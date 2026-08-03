@@ -274,7 +274,11 @@ def classify(
                     )
                 )
 
-    if directly_addressed:
+    # Direct addressing reinforces a request the content already contains;
+    # it never creates one. Being addressed is not the same as being asked
+    # something, and treating it as such would let routing metadata alone
+    # manufacture a request out of an ordinary remark.
+    if directly_addressed and any(c.candidate is MessageClass.DIRECT_REQUEST for c in contributors):
         contributors.append(
             ClassificationContributor(
                 MessageClass.DIRECT_REQUEST,
