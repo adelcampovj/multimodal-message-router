@@ -89,22 +89,42 @@ _FUNCTION_WORD = (
     r"in|with|for|of|by|as|if|even|though|entirely|completely|altogether|permanently|"
     r"temporarily|forever|again|anyway|soon|please|thanks|thank|ok|okay|here|back|"
     r"over|via|through|that|this|it|i|we|you|they|he|she|my|your|our|their|"
-    # A numeral does not change which word is the head -- "your PIN 4417" is
-    # still about the PIN -- and adverbs are closed enough to admit by shape.
-    r"\d[\d,.-]*|\w+ly)"
+    # A numeral does not change which word is the head -- "your PIN 4417" and
+    # "your medication #2" are still about the credential and the medication --
+    # and adverbs are closed enough to admit by shape.
+    r"#?\d[\d,.-]*|\w+ly)"
 )
 #: The governed token is the head of its phrase: end of input, punctuation,
-#: or a closed-class word follows it.
-_NP_HEAD_END = r"(?=$|\s*[.,;:!?)\]\"']|\s+" + _FUNCTION_WORD + r"\b)"
+#: or a closed-class word follows it. The punctuation class is closed and
+#: deliberately admits no letters or digits, so it can never carry the match
+#: through into an unrelated noun phrase.
+_NP_HEAD_END = (
+    r"(?=$|\s*[.,;:!?)\]}\(\[{\"'–—/-]|\s+" + _FUNCTION_WORD + r"\b)"
+)
 
-#: A bounded run of determiners, possessives and treatment qualifiers that may
-#: sit between a verb and the noun it governs. Every member is closed-class,
-#: so this run can never swallow an open-class noun and shift which word is
-#: the head.
+#: A bounded run of determiners, possessives, quantities and treatment
+#: qualifiers that may sit between a verb and the noun it governs. Every
+#: member is closed-class, so this run can never swallow an open-class noun
+#: and shift which word is the head.
+_QUANTITY = r"(?:\d+|#\d+|one|two|three|four|five|six|seven|eight|nine|ten|both|several)"
 _NP_PREFIX = (
     r"(?:\s+(?:the|a|an|your|my|our|their|his|her|its|this|that|these|those|any|all|"
     r"of|more|further|remaining|prescribed|prescription|repeat|regular|daily|"
-    r"current|new|old|usual))*"
+    r"current|new|old|usual|" + _QUANTITY + r"))*"
+)
+#: The same run without first-person possessives.
+#:
+#: "Stop my prescription" is a request a person makes to a pharmacy about
+#: their own treatment; "stop your medication" is advice aimed at the reader.
+#: The approved severe policy requires direction *toward the recipient*, so
+#: the direct-object path -- where the cessation verb governs the treatment
+#: with no consumption action in between -- does not accept "my" or "our".
+#: The consumption path keeps them: "stop taking my prescribed medication"
+#: is still an instruction about taking it.
+_NP_PREFIX_DIRECTED = (
+    r"(?:\s+(?:the|a|an|your|their|his|her|its|this|that|these|those|any|all|"
+    r"of|more|further|remaining|prescribed|prescription|repeat|regular|daily|"
+    r"current|new|old|usual|" + _QUANTITY + r"))*"
 )
 
 
@@ -206,12 +226,84 @@ class ContextFlags:
 
 
 def classify_context(norm: NormalizedText) -> ContextFlags:
+    """Document-level framing. Retained for auditability only.
+
+    Every rule gates on :class:`_LocalContext` instead. A sentence about
+    what attackers do says nothing about the next sentence, and treating it
+    as though it did turns "this article explains phishing" into a prefix
+    that downgrades whatever follows it.
+    """
     text = norm.folded
     return ContextFlags(
         warning=_any(_WARNING_PATTERNS, text) or _is_pronoun_warning(text),
         notification=_any(_NOTIFICATION_PATTERNS, text),
         educational=_any(_EDUCATIONAL_PATTERNS, text),
         quoted=_any(_QUOTED_PATTERNS, text),
+    )
+
+
+#: Clause boundaries. Deliberately not a parser: sentence terminators,
+#: semicolons, colons and line breaks only.
+_CLAUSE_BOUNDARY_RE = re.compile(r"[.!?;:\n]+")
+#: A clause that is itself a quotation, and the framing that introduces one.
+_QUOTE_ENCLOSED_RE = _c(r"^[\"'“‘(\[]|[\"'”’)\]]$")
+_QUOTE_INTRODUCER_RE = _c(
+    r"\b(?:said|says|saying|reads|wrote|writes|asked|asks|claims|claimed|"
+    r"message|text|sms|email|note|post)\b[^.]{0,20}$"
+)
+
+
+class _LocalContext:
+    """Framing resolved per clause, with one narrow inheritance rule.
+
+    A clause carries its own warning, notification, educational and quoted
+    flags. The single exception is a clause that *is* a quotation — enclosed
+    in quotes, or introduced by a preceding clause that announces one — which
+    inherits the quoted and educational framing of the clause that framed it.
+    That is the "narrowly associated clause" case, and it is the only way
+    framing crosses a boundary.
+    """
+
+    __slots__ = ("_spans", "_flags", "_fallback")
+
+    def __init__(self, text: str) -> None:
+        self._spans: list[tuple[int, int, str]] = []
+        start = 0
+        for match in _CLAUSE_BOUNDARY_RE.finditer(text):
+            self._spans.append((start, match.start(), text[start:match.start()]))
+            start = match.end()
+        self._spans.append((start, len(text), text[start:]))
+        self._fallback = _flags_for(text)
+
+        raw = [_flags_for(clause) for _, _, clause in self._spans]
+        resolved: list[ContextFlags] = []
+        for index, flags in enumerate(raw):
+            clause = self._spans[index][2].strip()
+            if index and _QUOTE_ENCLOSED_RE.search(clause):
+                previous = resolved[index - 1]
+                flags = ContextFlags(
+                    warning=flags.warning or previous.warning,
+                    notification=flags.notification,
+                    educational=flags.educational or previous.educational,
+                    quoted=flags.quoted or previous.quoted,
+                )
+            resolved.append(flags)
+        self._flags = resolved
+
+    def at(self, position: int) -> ContextFlags:
+        """Framing in force where a rule actually matched."""
+        for index, (start, end, _clause) in enumerate(self._spans):
+            if start <= position <= end:
+                return self._flags[index]
+        return self._fallback
+
+
+def _flags_for(clause: str) -> ContextFlags:
+    return ContextFlags(
+        warning=_any(_WARNING_PATTERNS, clause) or _is_pronoun_warning(clause),
+        notification=_any(_NOTIFICATION_PATTERNS, clause),
+        educational=_any(_EDUCATIONAL_PATTERNS, clause),
+        quoted=_any(_QUOTED_PATTERNS, clause),
     )
 
 
@@ -273,12 +365,15 @@ _INJECTION_RULES: tuple[tuple[str, str, DiagnosticCode], ...] = (
 _INJECTION_COMPILED = tuple((rid, _c(pat), diag) for rid, pat, diag in _INJECTION_RULES)
 
 
-def _evaluate_injection(norm: NormalizedText, ctx: ContextFlags) -> list[RuleHit]:
+def _evaluate_injection(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
     hits: list[RuleHit] = []
     for rule_id, pattern, diagnostic in _INJECTION_COMPILED:
-        if not pattern.search(norm.folded):
+        contexts = [local.at(m.start()) for m in pattern.finditer(norm.folded)]
+        if not contexts:
             continue
-        if ctx.is_discussion:
+        # An instruction that stands unframed somewhere is an instruction,
+        # however it was framed elsewhere.
+        if all(c.is_discussion for c in contexts):
             # Describing an attack is not performing one. Still reported --
             # a quoted injection is worth seeing -- but never severe.
             hits.append(
@@ -374,17 +469,55 @@ _SQUEEZED_REQUEST = _compile_all(
     r"provideyour", r"enteryour", r"typeyour", r"sendyour", r"sendthe",
 )
 
+# Messaging a credential to someone is a disclosure request, but "message"
+# is a noun at least as often as a verb -- "check the message for your PIN"
+# must stay quiet. So the action is admitted only when it governs *both* a
+# bounded recipient and the credential being transmitted; a bare "message"
+# never enters the general request-verb list.
+_MESSAGE_ACTION = r"(?:message|dm|text|whatsapp)"
+_TRANSMISSION_RECIPIENT = (
+    r"(?:me|us|him|her|them|support|admin|the team|customer service|"
+    r"customer support|the agent|the operator)"
+)
+_MESSAGE_TRANSMISSION_RE = _c(
+    # message me your PIN  /  message us your account PINs
+    r"\b" + _MESSAGE_ACTION + r"\s+" + _TRANSMISSION_RECIPIENT + r"\s+(?:with\s+)?"
+    + _SECRET_TARGET
+    # message the security PIN to support  /  message your banking PIN to me
+    + r"|\b" + _MESSAGE_ACTION + r"\s+" + _SECRET_TARGET
+    + r"[^.]{0,20}\bto\s+" + _TRANSMISSION_RECIPIENT + r"\b"
+    # send me a message with your card PIN  /  send us a message containing ...
+    + r"|\bsend\s+(?:" + _TRANSMISSION_RECIPIENT + r"\s+)?an?\s+"
+    + _MESSAGE_ACTION + r"\s+(?:with|containing|including|holding)\s+" + _SECRET_TARGET
+)
 
-def _evaluate_credentials(norm: NormalizedText, ctx: ContextFlags) -> list[RuleHit]:
+
+def _evaluate_credentials(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
     text = norm.folded
     hits: list[RuleHit] = []
 
     for rule_id, request_pattern, target_pattern, diagnostic in _CREDENTIAL_COMPILED:
-        target_present = bool(target_pattern.search(text))
-        request_present = bool(request_pattern.search(text))
+        target_contexts = [local.at(m.start()) for m in target_pattern.finditer(text)]
+        request_contexts = [local.at(m.start()) for m in request_pattern.finditer(text)]
+        target_present = bool(target_contexts)
 
         if not target_present:
             continue
+
+        # Framing is read where each occurrence actually sits, and the
+        # strongest unframed one decides. A warning in one sentence says
+        # nothing about a request in the next.
+        unframed_asks = [c for c in request_contexts
+                          if not c.is_advisory and not c.is_discussion]
+        framed_asks = [c for c in request_contexts if c.is_discussion]
+        request_present = bool(unframed_asks or framed_asks)
+        if unframed_asks:
+            ctx = unframed_asks[0]
+        elif framed_asks:
+            ctx = framed_asks[0]
+        else:
+            ctx = next((c for c in target_contexts
+                        if not c.is_advisory and not c.is_discussion), target_contexts[0])
 
         # An advisory telling someone never to share a secret is the
         # opposite of asking for one. Silenced outright.
@@ -426,7 +559,38 @@ def _evaluate_credentials(norm: NormalizedText, ctx: ContextFlags) -> list[RuleH
             )
         )
 
-    if not hits and not ctx.is_advisory and not ctx.is_discussion and not ctx.notification:
+    # A bounded message-to-recipient transmission request. Kept separate from
+    # the general request verbs on purpose: a bare "message" would flag "check
+    # the message for your PIN", so the action has to govern both a recipient
+    # and the credential being transmitted.
+    for match in _MESSAGE_TRANSMISSION_RE.finditer(text):
+        ctx = local.at(match.start())
+        if ctx.is_advisory:
+            continue
+        if ctx.is_discussion:
+            hits.append(
+                RuleHit(
+                    FindingCategory.CREDENTIAL_SOLICITATION,
+                    Severity.WEAK,
+                    "CRED_MESSAGE_TRANSMISSION",
+                    DiagnosticCode.QUOTED_OR_EDUCATIONAL_CONTEXT,
+                    ambiguous=True,
+                )
+            )
+            continue
+        hits.append(
+            RuleHit(
+                FindingCategory.CREDENTIAL_SOLICITATION,
+                Severity.SEVERE,
+                "CRED_MESSAGE_TRANSMISSION",
+                DiagnosticCode.CREDENTIAL_DISCLOSURE_REQUEST,
+            )
+        )
+        break
+
+    squeezed_ctx = local.at(0)
+    if (not hits and not squeezed_ctx.is_advisory and not squeezed_ctx.is_discussion
+            and not squeezed_ctx.notification):
         squeezed = norm.squeezed
         if len(squeezed) >= SQUEEZE_MIN_LENGTH and _any(_SQUEEZED_TARGETS, squeezed) and _any(
             _SQUEEZED_REQUEST, squeezed
@@ -491,9 +655,20 @@ _ORDINARY_BILLING = _compile_all(
 )
 
 
-def _evaluate_payment(norm: NormalizedText, ctx: ContextFlags) -> list[RuleHit]:
+def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
     text = norm.folded
     hits: list[RuleHit] = []
+
+    def first(patterns):
+        for pattern in patterns:
+            match = pattern.search(text)
+            if match is not None:
+                return match
+        return None
+
+    demand_at = first(_PAYMENT_DEMAND)
+    anchor = demand_at or first(_THREAT) or first(_OFF_CHANNEL) or first(_ADVANCE_FEE)
+    ctx = local.at(anchor.start() if anchor else 0)
     if ctx.is_advisory:
         return hits
 
@@ -607,9 +782,15 @@ _ORDINARY_DEADLINE = _compile_all(
 )
 
 
-def _evaluate_urgency(norm: NormalizedText, ctx: ContextFlags) -> list[RuleHit]:
+def _evaluate_urgency(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
     text = norm.folded
-    if ctx.is_advisory or not _any(_TIME_PRESSURE, text):
+    pressure = None
+    for pattern in _TIME_PRESSURE:
+        pressure = pattern.search(text)
+        if pressure is not None:
+            break
+    ctx = local.at(pressure.start() if pressure else 0)
+    if ctx.is_advisory or pressure is None:
         return []
     threatening = _any(_THREAT, text)
     if ctx.notification and not threatening:
@@ -642,10 +823,16 @@ _IDENTITY_CLAIM = _compile_all(
 )
 
 
-def _evaluate_identity(norm: NormalizedText, ctx: ContextFlags, has_asserted_trust: bool) -> list[RuleHit]:
-    if ctx.is_advisory or ctx.is_discussion:
+def _evaluate_identity(norm: NormalizedText, local: _LocalContext, has_asserted_trust: bool) -> list[RuleHit]:
+    claim = None
+    for pattern in _IDENTITY_CLAIM:
+        claim = pattern.search(norm.folded)
+        if claim is not None:
+            break
+    if claim is None:
         return []
-    if not _any(_IDENTITY_CLAIM, norm.folded):
+    ctx = local.at(claim.start())
+    if ctx.is_advisory or ctx.is_discussion:
         return []
     if has_asserted_trust:
         # A claim matching an independently recorded trust signal is not a
@@ -705,15 +892,17 @@ def _registrable_label(host: str) -> str:
     return parts[-2] if len(parts) >= 2 else host
 
 
-def _evaluate_links(norm: NormalizedText, ctx: ContextFlags) -> list[RuleHit]:
+def _evaluate_links(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
     text = norm.folded
     hits: list[RuleHit] = []
     seen_rules: set[str] = set()
+    position = {"at": 0}
 
     def add(rule_id: str, severity: Severity, diagnostic: DiagnosticCode) -> None:
         if rule_id in seen_rules:
             return
         seen_rules.add(rule_id)
+        ctx = local.at(position["at"])
         hits.append(
             RuleHit(
                 FindingCategory.DECEPTIVE_LINK,
@@ -725,6 +914,7 @@ def _evaluate_links(norm: NormalizedText, ctx: ContextFlags) -> list[RuleHit]:
         )
 
     for match in _URL_RE.finditer(text):
+        position["at"] = match.start()
         raw = match.group(0).rstrip(".,;:!?")
         host = _host_of(raw)
         if not host:
@@ -748,7 +938,9 @@ def _evaluate_links(norm: NormalizedText, ctx: ContextFlags) -> list[RuleHit]:
             # registrable domain is something else entirely.
             add("LNK_SUBDOMAIN_DISGUISE", Severity.SUSPICIOUS, DiagnosticCode.LOOKALIKE_HOST)
 
-    for label_text, target in _MARKDOWN_LINK_RE.findall(text):
+    for label_match in _MARKDOWN_LINK_RE.finditer(text):
+        position["at"] = label_match.start()
+        label_text, target = label_match.group(1), label_match.group(2)
         target_host = _host_of(target)
         if not target_host:
             continue
@@ -782,7 +974,9 @@ _PROFESSIONAL_GUIDANCE = _compile_all(
 #: *within* one clause, because a global "the text contains 'not' somewhere"
 #: exemption is exactly how a warning in one sentence ends up cancelling a
 #: dangerous instruction in the next.
-_CLAUSE_SPLIT_RE = re.compile(r"[.!?;\n]+")
+#: One clause splitter, shared with the context resolver so a colon that
+#: introduces an instruction separates it from whatever framed the sentence.
+_CLAUSE_SPLIT_RE = _CLAUSE_BOUNDARY_RE
 
 # A negator standing *before* a harmful action turns the clause into a
 # warning against it. Position matters: "don't stop your medication" is
@@ -910,7 +1104,9 @@ _UNSAFE_ADVICE_RULES = (
         + _NP_PREFIX + r"\s+" + _TREATMENT_OBJECT + r"\b" + _NP_HEAD_END
         # B. the verb governs the treatment directly, and the treatment word
         #    is the head of that phrase: "discontinue the prescribed medicine".
-        + r"|\b" + _CESSATION_VERB + r"\b" + _NP_PREFIX + r"\s+"
+        #    First-person possessives are excluded here -- see
+        #    ``_NP_PREFIX_DIRECTED``.
+        + r"|\b" + _CESSATION_VERB + r"\b" + _NP_PREFIX_DIRECTED + r"\s+"
         + _TREATMENT_OBJECT + r"\b" + _NP_HEAD_END,
         DiagnosticCode.MEDICATION_DISCONTINUATION,
         _HARM_IS_INSTRUCTION,
@@ -985,7 +1181,7 @@ def _advice_is_directive(clause: str, start: int) -> bool:
     return _any(_ADVICE_DIRECTIVE, clause) or bool(_IMPERATIVE_PREFIX_RE.match(clause[:start]))
 
 
-def _evaluate_unsafe_advice(norm: NormalizedText, ctx: ContextFlags) -> list[RuleHit]:
+def _evaluate_unsafe_advice(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
     """Narrow, clause-local dangerous-advice detection.
 
     Severity is decided here and nowhere else. A clear, actionable,
@@ -1001,7 +1197,6 @@ def _evaluate_unsafe_advice(norm: NormalizedText, ctx: ContextFlags) -> list[Rul
     is read per clause for the same reason, and a document-level discussion
     tone caps severity rather than exempting a clause outright.
     """
-    document_is_discussion = ctx.is_discussion
     hits: list[RuleHit] = []
     for clause in _clauses(norm.folded):
         if (
@@ -1030,7 +1225,7 @@ def _evaluate_unsafe_advice(norm: NormalizedText, ctx: ContextFlags) -> list[Rul
                     )
                 )
                 continue
-            if _advice_is_directive(clause, match.start()) and not document_is_discussion:
+            if _advice_is_directive(clause, match.start()):
                 hits.append(
                     RuleHit(FindingCategory.UNSAFE_ADVICE, Severity.SEVERE, rule_id, diagnostic)
                 )
@@ -1041,7 +1236,7 @@ def _evaluate_unsafe_advice(norm: NormalizedText, ctx: ContextFlags) -> list[Rul
                     Severity.SUSPICIOUS,
                     rule_id,
                     diagnostic,
-                    ambiguous=document_is_discussion,
+                    ambiguous=False,
                 )
             )
     return _deduplicate(hits)
@@ -1121,13 +1316,13 @@ def evaluate_propagation(norm: NormalizedText | None, forwarding_count: int | No
 
 def evaluate_content(norm: NormalizedText, has_asserted_trust: bool = False) -> list[RuleHit]:
     """Run every content rule family over one normalized piece of content."""
-    ctx = classify_context(norm)
+    local = _LocalContext(norm.folded)
     hits: list[RuleHit] = []
-    hits.extend(_evaluate_injection(norm, ctx))
-    hits.extend(_evaluate_credentials(norm, ctx))
-    hits.extend(_evaluate_payment(norm, ctx))
-    hits.extend(_evaluate_urgency(norm, ctx))
-    hits.extend(_evaluate_identity(norm, ctx, has_asserted_trust))
-    hits.extend(_evaluate_links(norm, ctx))
-    hits.extend(_evaluate_unsafe_advice(norm, ctx))
+    hits.extend(_evaluate_injection(norm, local))
+    hits.extend(_evaluate_credentials(norm, local))
+    hits.extend(_evaluate_payment(norm, local))
+    hits.extend(_evaluate_urgency(norm, local))
+    hits.extend(_evaluate_identity(norm, local, has_asserted_trust))
+    hits.extend(_evaluate_links(norm, local))
+    hits.extend(_evaluate_unsafe_advice(norm, local))
     return hits
