@@ -49,11 +49,14 @@ Separate families, because conflating them lets an attacker buy priority by
 shouting.
 
 * **Legitimate urgency** comes only from independently supported signals:
-  a safety alert, a near-term event, a time-sensitive direct request.
-  Direct targeting *amplifies* urgency that already has a basis — it never
-  originates it, or a promotion would become urgent purely by being
-  addressed to someone. Capitalization, punctuation, and the isolated words
-  "urgent" or "immediately" contribute nothing.
+  a safety alert, a near-term event supplied as structured metadata, or a
+  currently active service disruption. Request grammar is not one of them —
+  being asked something is not being asked something urgently, and a
+  `direct_request` therefore originates no urgency at all. Direct targeting
+  *amplifies* urgency that already has a basis; it never originates it, or a
+  promotion would become urgent purely by being addressed to someone.
+  Capitalization, punctuation, and the isolated words "urgent" or
+  "immediately" contribute nothing.
 * **Malicious pressure** derives only from safety findings — coercive
   payment, advance-fee, manufactured urgency.
 

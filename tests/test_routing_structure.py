@@ -33,15 +33,27 @@ ROUTING_SOURCES = sorted(ROUTING_DIR.glob("*.py"))
 
 REQUIRED_POLICY_IDS = (
     "route.safety.hard_veto",
-    "route.risk.pressure_suppress",
-    "route.risk.payment_identity_suppress",
+    "route.risk.identity_credential_suppress",
+    "route.risk.payment_link_suppress",
+    "route.risk.advance_fee_pressure_suppress",
+    "route.risk.unusual_channel_suppress",
+    "route.risk.coercion_pressure_suppress",
     "route.risk.propagation_low_value_suppress",
     "route.urgency.safe_interrupt",
-    "route.value.irrelevant_marketing_suppress",
-    "route.value.repetitive_low_value_suppress",
     "route.value.muted_low_value_suppress",
+    "route.value.repetitive_low_value_suppress",
+    "route.value.irrelevant_marketing_suppress",
     "route.utility.safe_defer",
     "route.analysis.incomplete_defer",
+)
+
+#: Policy identifiers formally replaced in P2C3B. The pressure rule was
+#: unreachable -- ``high`` manufactured pressure could only come from a
+#: severe finding, which already vetoes -- and the combined payment/identity
+#: rule has been split into the explicit families that replaced it.
+RETIRED_POLICY_IDS = (
+    "route.risk.pressure_suppress",
+    "route.risk.payment_identity_suppress",
 )
 
 
@@ -76,6 +88,39 @@ class PrecedenceTests(unittest.TestCase):
     def test_policy_ids_are_unique(self):
         ids = [pid for pid, _ in POLICY_ORDER]
         self.assertEqual(len(ids), len(set(ids)))
+
+    def test_retired_policy_ids_leave_no_compatibility_path(self):
+        """A replaced rule is gone, not kept as an unreachable alias."""
+        ids = {pid for pid, _ in POLICY_ORDER}
+        sources = "\n".join(p.read_text(encoding="utf-8") for p in ROUTING_SOURCES)
+        for retired in RETIRED_POLICY_IDS:
+            self.assertNotIn(retired, ids, retired)
+            self.assertNotIn(retired, sources, retired)
+
+    def test_every_suspicious_combination_needs_two_independent_families(self):
+        """Each risk rule pairs an anchor with a disjoint corroborator set,
+        and at least one side is substantive -- so pressure, a repeated
+        modality, or a suspicious-looking domain cannot combine alone."""
+        from message_router.analysis import RiskFamily
+        from message_router.routing.policy import RISK_COMBINATIONS
+
+        self.assertTrue(RISK_COMBINATIONS)
+        for policy_id, anchor, corroborators in RISK_COMBINATIONS:
+            self.assertIsInstance(anchor, RiskFamily, policy_id)
+            self.assertTrue(corroborators, policy_id)
+            self.assertNotIn(anchor, corroborators, policy_id)
+            self.assertTrue(
+                anchor.is_substantive or all(c.is_substantive for c in corroborators),
+                f"{policy_id} can fire on corroboration alone",
+            )
+
+    def test_risk_rules_read_projected_families_not_content(self):
+        """No routing rule re-derives risk: the families are projected by the
+        analysis layer and only read here."""
+        source = (ROUTING_DIR / "policy.py").read_text(encoding="utf-8")
+        self.assertIn("inputs.features.risk_families", source)
+        for term in ("re.compile", "re.search", "\\b", "keyword", "pattern"):
+            self.assertNotIn(term, source, f"routing performs its own matching: {term}")
 
     def test_route_evaluates_rules_in_declared_order(self):
         """Instrumented: record the order predicates are actually called."""
@@ -235,9 +280,23 @@ class CliSurfaceTests(unittest.TestCase):
 
 class ClassificationBindingTests(unittest.TestCase):
     def test_no_action_is_embedded_in_the_classification_module(self):
+        """No routing action, by name or by value, appears in classification.
+
+        Matched as whole tokens against every member of the real
+        ``RoutingAction`` vocabulary rather than as bare substrings. That
+        covers ``defer``, which a substring check had to leave out because
+        it collides with ordinary prose, and it stops an unrelated word that
+        merely shares a prefix -- a service described as "interrupted" -- from
+        reading as a routing action.
+        """
+        from message_router.domain import RoutingAction
+
         source = (SRC_DIR / "message_router" / "analysis" / "classification.py").read_text(encoding="utf-8")
-        for term in ("RoutingAction", "interrupt", "suppress"):
-            self.assertNotIn(term, source, f"classification references {term}")
+        self.assertNotIn("RoutingAction", source)
+        for action in RoutingAction:
+            found = re.search(rf"\b{action.value}\b", source, re.IGNORECASE)
+            self.assertIsNone(found, f"classification references the action {action.value}")
+            self.assertNotIn(f"{action.name}", source, action.name)
 
 
 if __name__ == "__main__":

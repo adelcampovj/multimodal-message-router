@@ -14,16 +14,26 @@ than inferred from behaviour.
 | # | Policy ID | Action |
 |---|---|---|
 | 1 | `route.safety.hard_veto` | suppress |
-| 2 | `route.risk.pressure_suppress` | suppress |
-| 3 | `route.risk.payment_identity_suppress` | suppress |
-| 4 | `route.risk.propagation_low_value_suppress` | suppress |
-| 5 | `route.urgency.safe_interrupt` | interrupt |
-| 6 | `route.value.irrelevant_marketing_suppress` | suppress |
-| 7 | `route.value.repetitive_low_value_suppress` | suppress |
-| 8 | `route.value.muted_low_value_suppress` | suppress |
-| 9 | `route.utility.safe_defer` | defer |
-| 10 | `route.analysis.incomplete_defer` | defer |
+| 2 | `route.risk.identity_credential_suppress` | suppress |
+| 3 | `route.risk.payment_link_suppress` | suppress |
+| 4 | `route.risk.advance_fee_pressure_suppress` | suppress |
+| 5 | `route.risk.unusual_channel_suppress` | suppress |
+| 6 | `route.risk.coercion_pressure_suppress` | suppress |
+| 7 | `route.risk.propagation_low_value_suppress` | suppress |
+| 8 | `route.urgency.safe_interrupt` | interrupt |
+| 9 | `route.value.muted_low_value_suppress` | suppress |
+| 10 | `route.value.repetitive_low_value_suppress` | suppress |
+| 11 | `route.value.irrelevant_marketing_suppress` | suppress |
+| 12 | `route.utility.safe_defer` | defer |
+| 13 | `route.analysis.incomplete_defer` | defer |
 | — | `route.default.defer` | defer |
+
+Every one of these is reachable by a real message through the real
+pipeline, and a test asserts it. That is not a formality: an earlier
+version of this table contained a rule requiring `high` manufactured
+pressure, which only a *severe* finding could produce — and a severe
+finding already vetoes one rule earlier. The rule read as a safeguard and
+had never fired.
 
 **There is no scoring.** No weighted sum, no point total, no probability,
 no aggregate. A structural test walks the AST of the whole package and
@@ -50,23 +60,41 @@ Severity and classification are not modified. Contributors record only the
 safety finding, so nothing implies that mitigating features were considered
 and outweighed.
 
-## Rule 2 — suspicious combinations
+## Rules 2–7 — suspicious combinations
 
 Suspicious risk suppresses only in explicit conjunctions, and never by
-mutating severity or fabricating a veto:
+mutating severity or fabricating a veto. A message suppressed here is still
+`suspicious` afterwards, and `hard_veto_applied` is `false`.
 
-* **A** suspicious risk **and** high manufactured pressure;
-* **B** a payment or credential concern **and** an identity or deceptive-link
-  concern;
-* **C** high circulation **and** established low relevance **and** established
-  low utility, with suspicious risk present.
+The unit of corroboration is a **risk family**, projected from safety
+findings by their fixed diagnostic codes. Two findings that express the same
+underlying indicator map to the same family and therefore count once, so a
+single pattern cannot corroborate itself. Each rule pairs an *anchor* family
+with a disjoint set of corroborating families:
 
-Each requires two or more independent signals. Alone, none of these
-suppresses: a weak finding, a single suspicious indicator, an unverified
-domain, missing trust, or forwarding metadata. An unresolved suspicious
-case falls through to deferral rather than being forced either way.
+| Policy | Anchor | Corroborated by |
+|---|---|---|
+| `identity_credential` | identity inconsistency | information request, coercive payment, unusual channel, advance fee |
+| `payment_link` | deceptive link | coercive payment, unusual channel, information request, advance fee |
+| `advance_fee_pressure` | advance fee | pressure, coercive payment, unusual channel, second modality |
+| `unusual_channel` | unusual payment channel | coercive payment, pressure, second modality |
+| `coercion_pressure` | coercive payment | pressure, second modality |
+| `propagation_low_value` | high circulation | established low relevance **and** utility, with suspicious risk |
 
-## Rule 5 — safe interrupt
+At least one side must be **substantive**. Manufactured pressure, a second
+modality repeating the same thing, and a domain that merely looks wrong are
+corroborators: they strengthen a substantive family and never combine into a
+suppression on their own. Urgency wording is not a family at all — a
+countdown must not corroborate itself.
+
+Only findings the safety layer reported as at least suspicious *and* not
+ambiguous qualify, so a weak mention and a quoted or educational match never
+accumulate. Alone, none of these suppresses: a weak finding, a single
+suspicious indicator, an unverified domain, missing trust, or forwarding
+metadata. An unresolved suspicious case falls through to deferral rather
+than being forced either way.
+
+## Rule 8 — safe interrupt
 
 Interrupting requires *all* of:
 
@@ -86,22 +114,49 @@ Quiet hours, a silenced conversation, and interruption cost are recorded as
 contextual contributors and deliberately do **not** block a genuinely
 urgent message. Unknown trust does not block one either.
 
-## Rules 6–8 — low value
+Urgency has to be *originated* by something independent: a safety alert, a
+near-term event supplied as structured metadata, or a currently active
+service disruption. Request grammar is not one of them. Being asked
+something is not being asked something urgently, and treating a request as
+urgency-bearing hands out priority for phrasing alone.
 
-Explicit and narrow: irrelevant marketing; heavily circulated content with
-**established** low value; a silenced conversation carrying nothing
-relevant, useful, or urgent.
+Direct targeting **amplifies** urgency that already has an independent
+basis and never originates it. With nothing to amplify it contributes no
+urgency at all, so it cannot move `absent` to `low` or `unknown` to
+established — it raises relevance, which is a different question.
 
-"Established" matters. `unknown` means context was never determined and is
-not the same finding as `low`. Rule 7 requires at least one positively
-established low-value signal, so forwarding metadata alone cannot suppress
-a message whose relevance and utility simply were not available.
+The active-disruption signal is deliberately narrow, and is the only
+classification rule a feature reads by identity. Scheduled maintenance, a
+resolved incident, a retrospective, a rumour, documentation, and an
+ordinary status update all fail it, because none of them is happening to
+this reader right now.
+
+## Rules 9–11 — low value
+
+Explicit and narrow: a silenced conversation, heavy circulation, and
+irrelevant marketing — each additionally requiring relevance *and*
+usefulness to have been established as `low`. Most specific first, so a
+general rule cannot shadow a narrower one into unreachability.
+
+"Established" matters, and is checked by explicit equality against `low`
+alone. `unknown` means context was never determined; `incomplete` and
+`conflicted` mean the analysis behind it was degraded or disagreed;
+`absent` is a statement about presence, not about value. None of them is a
+finding of low value, and a suppression built on any of them would fire
+whenever context happened to be missing. Relevance is established `low`
+only where it was actually determined — an untargeted broadcast channel,
+where both surface and targeting were consulted.
+
+Urgency is treated as a *guard* here rather than as evidence: the rules
+refuse to suppress anything with positive urgency support, without claiming
+urgency was determined to be low.
 
 Alone, none of these suppresses: a promotion, forwarding, a silenced
-thread, quiet hours, or absent engagement. A useful promotion defers, and
-urgent content in a silenced thread still interrupts.
+thread, quiet hours, or absent engagement. A useful promotion defers, a
+silenced thread whose usefulness was never determined defers, and urgent
+content in a silenced thread still interrupts.
 
-## Rules 9–11 — deferral
+## Rules 12–14 — deferral
 
 Safe content that is useful or relevant but not urgently so defers
 (`route.utility.safe_defer`). Cases that are ambiguous, conflicted, or

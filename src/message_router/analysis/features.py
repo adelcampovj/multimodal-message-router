@@ -36,11 +36,13 @@ from ..domain.errors import ValidationError, ValidationIssue
 from ..domain.message import IncomingMessage
 from ..safety.models import (
     ConflictKind,
+    DiagnosticCode,
     FindingCategory,
     ModalityState,
     SafetyAssessment,
     Severity,
 )
+from .classification import ACTIVE_DISRUPTION_RULE_ID
 
 __all__ = [
     "FeatureFamily",
@@ -50,6 +52,7 @@ __all__ = [
     "ModalityConsistency",
     "Completeness",
     "ContentAvailability",
+    "RiskFamily",
     "FeatureContributor",
     "Feature",
     "DecisionFeatures",
@@ -156,6 +159,89 @@ class ContentAvailability(Enum):
     CONFLICTED_CONTENT = "conflicted_content"
 
 
+class RiskFamily(Enum):
+    """Independent kinds of corroborated risk observed in one message.
+
+    Projected from safety findings by their fixed diagnostic codes, never
+    recomputed from content. Two findings that express the same underlying
+    indicator map to the same family and therefore count once, which is what
+    stops a single pattern from looking like independent corroboration.
+
+    :attr:`is_substantive` marks the families that can carry a suppression
+    on their own account. The rest -- manufactured pressure, a second
+    modality repeating the same thing, a domain that merely looks wrong --
+    corroborate a substantive family and never stand in for one.
+    """
+
+    MALICIOUS_PRESSURE = "malicious_pressure"
+    COERCIVE_PAYMENT = "coercive_payment"
+    INFORMATION_REQUEST = "information_request"
+    DECEPTIVE_LINK = "deceptive_link"
+    IDENTITY_INCONSISTENCY = "identity_inconsistency"
+    ADVANCE_FEE = "advance_fee"
+    UNUSUAL_PAYMENT_CHANNEL = "unusual_payment_channel"
+    CORROBORATING_MODALITY = "corroborating_modality"
+
+    @property
+    def is_substantive(self) -> bool:
+        return self not in _CORROBORATING_ONLY
+
+
+_CORROBORATING_ONLY = frozenset(
+    {
+        RiskFamily.MALICIOUS_PRESSURE,
+        RiskFamily.DECEPTIVE_LINK,
+        RiskFamily.CORROBORATING_MODALITY,
+    }
+)
+
+#: Fixed diagnostic-to-family map. ``ARTIFICIAL_TIME_PRESSURE`` is
+#: deliberately absent: urgency wording on its own is not a risk family, and
+#: including it would let a countdown corroborate itself.
+_DIAGNOSTIC_RISK_FAMILIES = {
+    DiagnosticCode.PAYMENT_DEMAND: RiskFamily.COERCIVE_PAYMENT,
+    DiagnosticCode.OFF_CHANNEL_PAYMENT: RiskFamily.UNUSUAL_PAYMENT_CHANNEL,
+    DiagnosticCode.CONSEQUENCE_THREAT: RiskFamily.MALICIOUS_PRESSURE,
+    DiagnosticCode.SECRECY_PRESSURE: RiskFamily.MALICIOUS_PRESSURE,
+    DiagnosticCode.ANTI_VERIFICATION_PRESSURE: RiskFamily.MALICIOUS_PRESSURE,
+    DiagnosticCode.ADVANCE_FEE_OFFER: RiskFamily.ADVANCE_FEE,
+    DiagnosticCode.CREDENTIAL_DISCLOSURE_REQUEST: RiskFamily.INFORMATION_REQUEST,
+    DiagnosticCode.CARD_DETAIL_REQUEST: RiskFamily.INFORMATION_REQUEST,
+    DiagnosticCode.BANKING_ACCESS_REQUEST: RiskFamily.INFORMATION_REQUEST,
+    DiagnosticCode.IDENTITY_CLAIM_UNSUPPORTED: RiskFamily.IDENTITY_INCONSISTENCY,
+    DiagnosticCode.LOOKALIKE_HOST: RiskFamily.DECEPTIVE_LINK,
+    DiagnosticCode.RAW_IP_HOST: RiskFamily.DECEPTIVE_LINK,
+    DiagnosticCode.EMBEDDED_CREDENTIALS_IN_URL: RiskFamily.DECEPTIVE_LINK,
+    DiagnosticCode.PUNYCODE_HOST: RiskFamily.DECEPTIVE_LINK,
+    DiagnosticCode.DISPLAY_TARGET_MISMATCH: RiskFamily.DECEPTIVE_LINK,
+    DiagnosticCode.LINK_WITH_CREDENTIAL_REQUEST: RiskFamily.DECEPTIVE_LINK,
+    DiagnosticCode.LINK_WITH_PAYMENT_PRESSURE: RiskFamily.DECEPTIVE_LINK,
+}
+
+
+def _risk_families(assessment: SafetyAssessment) -> frozenset[RiskFamily]:
+    """Project corroborated risk families. Severity is read, never changed.
+
+    Only findings the safety layer reported as at least suspicious *and* not
+    ambiguous qualify: a weak mention and a hedged, quoted, or educational
+    match are exactly the material that must not accumulate into a
+    suppression.
+    """
+    qualifying = [
+        finding
+        for finding in assessment.findings
+        if finding.severity.rank >= Severity.SUSPICIOUS.rank and not finding.ambiguous
+    ]
+    families = {
+        _DIAGNOSTIC_RISK_FAMILIES[finding.diagnostic]
+        for finding in qualifying
+        if finding.diagnostic in _DIAGNOSTIC_RISK_FAMILIES
+    }
+    if families and len({finding.provenance for finding in qualifying}) >= 2:
+        families.add(RiskFamily.CORROBORATING_MODALITY)
+    return frozenset(families)
+
+
 @dataclass(frozen=True)
 class FeatureContributor:
     """One reason a feature holds the value it does. Carries no content."""
@@ -211,6 +297,7 @@ class DecisionFeatures:
     highest_severity: Severity | None = None
     hard_veto_required: bool = False
     risk_categories: frozenset[FindingCategory] = frozenset()
+    risk_families: frozenset[RiskFamily] = frozenset()
     modality_consistency: ModalityConsistency = ModalityConsistency.NOT_APPLICABLE
     completeness: Completeness = Completeness.COMPLETE_FOR_AVAILABLE_INPUTS
     content_availability: ContentAvailability = ContentAvailability.NO_USABLE_CONTENT
@@ -239,7 +326,21 @@ _PRESSURE_CATEGORIES = frozenset(
 )
 
 _UTILITY_CLASSES = ("SERVICE_UPDATE", "FINANCIAL_NOTICE", "SCHEDULED_EVENT", "DIRECT_REQUEST", "SAFETY_ALERT")
-_URGENT_CLASSES = ("SAFETY_ALERT", "SCHEDULED_EVENT", "DIRECT_REQUEST")
+
+#: Classes that can *originate* legitimate urgency.
+#:
+#: ``DIRECT_REQUEST`` is deliberately absent. Being asked something is not
+#: the same as being asked something urgently: request grammar, politeness,
+#: capitalization, punctuation, and the isolated word "urgent" are all
+#: things anyone can write, so treating a request as urgency-bearing hands
+#: out priority for phrasing. A request becomes urgent only when an
+#: independent signal -- a near-term event, an active hazard, an active
+#: relevant disruption -- says so.
+_URGENT_CLASSES = ("SAFETY_ALERT", "SCHEDULED_EVENT")
+
+#: Classes and signals whose urgency stands alone rather than needing a
+#: second supporting contributor.
+_SELF_SUFFICIENT_URGENCY = ("SAFETY_ALERT",)
 
 
 def extract_features(
@@ -322,11 +423,18 @@ def extract_features(
 
     # -- legitimate urgency (never raised by a safety finding) ------------
     urgency_contributors: list[FeatureContributor] = []
+    disruption = _active_disruption_contributor(classification)
     if selected_name in _URGENT_CLASSES:
         urgency_contributors.append(
             FeatureContributor(f"URGENCY_{selected_name}", SupportSource.UNTRUSTED_CONTENT,
                                Provenance.AUTHORED_TEXT)
         )
+    if disruption is not None:
+        # A service the reader depends on is down *right now*. Narrow by
+        # construction: scheduled maintenance, a resolved incident, a
+        # retrospective, a rumour, and an ordinary status update all fail
+        # the classification rule that produces this.
+        urgency_contributors.append(disruption)
     if near_term_event:
         urgency_contributors.append(
             FeatureContributor("URGENCY_NEAR_TERM_EVENT", SupportSource.STRUCTURED_METADATA,
@@ -351,7 +459,11 @@ def extract_features(
     supporting = [c for c in urgency_contributors if c.note is not FeatureNote.URGENCY_WITHHELD_RISK_ATTRIBUTED]
     if not supporting:
         urgency_level = FeatureLevel.ABSENT
-    elif selected_name == "SAFETY_ALERT" or len(supporting) >= 2:
+    elif (
+        selected_name in _SELF_SUFFICIENT_URGENCY
+        or disruption is not None
+        or len(supporting) >= 2
+    ):
         urgency_level = FeatureLevel.HIGH
     else:
         urgency_level = FeatureLevel.MEDIUM
@@ -407,6 +519,17 @@ def extract_features(
                                Provenance.STRUCTURED_METADATA)
         )
     relevance_level = _tiered(len(relevance_contributors))
+    if not relevance_contributors and conversation.surface.name == "CHANNEL":
+        # A broadcast channel the reader was not addressed in is the one
+        # case where "not relevant to this reader" was actually determined
+        # rather than merely unavailable: surface and targeting are both
+        # structured metadata, and both were consulted. Everywhere else,
+        # missing context stays UNKNOWN.
+        relevance_level = FeatureLevel.LOW
+        relevance_contributors.append(
+            FeatureContributor("REL_UNTARGETED_BROADCAST", SupportSource.STRUCTURED_METADATA,
+                               Provenance.STRUCTURED_METADATA)
+        )
     features.append(
         Feature(FeatureFamily.RECIPIENT_RELEVANCE, relevance_level,
                 tuple(sorted(relevance_contributors, key=lambda c: c.sort_key())))
@@ -535,6 +658,7 @@ def extract_features(
         highest_severity=severity,
         hard_veto_required=veto,
         risk_categories=assessment.categories,
+        risk_families=_risk_families(assessment),
         modality_consistency=consistency,
         completeness=completeness,
         content_availability=availability,
@@ -566,6 +690,23 @@ class InteractionSummary:
         if self.dismissals > self.replies:
             return FeatureLevel.LOW
         return FeatureLevel.MEDIUM
+
+
+def _active_disruption_contributor(classification) -> FeatureContributor | None:
+    """Urgency support from a currently active, recorded service disruption.
+
+    Read by rule identity from the classifier's own contributors, so no
+    content is inspected here and the provenance the signal came from is
+    carried through unchanged.
+    """
+    for contributor in getattr(classification, "contributors", ()):
+        if getattr(contributor, "rule_id", None) == ACTIVE_DISRUPTION_RULE_ID:
+            return FeatureContributor(
+                "URGENCY_ACTIVE_DISRUPTION",
+                SupportSource.UNTRUSTED_CONTENT,
+                contributor.provenance,
+            )
+    return None
 
 
 def _tiered(count: int) -> FeatureLevel:

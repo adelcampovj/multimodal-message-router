@@ -97,6 +97,7 @@ class ClassificationDiagnostic(Enum):
     SCHEDULING_LANGUAGE = "scheduling_language"
     BILLING_LANGUAGE = "billing_language"
     STATUS_LANGUAGE = "status_language"
+    ACTIVE_DISRUPTION_LANGUAGE = "active_disruption_language"
     PROMOTIONAL_LANGUAGE = "promotional_language"
     CONVERSATIONAL_LANGUAGE = "conversational_language"
     FORWARDING_LANGUAGE = "forwarding_language"
@@ -242,6 +243,53 @@ _PATTERNS: tuple[tuple[str, MessageClass, SupportStrength, ClassificationDiagnos
 #: Forwarding metadata at or above this is a contributor on its own.
 FORWARD_METADATA_THRESHOLD = 5
 
+#: Rule identifier for a *currently active* service disruption. Named as a
+#: constant because a later stage reads it by identity rather than by
+#: re-inspecting content: this is the only classification signal that a
+#: feature may treat as an independent basis for urgency.
+ACTIVE_DISRUPTION_RULE_ID = "CLS_ACTIVE_DISRUPTION"
+
+# Deliberately narrow. An ordinary service update, a maintenance notice, a
+# resolved incident, a retrospective, a rumour, and a promotion must all
+# fail this, because the only thing it is allowed to support downstream is
+# treating something as urgent right now.
+_ACTIVE_DISRUPTION_RE = _c(
+    r"\b(?:service|system|platform|network|site|website|app|portal|server|api)\b[^.]{0,25}"
+    r"\b(?:is|are|currently)\b[^.]{0,20}"
+    r"\b(?:down|unavailable|inaccessible|offline|interrupted|disrupted|suspended)\b"
+    r"|\b(?:ongoing|active|current) (?:outage|disruption|incident|downtime)\b"
+    r"|\boutage (?:is )?(?:ongoing|in progress|affecting)\b"
+    r"|\bwe are (?:currently )?(?:experiencing|investigating)\b[^.]{0,30}"
+    r"\b(?:outage|disruption|incident|downtime|problems?)\b"
+)
+
+_DISRUPTION_EXCLUSIONS = tuple(
+    _c(pattern)
+    for pattern in (
+        # Scheduled or future work is not an active disruption.
+        r"\b(?:scheduled|planned|upcoming|forthcoming|due)\b[^.]{0,35}"
+        r"\b(?:maintenance|outage|downtime|disruption|window)\b",
+        r"\bmaintenance (?:window|is scheduled|will|begins)\b",
+        r"\b(?:next|last|this coming) (?:week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        # Already over.
+        r"\b(?:resolved|restored|fixed|back online|back up|no longer affected)\b",
+        # Retrospective or documentation.
+        r"\b(?:yesterday|last night|last year|back in|previously|used to be|in 20\d\d)\b",
+        r"\b(?:this|the) (?:article|guide|post|documentation|docs|manual|runbook|report)\b",
+        # Unconfirmed.
+        r"\b(?:might|may|could|possibly|rumou?r|reportedly|apparently|i think|not sure|heard that)\b",
+        # A promotion that happens to mention a service.
+        r"\b(?:sale|discount|shop now|promo code|offer ends|unsubscribe)\b",
+    )
+)
+
+
+def _is_active_disruption(raw: str) -> bool:
+    folded = raw.casefold()
+    if not _ACTIVE_DISRUPTION_RE.search(folded):
+        return False
+    return not any(pattern.search(folded) for pattern in _DISRUPTION_EXCLUSIONS)
+
 
 def classify(
     texts: tuple[tuple[str, Provenance], ...] = (),
@@ -273,6 +321,17 @@ def classify(
                         from_incomplete_analysis=incomplete,
                     )
                 )
+        if _is_active_disruption(raw):
+            contributors.append(
+                ClassificationContributor(
+                    candidate=MessageClass.SERVICE_UPDATE,
+                    provenance=provenance,
+                    rule_id=ACTIVE_DISRUPTION_RULE_ID,
+                    strength=SupportStrength.STRONG,
+                    diagnostic=ClassificationDiagnostic.ACTIVE_DISRUPTION_LANGUAGE,
+                    from_incomplete_analysis=incomplete,
+                )
+            )
 
     # Direct addressing reinforces a request the content already contains;
     # it never creates one. Being addressed is not the same as being asked

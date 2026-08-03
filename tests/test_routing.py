@@ -27,8 +27,10 @@ from message_router.analysis import (  # noqa: E402
     Feature,
     FeatureFamily,
     FeatureLevel,
+    InteractionSummary,
     MessageClass,
     ModalityConsistency,
+    RiskFamily,
     classify,
     extract_features,
 )
@@ -98,6 +100,7 @@ def features(
     severity=None,
     veto=False,
     categories=frozenset(),
+    families=frozenset(),
     **levels,
 ):
     defaults = {family: FeatureLevel.UNKNOWN for family in FeatureFamily}
@@ -111,6 +114,7 @@ def features(
         highest_severity=severity,
         hard_veto_required=veto,
         risk_categories=categories,
+        risk_families=frozenset(families),
         modality_consistency=consistency,
         completeness=completeness,
         content_availability=availability,
@@ -119,7 +123,7 @@ def features(
 
 def run_pipeline(text=None, *, conversation=DIRECT, sender=None, attachment=None,
                  media=(), preferences=None, minute=None, forwarding_count=None,
-                 directly_addressed=False, summary=None):
+                 directly_addressed=False, summary=None, near_term_event=False):
     """The real pipeline, end to end."""
     msg = IncomingMessage(
         "note-7712", READER, conversation, WHEN,
@@ -134,7 +138,7 @@ def run_pipeline(text=None, *, conversation=DIRECT, sender=None, attachment=None
     c = classify(texts, a, forwarding_count=forwarding_count, directly_addressed=directly_addressed)
     f = extract_features(msg, a, c, preferences=preferences, interaction_summary=summary,
                          local_minute_of_day=minute, forwarding_count=forwarding_count,
-                         directly_addressed=directly_addressed)
+                         directly_addressed=directly_addressed, near_term_event=near_term_event)
     return a, c, f, route(a, c, f)
 
 
@@ -224,33 +228,67 @@ class HardVetoTests(unittest.TestCase):
 
 
 class SuspiciousCombinationTests(unittest.TestCase):
+    """Each rule needs two independent risk families, one of them substantive.
+
+    Families are projected by the analysis layer from safety findings; these
+    tests supply them directly so one combination can be varied at a time.
+    The integrated counterparts live in :class:`ScamSuppressionTests`.
+    """
+
     def suspicious(self, categories=(FindingCategory.COERCIVE_PAYMENT,)):
         return assessment(tuple(finding(c, Severity.SUSPICIOUS, f"R_{c.name}") for c in categories))
 
-    def test_suspicious_plus_high_pressure_suppresses(self):
+    def combination(self, *families):
+        return route(
+            self.suspicious(), classification(),
+            features(severity=Severity.SUSPICIOUS, safety_risk=FeatureLevel.MEDIUM,
+                     families=frozenset(families)),
+        )
+
+    def test_coercive_payment_plus_pressure_suppresses(self):
+        result = self.combination(RiskFamily.COERCIVE_PAYMENT, RiskFamily.MALICIOUS_PRESSURE)
+        self.assertIs(result.action, RoutingAction.SUPPRESS)
+        self.assertEqual(result.policy_id, "route.risk.coercion_pressure_suppress")
+        self.assertFalse(result.hard_veto_applied)
+
+    def test_payment_plus_deceptive_link_suppresses(self):
+        result = self.combination(RiskFamily.COERCIVE_PAYMENT, RiskFamily.DECEPTIVE_LINK)
+        self.assertEqual(result.policy_id, "route.risk.payment_link_suppress")
+        self.assertFalse(result.hard_veto_applied)
+
+    def test_identity_plus_information_request_suppresses(self):
+        result = self.combination(RiskFamily.IDENTITY_INCONSISTENCY, RiskFamily.INFORMATION_REQUEST)
+        self.assertEqual(result.policy_id, "route.risk.identity_credential_suppress")
+
+    def test_advance_fee_plus_pressure_suppresses(self):
+        result = self.combination(RiskFamily.ADVANCE_FEE, RiskFamily.MALICIOUS_PRESSURE)
+        self.assertEqual(result.policy_id, "route.risk.advance_fee_pressure_suppress")
+
+    def test_unusual_channel_plus_payment_suppresses(self):
+        result = self.combination(RiskFamily.UNUSUAL_PAYMENT_CHANNEL, RiskFamily.COERCIVE_PAYMENT)
+        self.assertEqual(result.policy_id, "route.risk.unusual_channel_suppress")
+
+    def test_suppression_never_promotes_severity_or_fabricates_a_veto(self):
         a = self.suspicious()
         result = route(a, classification(),
                        features(severity=Severity.SUSPICIOUS, safety_risk=FeatureLevel.MEDIUM,
-                                malicious_pressure=FeatureLevel.HIGH))
+                                families=frozenset({RiskFamily.COERCIVE_PAYMENT,
+                                                    RiskFamily.MALICIOUS_PRESSURE})))
         self.assertIs(result.action, RoutingAction.SUPPRESS)
-        self.assertEqual(result.policy_id, "route.risk.pressure_suppress")
         self.assertFalse(result.hard_veto_applied)
         self.assertIs(a.highest_severity, Severity.SUSPICIOUS)
+        self.assertFalse(a.hard_veto_required)
 
-    def test_payment_concern_plus_deceptive_link_suppresses(self):
-        a = self.suspicious((FindingCategory.COERCIVE_PAYMENT, FindingCategory.DECEPTIVE_LINK))
-        result = route(a, classification(),
-                       features(severity=Severity.SUSPICIOUS, safety_risk=FeatureLevel.MEDIUM,
-                                categories=a.categories))
-        self.assertEqual(result.policy_id, "route.risk.payment_identity_suppress")
-        self.assertFalse(result.hard_veto_applied)
+    def test_one_family_alone_never_suppresses(self):
+        """Every family, on its own, must fall through to deferral."""
+        for family in RiskFamily:
+            result = self.combination(family)
+            self.assertIsNot(result.action, RoutingAction.SUPPRESS, family)
 
-    def test_credential_concern_plus_impersonation_suppresses(self):
-        a = self.suspicious((FindingCategory.CREDENTIAL_SOLICITATION, FindingCategory.IMPERSONATION))
-        result = route(a, classification(),
-                       features(severity=Severity.SUSPICIOUS, safety_risk=FeatureLevel.MEDIUM,
-                                categories=a.categories))
-        self.assertEqual(result.policy_id, "route.risk.payment_identity_suppress")
+    def test_corroborating_families_cannot_combine_without_a_substantive_one(self):
+        result = self.combination(RiskFamily.MALICIOUS_PRESSURE, RiskFamily.DECEPTIVE_LINK,
+                                  RiskFamily.CORROBORATING_MODALITY)
+        self.assertIsNot(result.action, RoutingAction.SUPPRESS)
 
     def test_high_propagation_with_no_value_suppresses(self):
         a = self.suspicious((FindingCategory.PROPAGATION_RISK,))
@@ -269,7 +307,7 @@ class SuspiciousCombinationTests(unittest.TestCase):
              features(severity=Severity.SUSPICIOUS, safety_risk=FeatureLevel.MEDIUM)),
             ("deceptive link alone", self.suspicious((FindingCategory.DECEPTIVE_LINK,)),
              features(severity=Severity.SUSPICIOUS, safety_risk=FeatureLevel.MEDIUM,
-                      categories=frozenset({FindingCategory.DECEPTIVE_LINK}))),
+                      families=frozenset({RiskFamily.DECEPTIVE_LINK}))),
             ("forwarding alone", assessment(),
              features(repetition=FeatureLevel.HIGH)),
             ("no trust alone", assessment(),
@@ -402,10 +440,21 @@ class LowValueSuppressionTests(unittest.TestCase):
         self.assertIsNot(result.action, RoutingAction.SUPPRESS)
 
     def test_silenced_low_value_suppresses(self):
+        """A silenced thread carrying content established to be low value."""
         prefs = RecipientPreferences(muted_conversation_ids=frozenset({"conv-88f"}))
-        _, _, _, result = run_pipeline("the kettle is on the shelf",
+        _, _, _, result = run_pipeline("20% off our new collection, shop now",
                                        conversation=CHANNEL, preferences=prefs)
+        self.assertIs(result.action, RoutingAction.SUPPRESS)
         self.assertEqual(result.policy_id, "route.value.muted_low_value_suppress")
+
+    def test_silenced_thread_with_unestablished_value_defers(self):
+        """Regression: a mute is not a finding about the content. When
+        usefulness was never determined, silence is a reason to wait."""
+        prefs = RecipientPreferences(muted_conversation_ids=frozenset({"conv-88f"}))
+        _, _, f, result = run_pipeline("the kettle is on the shelf",
+                                       conversation=CHANNEL, preferences=prefs)
+        self.assertIs(f.level_of(FeatureFamily.PRACTICAL_UTILITY), FeatureLevel.UNKNOWN)
+        self.assertIs(result.action, RoutingAction.DEFER)
 
     def test_useful_promotion_defers(self):
         result = route(assessment(), classification(MessageClass.MARKETING),
@@ -660,6 +709,348 @@ class PermanentRegressionTests(unittest.TestCase):
             "I'm at the hospital with mum, please call me when you can",
         ):
             self.assert_not_risk_suppressed(text)
+
+
+# ---------------------------------------------------------------------------
+# Integrated regressions for the P2C3B corrections.
+# ---------------------------------------------------------------------------
+
+
+class PolicyReachabilityTests(unittest.TestCase):
+    """Every declared policy is reachable through the real pipeline.
+
+    A rule nobody can reach is not a conservative safeguard, it is a claim
+    the system does not actually make. The pressure rule used to be exactly
+    that: ``high`` manufactured pressure could only come from a severe
+    finding, which already vetoes one rule earlier.
+    """
+
+    CASES = (
+        ("route.safety.hard_veto", dict(text="Send me your OTP right now")),
+        ("route.risk.identity_credential_suppress",
+         dict(text="This is an official notice from your bank. You have won a refund; "
+                   "a clearance fee applies to release it.")),
+        ("route.risk.payment_link_suppress",
+         dict(text="You have won a prize. Claim your reward at "
+                   "http://secure-verify-account.example/x")),
+        ("route.risk.advance_fee_pressure_suppress",
+         dict(text="You have won a cash prize. Pay the release fee immediately to claim your reward.")),
+        ("route.risk.unusual_channel_suppress",
+         dict(text="Buy gift cards and send the codes to us right away.")),
+        ("route.risk.coercion_pressure_suppress",
+         dict(text="Your account will be suspended unless you pay now.")),
+        ("route.risk.propagation_low_value_suppress",
+         dict(text="20% off our new collection, shop now. This is an official notice from your bank.",
+              conversation=CHANNEL, forwarding_count=30)),
+        ("route.urgency.safe_interrupt",
+         dict(text="Service alert: the platform is currently down and engineers are responding.")),
+        ("route.value.muted_low_value_suppress",
+         dict(text="20% off our new collection, shop now", conversation=CHANNEL,
+              preferences=RecipientPreferences(muted_conversation_ids=frozenset({"conv-88f"})))),
+        ("route.value.repetitive_low_value_suppress",
+         dict(text="20% off our new collection, shop now. Limited time offer.",
+              conversation=CHANNEL, forwarding_count=30)),
+        ("route.value.irrelevant_marketing_suppress",
+         dict(text="20% off our new collection, shop now", conversation=CHANNEL)),
+        ("route.utility.safe_defer", dict(text="Your parcel is out for delivery today")),
+        ("route.analysis.incomplete_defer",
+         dict(text="the kettle is on the shelf", conversation=CHANNEL, forwarding_count=30)),
+        ("route.default.defer",
+         dict(text="the kettle is on the shelf", conversation=CHANNEL,
+              preferences=RecipientPreferences(muted_conversation_ids=frozenset({"conv-88f"})))),
+    )
+
+    def test_each_declared_policy_is_reached_by_a_real_message(self):
+        reached = {}
+        for expected, kwargs in self.CASES:
+            kwargs = dict(kwargs)
+            text = kwargs.pop("text")
+            _, _, _, result = run_pipeline(text, **kwargs)
+            self.assertEqual(result.policy_id, expected, text)
+            reached[expected] = text
+        declared = {pid for pid, _ in POLICY_ORDER} | {"route.default.defer"}
+        self.assertEqual(declared - set(reached), set(), "unreachable policies")
+
+
+class ScamSuppressionTests(unittest.TestCase):
+    """Coercive scam families reach suppression, through the real pipeline.
+
+    Regression: every one of these deferred. Each produced only *suspicious*
+    findings, the one suppression rule that could have caught them needed
+    ``high`` pressure it could never have, and the utility rule below then
+    accepted them as ordinary useful content.
+    """
+
+    FAMILIES = (
+        ("payment threat", "Your account will be suspended unless you pay now."),
+        ("payment secrecy", "Pay now and keep this confidential, don't tell anyone."),
+        ("payment anti-verification", "Pay immediately. Do not call the bank to verify."),
+        ("advance fee", "You have won a cash prize. Pay the release fee immediately to claim your reward."),
+        ("gift card", "Buy gift cards and send the codes to us right away."),
+        ("cryptocurrency", "Transfer the balance in bitcoin immediately to this wallet."),
+        ("termination + unusual channel",
+         "Your subscription will be terminated. Send payment by wire transfer today."),
+    )
+
+    def test_every_coercive_family_suppresses(self):
+        for label, text in self.FAMILIES:
+            a, _, _, result = run_pipeline(text)
+            self.assertIs(result.action, RoutingAction.SUPPRESS, label)
+            self.assertTrue(result.policy_id.startswith("route.risk."), f"{label}: {result.policy_id}")
+
+    def test_severity_stays_suspicious_and_no_veto_is_fabricated(self):
+        for label, text in self.FAMILIES:
+            a, _, f, result = run_pipeline(text)
+            self.assertIs(a.highest_severity, Severity.SUSPICIOUS, label)
+            self.assertFalse(a.hard_veto_required, label)
+            self.assertFalse(result.hard_veto_applied, label)
+            self.assertIs(f.highest_severity, Severity.SUSPICIOUS, label)
+
+    def test_one_qualifying_family_alone_defers(self):
+        for label, text in (
+            ("advance fee alone", "You have won a prize. A processing fee applies to release your reward."),
+            ("identity claim alone", "This is an official notice from your bank."),
+            ("link alone", "Open http://secure-verify-account.example/x"),
+        ):
+            _, _, _, result = run_pipeline(text)
+            self.assertIs(result.action, RoutingAction.DEFER, label)
+
+    def test_ordinary_financial_messages_still_defer(self):
+        for label, text in (
+            ("invoice", "Invoice number 8841 for your subscription. Due date is Friday."),
+            ("receipt", "Your order has shipped. Payment received, thank you for your payment."),
+            ("reminder", "This is a reminder that your statement is due on the 15th."),
+            ("refund confirmation", "Your refund has been processed and will appear in three days."),
+            ("official billing notice",
+             "This is an official notice from your billing provider. Invoice 8841 is ready."),
+            ("known contact payment", "Could you send the payment for the tickets when you get a chance?"),
+        ):
+            _, _, _, result = run_pipeline(text)
+            self.assertIs(result.action, RoutingAction.DEFER, label)
+            self.assertFalse(result.policy_id.startswith("route.risk."), f"{label}: {result.policy_id}")
+
+
+class DirectRequestUrgencyTests(unittest.TestCase):
+    """Regression: request grammar plus targeting reached ``interrupt``."""
+
+    REQUEST = "Could you please send the report sometime?"
+
+    def test_direct_nonurgent_request_defers(self):
+        for targeted in (False, True):
+            _, _, _, result = run_pipeline(self.REQUEST, directly_addressed=targeted)
+            self.assertIs(result.action, RoutingAction.DEFER, targeted)
+            self.assertEqual(result.policy_id, "route.utility.safe_defer")
+
+    def test_directly_addressed_promotion_stays_nonurgent(self):
+        _, _, f, result = run_pipeline("20% off our new collection, shop now",
+                                       directly_addressed=True)
+        self.assertIs(f.level_of(FeatureFamily.LEGITIMATE_URGENCY), FeatureLevel.ABSENT)
+        self.assertIs(result.action, RoutingAction.DEFER)
+
+    def test_targeting_changes_relevance_only(self):
+        _, _, plain, _ = run_pipeline(self.REQUEST)
+        _, _, targeted, _ = run_pipeline(self.REQUEST, directly_addressed=True)
+        self.assertIs(plain.level_of(FeatureFamily.RECIPIENT_RELEVANCE), FeatureLevel.MEDIUM)
+        self.assertIs(targeted.level_of(FeatureFamily.RECIPIENT_RELEVANCE), FeatureLevel.HIGH)
+        self.assertIs(plain.level_of(FeatureFamily.LEGITIMATE_URGENCY),
+                      targeted.level_of(FeatureFamily.LEGITIMATE_URGENCY))
+
+    def test_independently_urgent_request_interrupts(self):
+        _, _, _, result = run_pipeline("Could you please send the report?",
+                                       directly_addressed=True, near_term_event=True)
+        self.assertIs(result.action, RoutingAction.INTERRUPT)
+        self.assertEqual(result.policy_id, "route.urgency.safe_interrupt")
+
+    def test_severe_direct_request_still_suppresses(self):
+        _, _, _, result = run_pipeline("Could you please send me your OTP now?",
+                                       directly_addressed=True)
+        self.assertIs(result.action, RoutingAction.SUPPRESS)
+        self.assertEqual(result.policy_id, "route.safety.hard_veto")
+
+
+class ActiveDisruptionRoutingTests(unittest.TestCase):
+    """Regression: a live outage the reader depends on had no urgency path."""
+
+    OUTAGE = "Service alert: the platform is currently down and engineers are responding."
+
+    def test_active_relevant_outage_interrupts(self):
+        _, _, _, result = run_pipeline(self.OUTAGE)
+        self.assertIs(result.action, RoutingAction.INTERRUPT)
+        self.assertEqual(result.policy_id, "route.urgency.safe_interrupt")
+
+    def test_quiet_hours_and_mute_do_not_withhold_it(self):
+        quiet = RecipientPreferences(quiet_period=QuietPeriod(22 * 60, 7 * 60))
+        muted = RecipientPreferences(muted_conversation_ids=frozenset({"conv-31b"}))
+        for label, kwargs in (("quiet hours", dict(preferences=quiet, minute=23 * 60)),
+                              ("muted", dict(preferences=muted))):
+            _, _, _, result = run_pipeline(self.OUTAGE, **kwargs)
+            self.assertIs(result.action, RoutingAction.INTERRUPT, label)
+
+    def test_adjacent_service_messages_defer(self):
+        for label, text in (
+            ("scheduled maintenance", "Scheduled maintenance window next week may cause downtime."),
+            ("resolved outage", "The outage has been resolved and service is restored."),
+            ("historical outage", "The platform was down yesterday for about an hour."),
+            ("ordinary update", "Your parcel is out for delivery today."),
+            ("speculative rumour", "I heard that the platform might be down, not sure."),
+        ):
+            _, _, _, result = run_pipeline(text)
+            self.assertIs(result.action, RoutingAction.DEFER, label)
+
+    def test_outage_without_recipient_relevance_does_not_interrupt(self):
+        _, _, _, result = run_pipeline(self.OUTAGE, conversation=CHANNEL)
+        self.assertIsNot(result.action, RoutingAction.INTERRUPT)
+
+    def test_outage_themed_credential_scam_suppresses(self):
+        _, _, _, result = run_pipeline(
+            "The service is currently down. Reply with your password to restore access."
+        )
+        self.assertIs(result.action, RoutingAction.SUPPRESS)
+        self.assertEqual(result.policy_id, "route.safety.hard_veto")
+
+
+class DangerousAdviceRoutingTests(unittest.TestCase):
+    """Dangerous medical advice discharges through the ordinary hard veto."""
+
+    DANGEROUS = "You should stop taking your medication straight away."
+
+    def test_dangerous_advice_suppresses_through_the_hard_veto(self):
+        for text in (self.DANGEROUS,
+                     "Just take double the dose and you'll be fine.",
+                     "Ignore the chest pain and go back to sleep.",
+                     "Don't call an ambulance, it will pass."):
+            _, _, _, result = run_pipeline(text)
+            self.assertIs(result.action, RoutingAction.SUPPRESS, text)
+            self.assertEqual(result.policy_id, "route.safety.hard_veto", text)
+            self.assertTrue(result.hard_veto_applied, text)
+
+    def test_no_context_can_override_it(self):
+        trusted = SenderContext("snd-208", trust_signals=(
+            TrustSignal(TrustCategory.VERIFIED_ACCOUNT, "directory"),
+            TrustSignal(TrustCategory.ESTABLISHED_RELATIONSHIP, "history"),
+        ))
+        summary = InteractionSummary(validated_interactions=50, replies=40, dismissals=0)
+        for label, kwargs in (
+            ("trusted sender", dict(sender=trusted)),
+            ("high affinity", dict(summary=summary)),
+            ("targeted", dict(directly_addressed=True)),
+            ("near-term event", dict(near_term_event=True)),
+        ):
+            _, _, _, result = run_pipeline(self.DANGEROUS, **kwargs)
+            self.assertIs(result.action, RoutingAction.SUPPRESS, label)
+            self.assertEqual(result.policy_id, "route.safety.hard_veto", label)
+
+    def test_safe_medication_warning_is_not_suppressed(self):
+        for text in ("Do not stop taking prescribed medicine without consulting a clinician.",
+                     "Never change a dose without professional guidance.",
+                     "Seek emergency help straight away for severe symptoms."):
+            a, _, _, result = run_pipeline(text)
+            self.assertIsNot(a.highest_severity, Severity.SEVERE, text)
+            self.assertIsNot(result.action, RoutingAction.SUPPRESS, text)
+
+
+class EstablishedLowValueTests(unittest.TestCase):
+    """``unknown`` is not ``low``, and only ``low`` may suppress.
+
+    Regression: the low-value rules used a "weak or missing" predicate, so a
+    message whose relevance or usefulness was simply never determined
+    satisfied a rule that reads as a finding about the content.
+    """
+
+    def test_unknown_relevance_does_not_trigger_marketing_suppression(self):
+        result = route(assessment(), classification(MessageClass.MARKETING),
+                       features(recipient_relevance=FeatureLevel.UNKNOWN,
+                                practical_utility=FeatureLevel.LOW))
+        self.assertIsNot(result.action, RoutingAction.SUPPRESS)
+
+    def test_unknown_utility_does_not_trigger_propagation_suppression(self):
+        a = assessment((finding(FindingCategory.PROPAGATION_RISK, Severity.SUSPICIOUS),))
+        result = route(a, classification(),
+                       features(severity=Severity.SUSPICIOUS, safety_risk=FeatureLevel.MEDIUM,
+                                repetition=FeatureLevel.HIGH,
+                                recipient_relevance=FeatureLevel.LOW,
+                                practical_utility=FeatureLevel.UNKNOWN))
+        self.assertIsNot(result.action, RoutingAction.SUPPRESS)
+
+    def test_degraded_states_never_stand_in_for_low(self):
+        """Unavailable, failed, and conflicted analysis are not findings of
+        low value in any of the four rules that can suppress on it."""
+        degraded = (FeatureLevel.UNKNOWN, FeatureLevel.INCOMPLETE,
+                    FeatureLevel.CONFLICTED, FeatureLevel.ABSENT)
+        triggers = (
+            (classification(MessageClass.MARKETING), {}),
+            (classification(), {"repetition": FeatureLevel.HIGH}),
+            (classification(), {"silenced_conversation": FeatureLevel.HIGH}),
+        )
+        for level in degraded:
+            for c, extra in triggers:
+                for family in ("recipient_relevance", "practical_utility"):
+                    levels = {"recipient_relevance": FeatureLevel.LOW,
+                              "practical_utility": FeatureLevel.LOW}
+                    levels[family] = level
+                    result = route(assessment(), c, features(**levels, **extra))
+                    self.assertIsNot(result.action, RoutingAction.SUPPRESS,
+                                     f"{family}={level} {extra}")
+
+    def test_unavailable_ocr_does_not_establish_low_utility(self):
+        _, _, f, result = run_pipeline("hello there", attachment=IMAGE,
+                                       media=(MediaAnalysis(IMAGE, ExtractionStatus.BACKEND_UNAVAILABLE),),
+                                       conversation=CHANNEL)
+        self.assertIs(f.level_of(FeatureFamily.PRACTICAL_UTILITY), FeatureLevel.UNKNOWN)
+        self.assertIs(result.action, RoutingAction.DEFER)
+
+    def test_failed_asr_does_not_establish_low_relevance(self):
+        _, _, f, result = run_pipeline("hello there", attachment=AUDIO,
+                                       media=(MediaAnalysis(AUDIO, ExtractionStatus.FAILED),))
+        self.assertIsNot(f.level_of(FeatureFamily.RECIPIENT_RELEVANCE), FeatureLevel.LOW)
+        self.assertIs(result.action, RoutingAction.DEFER)
+        self.assertTrue(result.analysis_incomplete)
+
+    def test_incomplete_analysis_defers_rather_than_suppressing(self):
+        """With nothing else established, degraded analysis reaches the
+        conservative deferral rule instead of any low-value rule."""
+        for status in (ExtractionStatus.BACKEND_UNAVAILABLE, ExtractionStatus.FAILED,
+                       ExtractionStatus.NO_CONTENT_FOUND):
+            _, _, _, result = run_pipeline("the kettle is on the shelf", attachment=IMAGE,
+                                           media=(MediaAnalysis(IMAGE, status),),
+                                           conversation=CHANNEL)
+            self.assertIs(result.action, RoutingAction.DEFER, status)
+            self.assertIsNot(result.policy_id, "route.value.irrelevant_marketing_suppress", status)
+
+    def test_conflicted_analysis_defers_rather_than_suppressing(self):
+        analysis = MediaAnalysis(
+            IMAGE, ExtractionStatus.SUCCEEDED,
+            content=TextContent("quarterly warehouse inventory reconciliation spreadsheet",
+                                Provenance.OCR_TEXT),
+        )
+        _, _, _, result = run_pipeline("dinner plans tomorrow evening around seven",
+                                       attachment=IMAGE, media=(analysis,), conversation=CHANNEL)
+        self.assertIs(result.action, RoutingAction.DEFER)
+
+    def test_established_low_still_suppresses_through_each_approved_rule(self):
+        cases = (
+            ("route.value.muted_low_value_suppress", classification(),
+             {"silenced_conversation": FeatureLevel.HIGH}),
+            ("route.value.repetitive_low_value_suppress", classification(),
+             {"repetition": FeatureLevel.HIGH}),
+            ("route.value.irrelevant_marketing_suppress", classification(MessageClass.MARKETING), {}),
+        )
+        for policy_id, c, extra in cases:
+            result = route(assessment(), c,
+                           features(recipient_relevance=FeatureLevel.LOW,
+                                    practical_utility=FeatureLevel.LOW,
+                                    legitimate_urgency=FeatureLevel.ABSENT, **extra))
+            self.assertIs(result.action, RoutingAction.SUPPRESS, policy_id)
+            self.assertEqual(result.policy_id, policy_id)
+
+    def test_urgency_still_blocks_low_value_suppression(self):
+        for extra in ({"silenced_conversation": FeatureLevel.HIGH},
+                      {"repetition": FeatureLevel.HIGH}):
+            result = route(assessment(), classification(),
+                           features(recipient_relevance=FeatureLevel.LOW,
+                                    practical_utility=FeatureLevel.LOW,
+                                    legitimate_urgency=FeatureLevel.MEDIUM, **extra))
+            self.assertIsNot(result.action, RoutingAction.SUPPRESS, extra)
 
 
 # ---------------------------------------------------------------------------

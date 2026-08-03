@@ -29,6 +29,7 @@ from .features import (
     FeatureNote,
     InteractionSummary,
     ModalityConsistency,
+    RiskFamily,
     SupportSource,
     extract_features,
 )
@@ -51,5 +52,6 @@ __all__ = [
     "ModalityConsistency",
     "Completeness",
     "ContentAvailability",
+    "RiskFamily",
     "InteractionSummary",
 ]

@@ -220,12 +220,23 @@ class UrgencyTests(unittest.TestCase):
         f = self.features_for("Fire alarm activated, please evacuate the building")
         self.assertIs(f.level_of(FeatureFamily.LEGITIMATE_URGENCY), FeatureLevel.HIGH)
 
-    def test_near_term_appointment_and_direct_request_are_urgent(self):
-        for text in ("Your appointment is scheduled for Tuesday at 10am",
-                     "Could you please send the file?"):
+    def test_dated_commitment_carries_urgency(self):
+        f = self.features_for("Your appointment is scheduled for Tuesday at 10am")
+        self.assertIn(f.level_of(FeatureFamily.LEGITIMATE_URGENCY),
+                      (FeatureLevel.MEDIUM, FeatureLevel.HIGH))
+
+    def test_a_plain_request_carries_no_urgency(self):
+        """Regression: request grammar is not a time-sensitivity signal.
+
+        Being asked something is not being asked something urgently, and
+        treating it as such hands out priority for phrasing alone.
+        """
+        for text in ("Could you please send the file?",
+                     "Can you let me know what time works?",
+                     "Please send the report when you can",
+                     "I need you to check the figures"):
             f = self.features_for(text)
-            self.assertIn(f.level_of(FeatureFamily.LEGITIMATE_URGENCY),
-                          (FeatureLevel.MEDIUM, FeatureLevel.HIGH), text)
+            self.assertIs(f.level_of(FeatureFamily.LEGITIMATE_URGENCY), FeatureLevel.ABSENT, text)
 
     def test_ordinary_content_is_not_urgent(self):
         for text in ("20% off our new collection, shop now", "Good morning! Hope you're well"):
@@ -269,6 +280,190 @@ class UrgencyTests(unittest.TestCase):
         self.assertIs(f.level_of(FeatureFamily.LEGITIMATE_URGENCY), FeatureLevel.HIGH)
         self.assertIs(f.level_of(FeatureFamily.QUIET_HOURS_IMPACT), FeatureLevel.HIGH)
         self.assertIs(f.level_of(FeatureFamily.SILENCED_CONVERSATION), FeatureLevel.HIGH)
+
+
+class UrgencyOriginationTests(unittest.TestCase):
+    """What is allowed to *create* legitimate urgency, and what only amplifies it.
+
+    Regression: a plain request classified as ``DIRECT_REQUEST`` originated
+    urgency, and direct targeting then amplified it to ``high``, so an
+    ordinary "could you send this sometime" reached the interrupt threshold
+    on phrasing plus metadata alone.
+    """
+
+    def features_for(self, text, *, directly_addressed=False, near_term_event=False):
+        msg = message(text)
+        assessment = analyze_message(msg)
+        result = classify(((text, Provenance.AUTHORED_TEXT),), assessment,
+                          directly_addressed=directly_addressed)
+        return extract_features(msg, assessment, result,
+                                directly_addressed=directly_addressed,
+                                near_term_event=near_term_event)
+
+    def urgency_rules(self, f):
+        return {c.rule_id for c in f.get(FeatureFamily.LEGITIMATE_URGENCY).contributors}
+
+    def test_a_request_alone_originates_no_urgency(self):
+        f = self.features_for("Could you please send the report sometime?")
+        self.assertIs(f.level_of(FeatureFamily.LEGITIMATE_URGENCY), FeatureLevel.ABSENT)
+        self.assertEqual(self.urgency_rules(f), set())
+
+    def test_targeting_alone_originates_no_urgency(self):
+        for text in ("Could you please send the report sometime?",
+                     "20% off our new collection, shop now",
+                     "the kettle is on the shelf"):
+            f = self.features_for(text, directly_addressed=True)
+            self.assertIs(f.level_of(FeatureFamily.LEGITIMATE_URGENCY), FeatureLevel.ABSENT, text)
+            self.assertNotIn("URGENCY_DIRECT_TARGET", self.urgency_rules(f), text)
+
+    def test_targeting_still_contributes_relevance(self):
+        plain = self.features_for("Could you please send the report sometime?")
+        targeted = self.features_for("Could you please send the report sometime?",
+                                     directly_addressed=True)
+        self.assertIs(plain.level_of(FeatureFamily.RECIPIENT_RELEVANCE), FeatureLevel.MEDIUM)
+        self.assertIs(targeted.level_of(FeatureFamily.RECIPIENT_RELEVANCE), FeatureLevel.HIGH)
+
+    def test_targeting_amplifies_only_independently_established_urgency(self):
+        independent = self.features_for("Could you please send the report?", near_term_event=True)
+        amplified = self.features_for("Could you please send the report?",
+                                      near_term_event=True, directly_addressed=True)
+        self.assertIs(independent.level_of(FeatureFamily.LEGITIMATE_URGENCY), FeatureLevel.MEDIUM)
+        self.assertIs(amplified.level_of(FeatureFamily.LEGITIMATE_URGENCY), FeatureLevel.HIGH)
+        self.assertIn("URGENCY_DIRECT_TARGET", self.urgency_rules(amplified))
+
+    def test_targeting_never_moves_absent_or_unknown_upward(self):
+        """Targeting must not turn absent into low, or unknown into
+        established. With nothing to amplify it adds no contributor at all."""
+        for text in ("the kettle is on the shelf", "THE KETTLE IS ON THE SHELF",
+                     "the kettle is on the shelf!!!!!", "urgent", "immediately"):
+            plain = self.features_for(text)
+            targeted = self.features_for(text, directly_addressed=True)
+            self.assertIs(plain.level_of(FeatureFamily.LEGITIMATE_URGENCY), FeatureLevel.ABSENT, text)
+            self.assertIs(targeted.level_of(FeatureFamily.LEGITIMATE_URGENCY),
+                          FeatureLevel.ABSENT, text)
+
+
+class ActiveDisruptionTests(unittest.TestCase):
+    """A service the reader depends on being down *now* is urgency-bearing.
+
+    Everything adjacent to it deliberately is not: a maintenance notice, a
+    resolved incident, a retrospective, a rumour, and an ordinary status
+    update all describe something that is not happening to the reader right
+    now.
+    """
+
+    ACTIVE = (
+        "Service alert: the platform is currently down and engineers are responding.",
+        "We are experiencing a major outage affecting logins right now.",
+        "The payment system is currently unavailable; there is an ongoing incident.",
+    )
+    NOT_ACTIVE = (
+        "Scheduled maintenance window next week may cause downtime.",
+        "The outage has been resolved and service is restored.",
+        "The platform was down yesterday for about an hour.",
+        "I heard that the platform might be down, not sure.",
+        "Your parcel is out for delivery today.",
+        "Your account has been updated successfully.",
+        "This guide explains what to do when the service is down.",
+    )
+
+    def features_for(self, text):
+        msg = message(text)
+        assessment = analyze_message(msg)
+        result = classify(((text, Provenance.AUTHORED_TEXT),), assessment)
+        return result, extract_features(msg, assessment, result)
+
+    def test_active_disruption_originates_urgency(self):
+        for text in self.ACTIVE:
+            result, f = self.features_for(text)
+            self.assertIn("CLS_ACTIVE_DISRUPTION", {c.rule_id for c in result.contributors}, text)
+            self.assertIs(f.level_of(FeatureFamily.LEGITIMATE_URGENCY), FeatureLevel.HIGH, text)
+
+    def test_everything_adjacent_to_it_does_not(self):
+        for text in self.NOT_ACTIVE:
+            result, f = self.features_for(text)
+            self.assertNotIn("CLS_ACTIVE_DISRUPTION", {c.rule_id for c in result.contributors}, text)
+            self.assertIs(f.level_of(FeatureFamily.LEGITIMATE_URGENCY), FeatureLevel.ABSENT, text)
+
+    def test_disruption_urgency_keeps_its_provenance(self):
+        text = "Service alert: the platform is currently down and engineers are responding."
+        msg = message(attachment=IMAGE)
+        analysis = MediaAnalysis(IMAGE, ExtractionStatus.SUCCEEDED,
+                                 content=TextContent(text, Provenance.OCR_TEXT))
+        assessment = analyze_message(msg, media_analyses=(analysis,))
+        result = classify(((text, Provenance.OCR_TEXT),), assessment)
+        f = extract_features(msg, assessment, result)
+        urgency = f.get(FeatureFamily.LEGITIMATE_URGENCY)
+        disruption = [c for c in urgency.contributors if c.rule_id == "URGENCY_ACTIVE_DISRUPTION"]
+        self.assertTrue(disruption)
+        self.assertIs(disruption[0].provenance, Provenance.OCR_TEXT)
+
+    def test_scam_pressure_stays_separate_from_disruption_urgency(self):
+        text = ("The service is currently down. Pay immediately via gift cards to restore access. "
+                "Do not contact support.")
+        msg = message(text)
+        assessment = analyze_message(msg)
+        result = classify(((text, Provenance.AUTHORED_TEXT),), assessment)
+        f = extract_features(msg, assessment, result)
+        self.assertIn(f.level_of(FeatureFamily.MALICIOUS_PRESSURE),
+                      (FeatureLevel.MEDIUM, FeatureLevel.HIGH))
+        pressure = f.get(FeatureFamily.MALICIOUS_PRESSURE)
+        for contributor in pressure.contributors:
+            self.assertIs(contributor.source, SupportSource.SAFETY_FINDINGS)
+        urgency = f.get(FeatureFamily.LEGITIMATE_URGENCY)
+        self.assertIn(FeatureNote.URGENCY_WITHHELD_RISK_ATTRIBUTED,
+                      {c.note for c in urgency.contributors})
+
+
+class RiskFamilyProjectionTests(unittest.TestCase):
+    """Independent risk families, projected from findings and deduplicated."""
+
+    def families_for(self, text):
+        msg = message(text)
+        assessment = analyze_message(msg)
+        result = classify(((text, Provenance.AUTHORED_TEXT),), assessment)
+        return extract_features(msg, assessment, result).risk_families
+
+    def test_ordinary_content_projects_no_families(self):
+        for text in ("Invoice number 8841 for your subscription. Due date is Friday.",
+                     "Your parcel is out for delivery today",
+                     "Good morning! Hope you're well"):
+            self.assertEqual(self.families_for(text), frozenset(), text)
+
+    def test_independent_indicators_project_distinct_families(self):
+        from message_router.analysis import RiskFamily
+
+        families = self.families_for("Pay now using gift cards to avoid a penalty.")
+        self.assertIn(RiskFamily.COERCIVE_PAYMENT, families)
+        self.assertIn(RiskFamily.UNUSUAL_PAYMENT_CHANNEL, families)
+
+    def test_weak_and_ambiguous_findings_never_qualify(self):
+        for text in ("Have a look at this",
+                     "I forgot my password again this morning",
+                     "The report is due on Friday, please send it next week"):
+            self.assertEqual(self.families_for(text), frozenset(), text)
+
+    def test_repeated_expressions_of_one_indicator_count_once(self):
+        from message_router.analysis import RiskFamily
+
+        # Two threat phrasings, one underlying pressure indicator.
+        families = self.families_for(
+            "Your account will be suspended and legal action will follow unless you pay now."
+        )
+        self.assertIn(RiskFamily.MALICIOUS_PRESSURE, families)
+        self.assertEqual(
+            len([f for f in families if f is RiskFamily.MALICIOUS_PRESSURE]), 1
+        )
+
+    def test_projection_never_changes_severity(self):
+        msg = message("Pay now and keep this confidential, don't tell anyone.")
+        assessment = analyze_message(msg)
+        result = classify((("x", Provenance.AUTHORED_TEXT),), assessment)
+        f = extract_features(msg, assessment, result)
+        self.assertIs(f.highest_severity, assessment.highest_severity)
+        self.assertIs(f.highest_severity, Severity.SUSPICIOUS)
+        self.assertFalse(f.hard_veto_required)
+        self.assertTrue(f.risk_families)
 
 
 # ---------------------------------------------------------------------------

@@ -115,6 +115,8 @@ class DiagnosticCode(Enum):
     LINK_WITH_PAYMENT_PRESSURE = "link_with_payment_pressure"
     MEDICATION_DISCONTINUATION = "medication_discontinuation"
     DANGEROUS_DOSAGE = "dangerous_dosage"
+    HARMFUL_INGESTION = "harmful_ingestion"
+    EMERGENCY_SYMPTOMS_IGNORED = "emergency_symptoms_ignored"
     EMERGENCY_CARE_DISCOURAGED = "emergency_care_discouraged"
     CONCEALMENT_FROM_CARE = "concealment_from_care"
     HIGH_FORWARD_COUNT = "high_forward_count"

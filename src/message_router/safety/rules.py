@@ -705,59 +705,215 @@ _PROFESSIONAL_GUIDANCE = _compile_all(
     r"\bfollow(?:ing)? (?:your|the) (?:doctor|gp|prescription)\b",
 )
 
+#: Clause boundary. Negation, guidance and directive markers are all read
+#: *within* one clause, because a global "the text contains 'not' somewhere"
+#: exemption is exactly how a warning in one sentence ends up cancelling a
+#: dangerous instruction in the next.
+_CLAUSE_SPLIT_RE = re.compile(r"[.!?;\n]+")
+
+# A negator standing *before* a harmful action turns the clause into a
+# warning against it. Position matters: "don't stop your medication" is
+# advice not to, while "stop your medication and don't tell anyone" is not.
+_ADVICE_NEGATOR = _compile_all(
+    r"\b(?:never|do ?n[o']?t|dont|should ?n[o']?t|shouldnt|must ?n[o']?t|mustnt|avoid|no ?one should)\b",
+    r"\bit(?:'s| is) (?:dangerous|unsafe|risky|not safe|a bad idea) to\b",
+)
+
+# Seeking professional guidance *before* the action is the opposite of
+# advising the action. "Ask your doctor before you stop" is safe; "stop
+# without asking your doctor" is not, and the qualifier trails the verb
+# there, so a position-aware check separates them.
+_SEEK_GUIDANCE_FIRST = _compile_all(
+    r"\b(?:ask|consult|speak (?:to|with)|talk to|check with|contact|call|see)\b[^.]{0,25}"
+    r"\b(?:doctor|gp|physician|clinician|pharmacist|nurse|specialist|consultant)\b",
+    r"\b(?:professional|medical) (?:guidance|advice|supervision)\b",
+)
+
+# Two rules below match text that *is* a negation ("don't call an
+# ambulance"). Their warning form is therefore a double negation or an
+# obligation, which is what this recognizes.
+_ENCOURAGE_CARE = _compile_all(
+    r"\b(?:never|do ?n[o']?t|dont)\b[^.]{0,25}"
+    r"\b(?:hesitate|delay|forget|wait|put off|be afraid|be embarrassed|fail)\b",
+    r"\b(?:always|be sure to|make sure|remember to)\b[^.]{0,25}"
+    r"\b(?:call|contact|tell|inform|see|visit|seek)\b",
+    r"\bif in doubt\b",
+)
+
+# Discussing, quoting, or criticizing dangerous advice is not giving it.
+_ADVICE_CRITICAL_CONTEXT = _compile_all(
+    r"\b(?:if|when|whenever|suppose|imagine)\b[^.]{0,45}"
+    r"\b(?:tells? you|asks? you|says? you should|advises? you)\b",
+    r"\b(?:that|this|it)(?:'s| is| was) (?:dangerous|unsafe|harmful|bad advice|a myth|misinformation)\b",
+    r"\b(?:never|do ?n[o']?t|dont)\b[^.]{0,20}\b(?:follow|listen to|act on|believe)\b",
+    r"\b(?:bad|dangerous|unsafe|harmful) advice\b",
+    r"\b(?:someone|somebody|a friend|a stranger|a caller) (?:told|messaged|texted|said|sent)\b",
+)
+
+# Severe requires the clause to actually direct the reader to act, rather
+# than merely mentioning the action.
+_ADVICE_DIRECTIVE = _compile_all(
+    r"\byou (?:should|shall|must|need to|have to|ought to|can|could|might want to)\b",
+    r"\b(?:just|simply|honestly|seriously)\b",
+    r"\bi (?:recommend|suggest|advise)\b",
+    r"\b(?:make sure|be sure) (?:to|you)\b",
+    r"\bit(?:'s| is) (?:fine|ok|okay|safe|better|best) to\b",
+    r"\byou(?:'ll| will) be fine\b",
+    r"\bno need to\b",
+    r"\btrust me\b",
+)
+
+#: A clause whose harmful verb sits at the front is an imperative.
+_IMPERATIVE_PREFIX_RE = _c(r"^(?:\s*(?:and|then|also|so|but|just|please|ok|okay|hey|,)\s*)*$")
+
+#: ``True`` when the pattern itself contains the harmful negation, so a
+#: leading negator is the *harmful* form rather than the warning form.
+_HARM_IS_NEGATION = True
+_HARM_IS_INSTRUCTION = False
+
 _UNSAFE_ADVICE_RULES = (
     (
         "ADV_STOP_MEDICATION",
         r"\b(?:stop|quit|discontinue|throw away|bin|come off)\b[^.]{0,30}"
         r"\b(?:medication|medicine|tablets|pills|prescription|insulin|antibiotics|inhaler|treatment)\b",
         DiagnosticCode.MEDICATION_DISCONTINUATION,
+        _HARM_IS_INSTRUCTION,
     ),
     (
         "ADV_DANGEROUS_DOSE",
         r"\b(?:take|swallow|use)\b[^.]{0,25}\b(?:double|triple|twice|three times|extra|more than)\b"
         r"[^.]{0,25}\b(?:dose|doses|tablets|pills)\b"
-        r"|\btake\b[^.]{0,15}\b(?:\d{2,})\b[^.]{0,15}\b(?:tablets|pills)\b",
+        r"|\btake\b[^.]{0,15}\b(?:\d{2,})\b[^.]{0,15}\b(?:tablets|pills)\b"
+        r"|\b(?:double|triple|halve)\b[^.]{0,20}\b(?:dose|dosage)\b",
         DiagnosticCode.DANGEROUS_DOSAGE,
+        _HARM_IS_INSTRUCTION,
+    ),
+    (
+        "ADV_HARMFUL_INGESTION",
+        r"\b(?:drink|swallow|ingest|inhale|gargle)\b[^.]{0,25}"
+        r"\b(?:bleach|disinfectant|antifreeze|petrol|gasoline|turpentine|hydrogen peroxide)\b",
+        DiagnosticCode.HARMFUL_INGESTION,
+        _HARM_IS_INSTRUCTION,
+    ),
+    (
+        "ADV_IGNORE_EMERGENCY_SYMPTOMS",
+        r"\b(?:ignore|dismiss|push through|sleep off|walk off|shake off)\b[^.]{0,30}"
+        r"\b(?:chest pain|difficulty breathing|trouble breathing|shortness of breath|"
+        r"heavy bleeding|seizure|stroke|overdose|numbness|slurred speech|symptoms)\b",
+        DiagnosticCode.EMERGENCY_SYMPTOMS_IGNORED,
+        _HARM_IS_INSTRUCTION,
     ),
     (
         "ADV_AVOID_EMERGENCY_CARE",
         r"\b(?:do ?n[o']?t|dont|no need to|avoid)\b[^.]{0,30}"
-        r"\b(?:call an ambulance|go to (?:the )?hospital|emergency room|a ?& ?e|call 9 ?1 ?1|call 9 ?9 ?9|call 1 ?1 ?2|see a doctor|seek help)\b",
+        r"\b(?:call an ambulance|go to (?:the )?hospital|emergency room|a ?& ?e|call 9 ?1 ?1|call 9 ?9 ?9|call 1 ?1 ?2|see a doctor|seek help)\b"
+        r"|\binstead of\b[^.]{0,25}"
+        r"\b(?:calling an ambulance|going to (?:the )?hospital|the emergency room|seeing a doctor|seeking help)\b",
         DiagnosticCode.EMERGENCY_CARE_DISCOURAGED,
+        _HARM_IS_NEGATION,
     ),
     (
         "ADV_CONCEAL_FROM_CARE",
         r"\b(?:do ?n[o']?t|dont|never)\b[^.]{0,25}\b(?:tell|mention|inform|show)\b[^.]{0,25}"
         r"\b(?:doctor|gp|hospital|nurse|paramedic|pharmacist)\b",
         DiagnosticCode.CONCEALMENT_FROM_CARE,
+        _HARM_IS_NEGATION,
     ),
 )
-_UNSAFE_COMPILED = tuple((rid, _c(pat), diag) for rid, pat, diag in _UNSAFE_ADVICE_RULES)
+_UNSAFE_COMPILED = tuple(
+    (rid, _c(pat), diag, negated) for rid, pat, diag, negated in _UNSAFE_ADVICE_RULES
+)
+
+
+def _clauses(text: str) -> tuple[str, ...]:
+    return tuple(part for part in (p.strip() for p in _CLAUSE_SPLIT_RE.split(text)) if part)
+
+
+def _advice_is_warning(clause: str, start: int, harm_is_negation: bool) -> bool:
+    """True when this clause argues *against* the action it names."""
+    if harm_is_negation:
+        # The negation is inside the match, so only a double negation or an
+        # explicit obligation to seek care can flip it back to a warning.
+        return _any(_ENCOURAGE_CARE, clause)
+    prefix = clause[:start]
+    return _any(_ADVICE_NEGATOR, prefix) or _any(_SEEK_GUIDANCE_FIRST, prefix)
+
+
+def _advice_is_directive(clause: str, start: int) -> bool:
+    """True when the clause tells the reader to do it, not merely names it."""
+    return _any(_ADVICE_DIRECTIVE, clause) or bool(_IMPERATIVE_PREFIX_RE.match(clause[:start]))
 
 
 def _evaluate_unsafe_advice(norm: NormalizedText, ctx: ContextFlags) -> list[RuleHit]:
-    text = norm.folded
-    if ctx.is_advisory or ctx.is_discussion:
-        return []
-    guided = _any(_PROFESSIONAL_GUIDANCE, text)
+    """Narrow, clause-local dangerous-advice detection.
+
+    Severity is decided here and nowhere else. A clear, actionable,
+    unambiguous instruction toward substantial physical harm is severe and
+    therefore obliges the ordinary hard veto; everything softer -- a
+    mention, a clinician-guided statement, a hypothetical -- stays below it.
+    No diagnostic, rule identifier, or indicator carries any of the text.
+
+    The *advisory* flag is deliberately not consulted. It recognizes
+    credential warnings, which say nothing about medical advice, and
+    honouring it here would make "never share your password with anyone" a
+    prefix that silences whatever follows it. Educational and quoted framing
+    is read per clause for the same reason, and a document-level discussion
+    tone caps severity rather than exempting a clause outright.
+    """
+    document_is_discussion = ctx.is_discussion
     hits: list[RuleHit] = []
-    for rule_id, pattern, diagnostic in _UNSAFE_COMPILED:
-        if not pattern.search(text):
+    for clause in _clauses(norm.folded):
+        if (
+            _any(_ADVICE_CRITICAL_CONTEXT, clause)
+            or _any(_EDUCATIONAL_PATTERNS, clause)
+            or _any(_QUOTED_PATTERNS, clause)
+        ):
+            # Quoting, supposing, teaching, or condemning it -- not giving it.
             continue
-        if guided:
-            # Relaying what a clinician actually said is not unsafe advice.
+        guided = _any(_PROFESSIONAL_GUIDANCE, clause)
+        for rule_id, pattern, diagnostic, harm_is_negation in _UNSAFE_COMPILED:
+            match = pattern.search(clause)
+            if match is None:
+                continue
+            if _advice_is_warning(clause, match.start(), harm_is_negation):
+                continue
+            if guided:
+                # Relaying what a clinician actually said is not unsafe advice.
+                hits.append(
+                    RuleHit(
+                        FindingCategory.UNSAFE_ADVICE,
+                        Severity.WEAK,
+                        rule_id,
+                        diagnostic,
+                        ambiguous=True,
+                    )
+                )
+                continue
+            if _advice_is_directive(clause, match.start()) and not document_is_discussion:
+                hits.append(
+                    RuleHit(FindingCategory.UNSAFE_ADVICE, Severity.SEVERE, rule_id, diagnostic)
+                )
+                continue
             hits.append(
                 RuleHit(
                     FindingCategory.UNSAFE_ADVICE,
-                    Severity.WEAK,
+                    Severity.SUSPICIOUS,
                     rule_id,
                     diagnostic,
-                    ambiguous=True,
+                    ambiguous=document_is_discussion,
                 )
             )
-            continue
-        hits.append(RuleHit(FindingCategory.UNSAFE_ADVICE, Severity.SUSPICIOUS, rule_id, diagnostic))
-    return hits
+    return _deduplicate(hits)
+
+
+def _deduplicate(hits: list[RuleHit]) -> list[RuleHit]:
+    """Keep the strongest hit per rule; clauses must not multiply findings."""
+    strongest: dict[str, RuleHit] = {}
+    for hit in hits:
+        current = strongest.get(hit.rule_id)
+        if current is None or hit.severity.rank > current.severity.rank:
+            strongest[hit.rule_id] = hit
+    return [strongest[rule_id] for rule_id in sorted(strongest)]
 
 
 # ---------------------------------------------------------------------------

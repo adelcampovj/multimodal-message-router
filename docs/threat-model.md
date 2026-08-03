@@ -79,7 +79,11 @@ classes suppress or downgrade request-shaped rules:
 
 * **warning** — "we will never ask for your code" is advice, not a request.
   Scoped to warnings *about credentials*, so "don't tell anyone" and
-  "don't tell your doctor" are not mistaken for security advice.
+  "don't tell your doctor" are not mistaken for security advice. For the
+  same reason it is not consulted by the unsafe-advice family at all: a
+  password warning says nothing about medical advice, and honouring it there
+  would make "never share your password" a prefix that silences whatever
+  follows it.
 * **notification** — "your code is …" delivers something. It does **not**
   suppress a genuine request in the same message: "your code is X, now send
   it to me" is still severe.
@@ -134,8 +138,26 @@ receive identical analysis.
   imitation of a specific well-known domain is only caught when its shape
   is itself suspicious.
 * **Unsafe advice is deliberately narrow.** It flags a few explicit
-  dangerous instructions. It does not diagnose, does not classify medical
-  conversation, and emits no health details.
+  dangerous instructions — stopping prescribed medication, a substantially
+  changed dose, ingesting something clearly harmful, ignoring emergency
+  symptoms, avoiding or replacing emergency care, and concealing a condition
+  from care. It does not diagnose, does not classify medical conversation,
+  and emits no health details.
+
+  Negation is read *within the clause* and relative to the harmful action,
+  never as a global "the text contains 'not'" exemption — that would let one
+  safe sentence cancel a dangerous one. "Do not stop taking prescribed
+  medicine without consulting a clinician" is a warning; "stop taking your
+  medicine, and don't tell your doctor" is two dangerous clauses. Two rules
+  match text that *is* a negation ("don't call an ambulance"), so their
+  warning form is a double negation — "don't hesitate to call an ambulance"
+  — recognized separately.
+
+  A clause becomes **severe** only when it is a clear, actionable, unnegated
+  instruction: a directive or an imperative, not a mention, a hypothetical,
+  a quotation, or a clinician-guided statement. Severe discharges through
+  the ordinary hard veto; there is no medical-specific routing path, and
+  trust, affinity, relevance, and urgency cannot reach it.
 * **Processing is bounded** at 20,000 characters per source; longer content
   is analysed up to the limit and flagged as truncated.
 

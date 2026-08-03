@@ -10,10 +10,18 @@ Precedence, highest first:
 1. ``route.safety.hard_veto`` -- a safety obligation, short-circuited
 2. ``route.risk.*`` -- explicit suspicious combinations
 3. ``route.urgency.safe_interrupt`` -- safe, supported, genuinely urgent
-4. ``route.value.*`` -- explicit low-value or unwanted suppression
+4. ``route.value.*`` -- positively established low-value suppression
 5. ``route.utility.safe_defer`` -- safe and useful, but not urgent
 6. ``route.analysis.incomplete_defer`` -- ambiguous, conflicted, or degraded
 7. ``route.default.defer`` -- nothing matched
+
+Tier 2 never invents risk. It fires only on two *independent* families of
+corroborated risk projected from the safety layer's own findings, at least
+one of them substantive, and it never promotes a severity or fabricates a
+veto: a suspicious message that suppresses here is still suspicious
+afterwards. Tier 4 requires value to have been positively established as
+low; ``unknown``, ``incomplete``, and ``conflicted`` are not evidence and
+fall through to deferral.
 
 Rule 1 returns before any later predicate is even called, which is what
 makes the veto a genuine obligation rather than a strong preference: no
@@ -37,14 +45,15 @@ from ..analysis.features import (
     FeatureFamily,
     FeatureLevel,
     ModalityConsistency,
+    RiskFamily,
     SupportSource,
 )
 from ..domain.enums import RoutingAction
 from ..domain.errors import ValidationError, ValidationIssue
-from ..safety.models import FindingCategory, SafetyAssessment
+from ..safety.models import SafetyAssessment
 from .models import ContributorEffect, RoutingContributor, RoutingDiagnostic, RoutingResult
 
-__all__ = ["RoutingPolicy", "route", "POLICY_ORDER"]
+__all__ = ["RoutingPolicy", "route", "POLICY_ORDER", "RISK_COMBINATIONS"]
 
 #: Explicit qualitative ordering. Used only for local comparisons inside a
 #: single rule -- never summed across families, and never consulted before
@@ -70,20 +79,27 @@ def _at_least(level: FeatureLevel, floor: FeatureLevel) -> bool:
     return _LEVEL_ORDER[level] >= _LEVEL_ORDER[floor]
 
 
-def _is_weak_or_missing(level: FeatureLevel) -> bool:
-    """True when a level offers no positive support."""
-    return _LEVEL_ORDER[level] <= 1
-
-
 def _is_established_low(level: FeatureLevel) -> bool:
-    """True only when a level was *established* as low or absent.
+    """True only when a level was positively established as ``low``.
 
-    ``UNKNOWN`` deliberately fails this: "we could not determine any value"
-    is not the same finding as "we determined there is little value", and a
-    rule that suppresses on the former would suppress whenever context
-    happened to be missing.
+    Explicit equality against one member, deliberately. ``UNKNOWN`` means
+    nothing determined it; ``INCOMPLETE`` and ``CONFLICTED`` mean the
+    analysis behind it was degraded or disagreed; ``ABSENT`` is a statement
+    about presence, not about value. None of them is a finding of low value,
+    and a suppression built on any of them would fire whenever context
+    happened to be missing -- which is a failure mode, not a policy.
     """
-    return level in (FeatureLevel.ABSENT, FeatureLevel.LOW)
+    return level is FeatureLevel.LOW
+
+
+def _is_not_urgent(level: FeatureLevel) -> bool:
+    """Guard, not evidence: nothing here supports interrupting.
+
+    Distinct from :func:`_is_established_low` on purpose. This does not
+    claim urgency was determined to be low; it only refuses to suppress
+    something that has positive urgency support.
+    """
+    return not _at_least(level, FeatureLevel.MEDIUM)
 
 
 #: Completeness and consistency states that make a decision materially
@@ -107,15 +123,48 @@ _DEGRADED_CONSISTENCY = frozenset(
     }
 )
 
-_PAYMENT_CONCERNS = frozenset(
-    {
-        FindingCategory.COERCIVE_PAYMENT,
-        FindingCategory.CREDENTIAL_SOLICITATION,
-        FindingCategory.ADVANCE_FEE,
-        FindingCategory.FINANCIAL_REQUEST,
-    }
+#: The explicit suspicious combinations, as data: ``(policy_id, anchor,
+#: corroborators)``. A combination fires only when the anchor family and at
+#: least one corroborating family are both present, which is two independent
+#: families by construction; families are projected from safety findings by
+#: fixed diagnostic code, so two expressions of the same indicator collapse
+#: to one family and cannot corroborate each other.
+#:
+#: Every entry is additionally required to contain a *substantive* family --
+#: asserted by a test over this table rather than trusted -- so manufactured
+#: pressure, a repeated modality, or a suspicious-looking domain can never
+#: combine into a suppression without something substantive to corroborate.
+RISK_COMBINATIONS: tuple[tuple[str, RiskFamily, frozenset[RiskFamily]], ...] = (
+    (
+        "route.risk.identity_credential_suppress",
+        RiskFamily.IDENTITY_INCONSISTENCY,
+        frozenset({RiskFamily.INFORMATION_REQUEST, RiskFamily.COERCIVE_PAYMENT,
+                   RiskFamily.UNUSUAL_PAYMENT_CHANNEL, RiskFamily.ADVANCE_FEE}),
+    ),
+    (
+        "route.risk.payment_link_suppress",
+        RiskFamily.DECEPTIVE_LINK,
+        frozenset({RiskFamily.COERCIVE_PAYMENT, RiskFamily.UNUSUAL_PAYMENT_CHANNEL,
+                   RiskFamily.INFORMATION_REQUEST, RiskFamily.ADVANCE_FEE}),
+    ),
+    (
+        "route.risk.advance_fee_pressure_suppress",
+        RiskFamily.ADVANCE_FEE,
+        frozenset({RiskFamily.MALICIOUS_PRESSURE, RiskFamily.COERCIVE_PAYMENT,
+                   RiskFamily.UNUSUAL_PAYMENT_CHANNEL, RiskFamily.CORROBORATING_MODALITY}),
+    ),
+    (
+        "route.risk.unusual_channel_suppress",
+        RiskFamily.UNUSUAL_PAYMENT_CHANNEL,
+        frozenset({RiskFamily.COERCIVE_PAYMENT, RiskFamily.MALICIOUS_PRESSURE,
+                   RiskFamily.CORROBORATING_MODALITY}),
+    ),
+    (
+        "route.risk.coercion_pressure_suppress",
+        RiskFamily.COERCIVE_PAYMENT,
+        frozenset({RiskFamily.MALICIOUS_PRESSURE, RiskFamily.CORROBORATING_MODALITY}),
+    ),
 )
-_IDENTITY_CONCERNS = frozenset({FindingCategory.IMPERSONATION, FindingCategory.DECEPTIVE_LINK})
 
 
 @dataclass(frozen=True)
@@ -172,42 +221,50 @@ def _rule_hard_veto(inputs: _Inputs) -> RoutingResult | None:
     )
 
 
-def _rule_pressure_suppress(inputs: _Inputs) -> RoutingResult | None:
-    """Rule 2A. Suspicious risk *and* high manufactured pressure."""
-    if not _at_least(inputs.level(FeatureFamily.SAFETY_RISK), FeatureLevel.MEDIUM):
-        return None
-    if inputs.level(FeatureFamily.MALICIOUS_PRESSURE) is not FeatureLevel.HIGH:
-        return None
-    return _suppress(
-        inputs,
-        "route.risk.pressure_suppress",
-        (FeatureFamily.SAFETY_RISK, "RISK_SUSPICIOUS"),
-        (FeatureFamily.MALICIOUS_PRESSURE, "PRESSURE_HIGH"),
-    )
+def _make_risk_rule(
+    policy_id: str, anchor: RiskFamily, corroborators: frozenset[RiskFamily]
+) -> Callable[[_Inputs], "RoutingResult | None"]:
+    """Build one explicit suspicious-combination rule.
 
+    Reads projected risk families and qualitative levels only. Severity and
+    the veto obligation are untouched: a combination that fires here reports
+    ``hard_veto_applied=False`` and leaves the assessment exactly as the
+    safety layer wrote it.
+    """
 
-def _rule_payment_identity_suppress(inputs: _Inputs) -> RoutingResult | None:
-    """Rule 2B. A payment or credential concern corroborated by identity or link deception."""
-    if not _at_least(inputs.level(FeatureFamily.SAFETY_RISK), FeatureLevel.MEDIUM):
-        return None
-    categories = inputs.assessment.categories
-    if not (categories & _PAYMENT_CONCERNS) or not (categories & _IDENTITY_CONCERNS):
-        return None
-    return _suppress(
-        inputs,
-        "route.risk.payment_identity_suppress",
-        (FeatureFamily.SAFETY_RISK, "RISK_PAYMENT_CONCERN"),
-        (FeatureFamily.MALICIOUS_PRESSURE, "RISK_IDENTITY_OR_LINK"),
-    )
+    def _rule(inputs: _Inputs) -> RoutingResult | None:
+        families = inputs.features.risk_families
+        if anchor not in families:
+            return None
+        matched = corroborators & families
+        if not matched:
+            return None
+        corroborator = sorted(matched, key=lambda family: family.value)[0]
+        if not (anchor.is_substantive or corroborator.is_substantive):
+            return None
+        return _suppress(
+            inputs,
+            policy_id,
+            (FeatureFamily.SAFETY_RISK, f"RISK_{anchor.name}"),
+            (FeatureFamily.MALICIOUS_PRESSURE, f"RISK_{corroborator.name}"),
+        )
+
+    return _rule
 
 
 def _rule_propagation_low_value_suppress(inputs: _Inputs) -> RoutingResult | None:
-    """Rule 2C. Heavily circulated content with nothing in it for this reader."""
+    """Circulated content with suspicious risk and nothing in it for this reader.
+
+    Both value conditions must be *established* low. Circulation plus
+    "we never found out" is not evidence of worthlessness.
+    """
     if inputs.level(FeatureFamily.REPETITION) is not FeatureLevel.HIGH:
         return None
-    if not _is_weak_or_missing(inputs.level(FeatureFamily.RECIPIENT_RELEVANCE)):
+    if not _is_established_low(inputs.level(FeatureFamily.RECIPIENT_RELEVANCE)):
         return None
-    if not _is_weak_or_missing(inputs.level(FeatureFamily.PRACTICAL_UTILITY)):
+    if not _is_established_low(inputs.level(FeatureFamily.PRACTICAL_UTILITY)):
+        return None
+    if not _is_not_urgent(inputs.level(FeatureFamily.LEGITIMATE_URGENCY)):
         return None
     if not _at_least(inputs.level(FeatureFamily.SAFETY_RISK), FeatureLevel.MEDIUM):
         return None
@@ -255,12 +312,14 @@ def _rule_safe_interrupt(inputs: _Inputs) -> RoutingResult | None:
 
 
 def _rule_irrelevant_marketing_suppress(inputs: _Inputs) -> RoutingResult | None:
-    """Rule 4A. A promotion with neither relevance nor usefulness."""
+    """A promotion established to be neither relevant nor useful here."""
     if inputs.classification.selected is not MessageClass.MARKETING:
         return None
-    if not _is_weak_or_missing(inputs.level(FeatureFamily.RECIPIENT_RELEVANCE)):
+    if not _is_established_low(inputs.level(FeatureFamily.RECIPIENT_RELEVANCE)):
         return None
-    if not _is_weak_or_missing(inputs.level(FeatureFamily.PRACTICAL_UTILITY)):
+    if not _is_established_low(inputs.level(FeatureFamily.PRACTICAL_UTILITY)):
+        return None
+    if not _is_not_urgent(inputs.level(FeatureFamily.LEGITIMATE_URGENCY)):
         return None
     return _suppress(
         inputs,
@@ -272,25 +331,20 @@ def _rule_irrelevant_marketing_suppress(inputs: _Inputs) -> RoutingResult | None
 
 
 def _rule_repetitive_low_value_suppress(inputs: _Inputs) -> RoutingResult | None:
-    """Rule 4B. Circulated content with no usefulness, relevance, or urgency.
+    """Circulated content with established low usefulness and relevance.
 
-    Requires low value to have been *established*, not merely unknown --
+    Both value conditions must have been *established*, not merely unknown --
     otherwise forwarding metadata alone would suppress any message whose
     context happened to be unavailable, which is exactly the "forwarding
     alone" case this rule must not fire on.
     """
     if inputs.level(FeatureFamily.REPETITION) is not FeatureLevel.HIGH:
         return None
-    if not (
-        _is_established_low(inputs.level(FeatureFamily.PRACTICAL_UTILITY))
-        or _is_established_low(inputs.level(FeatureFamily.RECIPIENT_RELEVANCE))
-    ):
+    if not _is_established_low(inputs.level(FeatureFamily.PRACTICAL_UTILITY)):
         return None
-    if not _is_weak_or_missing(inputs.level(FeatureFamily.PRACTICAL_UTILITY)):
+    if not _is_established_low(inputs.level(FeatureFamily.RECIPIENT_RELEVANCE)):
         return None
-    if not _is_weak_or_missing(inputs.level(FeatureFamily.RECIPIENT_RELEVANCE)):
-        return None
-    if not _is_weak_or_missing(inputs.level(FeatureFamily.LEGITIMATE_URGENCY)):
+    if not _is_not_urgent(inputs.level(FeatureFamily.LEGITIMATE_URGENCY)):
         return None
     return _suppress(
         inputs,
@@ -302,14 +356,14 @@ def _rule_repetitive_low_value_suppress(inputs: _Inputs) -> RoutingResult | None
 
 
 def _rule_muted_low_value_suppress(inputs: _Inputs) -> RoutingResult | None:
-    """Rule 4C. A silenced thread carrying nothing this reader needs."""
+    """A silenced thread established to carry nothing this reader needs."""
     if inputs.level(FeatureFamily.SILENCED_CONVERSATION) is not FeatureLevel.HIGH:
         return None
-    if not _is_weak_or_missing(inputs.level(FeatureFamily.RECIPIENT_RELEVANCE)):
+    if not _is_established_low(inputs.level(FeatureFamily.RECIPIENT_RELEVANCE)):
         return None
-    if not _is_weak_or_missing(inputs.level(FeatureFamily.PRACTICAL_UTILITY)):
+    if not _is_established_low(inputs.level(FeatureFamily.PRACTICAL_UTILITY)):
         return None
-    if not _is_weak_or_missing(inputs.level(FeatureFamily.LEGITIMATE_URGENCY)):
+    if not _is_not_urgent(inputs.level(FeatureFamily.LEGITIMATE_URGENCY)):
         return None
     return _suppress(
         inputs,
@@ -411,13 +465,18 @@ def _suppress(
 #: order directly rather than inferring it from behaviour.
 POLICY_ORDER: tuple[tuple[str, Callable[[_Inputs], "RoutingResult | None"]], ...] = (
     ("route.safety.hard_veto", _rule_hard_veto),
-    ("route.risk.pressure_suppress", _rule_pressure_suppress),
-    ("route.risk.payment_identity_suppress", _rule_payment_identity_suppress),
+    *(
+        (policy_id, _make_risk_rule(policy_id, anchor, corroborators))
+        for policy_id, anchor, corroborators in RISK_COMBINATIONS
+    ),
     ("route.risk.propagation_low_value_suppress", _rule_propagation_low_value_suppress),
     ("route.urgency.safe_interrupt", _rule_safe_interrupt),
-    ("route.value.irrelevant_marketing_suppress", _rule_irrelevant_marketing_suppress),
-    ("route.value.repetitive_low_value_suppress", _rule_repetitive_low_value_suppress),
+    # Most specific first. Each low-value rule adds a further established
+    # condition to the one below it, so a general rule placed above a
+    # narrower one would shadow it into unreachability.
     ("route.value.muted_low_value_suppress", _rule_muted_low_value_suppress),
+    ("route.value.repetitive_low_value_suppress", _rule_repetitive_low_value_suppress),
+    ("route.value.irrelevant_marketing_suppress", _rule_irrelevant_marketing_suppress),
     ("route.utility.safe_defer", _rule_safe_defer),
     ("route.analysis.incomplete_defer", _rule_incomplete_defer),
 )

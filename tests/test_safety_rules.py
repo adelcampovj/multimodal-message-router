@@ -477,6 +477,177 @@ class UnsafeAdviceTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Clause-local negation, and the narrow severe dangerous-advice policy.
+# ---------------------------------------------------------------------------
+
+
+class SafeMedicalLanguageTests(unittest.TestCase):
+    """Regression: warnings *against* unsafe behaviour read as unsafe advice.
+
+    The rules matched the harmful action without looking at whether the
+    clause was arguing for it. "Never stop taking prescribed medicine
+    without asking your doctor" is the single most common safe thing a
+    health service sends, and it was being flagged.
+
+    Negation is now read within the clause and relative to the harmful verb,
+    which is deliberately not the same as a global "the text contains 'not'"
+    exemption -- that would let one safe sentence cancel a dangerous one.
+    """
+
+    SAFE = (
+        "Do not stop taking prescribed medicine without consulting a clinician.",
+        "Never stop your medication unless a clinician tells you to.",
+        "You should never come off your tablets without professional guidance.",
+        "Never change a dose without professional guidance.",
+        "Never double your dose to catch up on a missed one.",
+        "Contact a doctor before stopping treatment.",
+        "Ask your pharmacist before you stop taking your antibiotics.",
+        "Seek emergency help straight away for severe symptoms.",
+        "Do not hesitate to call an ambulance if the pain gets worse.",
+        "Do not forget to tell your doctor about the new tablets.",
+        "Always tell your nurse if you feel faint.",
+    )
+
+    def test_safe_medication_warnings_produce_no_unsafe_advice_finding(self):
+        for text in self.SAFE:
+            a = analyze(text)
+            self.assertNotIn(FindingCategory.UNSAFE_ADVICE, categories(a), text)
+            self.assertFalse(a.hard_veto_required, text)
+
+    def test_professional_guidance_qualifier_downgrades_rather_than_flagging(self):
+        a = analyze("My doctor said to stop taking my tablets after this week.")
+        advice = [f for f in a.findings if f.category is FindingCategory.UNSAFE_ADVICE]
+        self.assertTrue(advice)
+        for finding in advice:
+            self.assertIs(finding.severity, Severity.WEAK)
+            self.assertTrue(finding.ambiguous)
+
+    def test_quoted_warning_is_not_unsafe_advice(self):
+        for text in (
+            "Someone sent me a message telling me to stop taking my medication. Is this a scam?",
+            "I just received a message saying to take double the dose. Should I trust it?",
+        ):
+            a = analyze(text)
+            self.assertNotIn(FindingCategory.UNSAFE_ADVICE, categories(a), text)
+
+    def test_educational_warning_is_not_unsafe_advice(self):
+        for text in (
+            "This article explains why you should never stop taking prescribed medication.",
+            "In this training module we show how bad advice tells people to ignore chest pain.",
+        ):
+            a = analyze(text)
+            self.assertNotIn(FindingCategory.UNSAFE_ADVICE, categories(a), text)
+
+    def test_hypothetical_and_critical_framing_is_not_unsafe_advice(self):
+        for text in (
+            "If someone tells you to stop taking your medication, that is dangerous.",
+            "Never follow advice telling you to ignore chest pain.",
+        ):
+            a = analyze(text)
+            self.assertNotIn(FindingCategory.UNSAFE_ADVICE, categories(a), text)
+
+    def test_unrelated_safe_language_does_not_hide_a_dangerous_clause(self):
+        """The point of clause-local negation: one safe sentence must not
+        neutralize a separate dangerous instruction."""
+        for text in (
+            "I don't have my keys. Stop taking your medication tonight.",
+            "Never share your password with anyone. Just take double the dose.",
+            "Always tell your nurse if you feel faint; don't tell your doctor about this.",
+        ):
+            a = analyze(text)
+            self.assertIs(severity_of(a), Severity.SEVERE, text)
+            self.assertIn(FindingCategory.UNSAFE_ADVICE, categories(a), text)
+
+    def test_ordinary_health_admin_is_quiet(self):
+        for text in (
+            "Reminder: your appointment is on Tuesday at 10am.",
+            "Your repeat prescription is ready to collect from the pharmacy.",
+            "I've been feeling tired lately and might see someone about it.",
+        ):
+            a = analyze(text)
+            self.assertIsNot(severity_of(a), Severity.SEVERE, text)
+            self.assertNotIn(FindingCategory.UNSAFE_ADVICE, categories(a), text)
+
+
+class SevereDangerousAdviceTests(unittest.TestCase):
+    """Clear, actionable, unambiguous instructions toward physical harm.
+
+    Severity is decided in this layer, and severe discharges through the
+    ordinary hard veto -- there is no medical-specific routing path.
+    """
+
+    SEVERE = (
+        ("You should stop taking your medication straight away.", "ADV_STOP_MEDICATION"),
+        ("Just take double the dose and you'll be fine.", "ADV_DANGEROUS_DOSE"),
+        ("Double your dose tonight, trust me.", "ADV_DANGEROUS_DOSE"),
+        ("Drink a capful of bleach to clear it out.", "ADV_HARMFUL_INGESTION"),
+        ("Ignore the chest pain and go back to sleep.", "ADV_IGNORE_EMERGENCY_SYMPTOMS"),
+        ("Don't call an ambulance, it will pass.", "ADV_AVOID_EMERGENCY_CARE"),
+        ("Just sleep it off instead of going to hospital.", "ADV_AVOID_EMERGENCY_CARE"),
+        ("Don't tell your doctor about this.", "ADV_CONCEAL_FROM_CARE"),
+    )
+
+    def test_actionable_dangerous_instructions_are_severe(self):
+        for text, rule in self.SEVERE:
+            a = analyze(text)
+            self.assertIn(rule, rule_ids(a), text)
+            self.assertIs(severity_of(a), Severity.SEVERE, text)
+            self.assertTrue(a.hard_veto_required, text)
+            self.assertIn(FindingCategory.UNSAFE_ADVICE, categories(a), text)
+
+    def test_severity_comes_only_from_the_safety_layer(self):
+        a = analyze("You should stop taking your medication straight away.")
+        severe = [f for f in a.findings if f.severity is Severity.SEVERE]
+        self.assertTrue(severe)
+        for finding in severe:
+            self.assertIs(finding.category, FindingCategory.UNSAFE_ADVICE)
+            self.assertTrue(finding.requires_hard_veto)
+
+    def test_detected_in_every_untrusted_provenance(self):
+        payload = "You should stop taking your medication straight away."
+        for provenance, ref in (
+            (Provenance.OCR_TEXT, IMAGE),
+            (Provenance.QR_DERIVED, IMAGE),
+            (Provenance.ASR_TRANSCRIPT, AUDIO),
+        ):
+            analysis = MediaAnalysis(ref, ExtractionStatus.SUCCEEDED,
+                                     content=TextContent(payload, provenance))
+            a = analyze_message(message(attachment=ref), media_analyses=(analysis,))
+            self.assertIs(severity_of(a), Severity.SEVERE, provenance)
+            self.assertTrue(all(f.provenance is provenance for f in a.findings), provenance)
+
+    def test_severe_advice_survives_another_modality_failing(self):
+        strong = MediaAnalysis(
+            IMAGE, ExtractionStatus.SUCCEEDED,
+            content=TextContent("Just take double the dose and you'll be fine.", Provenance.OCR_TEXT),
+        )
+        failed = MediaAnalysis(AUDIO, ExtractionStatus.FAILED)
+        a = analyze_message(message(attachment=IMAGE), media_analyses=(strong, failed))
+        self.assertIs(severity_of(a), Severity.SEVERE)
+        self.assertTrue(a.hard_veto_required)
+        self.assertTrue(a.analysis_incomplete)
+
+    def test_ambiguous_or_incomplete_health_content_is_not_severe(self):
+        for text in (
+            "I've been feeling tired lately and might see someone about it.",
+            "We talked about the tablets again yesterday.",
+            "The pharmacy called about a prescription.",
+        ):
+            a = analyze(text)
+            self.assertIsNot(severity_of(a), Severity.SEVERE, text)
+
+    def test_no_health_content_reaches_any_diagnostic(self):
+        detail = "stage 3 hypertension on 5mg amlodipine"
+        a = analyze(f"You should stop taking your medication for {detail} straight away.")
+        self.assertIs(severity_of(a), Severity.SEVERE)
+        rendered = " ".join(
+            [repr(a)] + [repr(f) for f in a.findings] + [d.value for d in a.diagnostics]
+        )
+        for fragment in (detail, "amlodipine", "hypertension", "5mg", "stop taking"):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
+# ---------------------------------------------------------------------------
 # Forwarding.
 # ---------------------------------------------------------------------------
 
