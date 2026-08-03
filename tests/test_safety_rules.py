@@ -371,6 +371,71 @@ class PinCredentialTests(unittest.TestCase):
         for pattern in rules_module._SQUEEZED_TARGETS:
             self.assertNotIn("pin", pattern.pattern)
 
+    def test_constrained_credential_phrases_are_severe(self):
+        """The credential reading requires a determiner or possessive next to
+        the token, optionally with one approved credential modifier."""
+        for text in (
+            "Reply with your account PIN now",
+            "Share your security PIN with me",
+            "Reveal the banking PIN to me now",
+            "Disclose the card PIN to me now",
+            "Transmit the access PIN to me now",
+            "Enter your ATM PIN into the chat",
+            "Type the authentication PIN in your reply",
+            "Send me the verification PIN now",
+        ):
+            a = analyze(text)
+            self.assertIs(severity_of(a), Severity.SEVERE, text)
+            self.assertTrue(a.hard_veto_required, text)
+
+    def test_open_class_pin_compounds_stay_safe(self):
+        """Regression, and the reason the denylist was replaced.
+
+        Physical and technical pin compounds are an open class, so they can
+        never be enumerated. The grammar instead requires the credential
+        token to be the head of its phrase: an unapproved modifier breaks the
+        determiner adjacency, whatever that modifier happens to be. The
+        modifiers below are deliberately *not* named anywhere in the source,
+        and several were invented for this test.
+        """
+        modifiers = ("socket", "electrical", "terminal", "contact", "alignment", "guide",
+                     "dowel", "retaining", "locating", "firing", "tuning", "circuit-board",
+                     "connector", "header", "safety", "bobby", "cotter", "push", "map",
+                     "location", "sewing", "hardware", "GPIO", "input", "output",
+                     "flange", "gudgeon", "trunnion", "escutcheon", "bezel",
+                     "spindle", "clevis", "shear", "taper")
+        verbs = ("Send me", "Provide", "Share", "Reveal", "Disclose", "Transmit", "Reply with")
+        offenders = []
+        for modifier in modifiers:
+            for verb in verbs:
+                for form in ("pin", "pins"):
+                    text = "%s the %s %s specification" % (verb, modifier, form)
+                    if severity_of(analyze(text)) is Severity.SEVERE:
+                        offenders.append(text)
+        self.assertEqual(offenders, [], "%d of %d combinations severe"
+                         % (len(offenders), len(modifiers) * len(verbs) * 2))
+
+    def test_the_correction_is_not_a_modifier_denylist(self):
+        """Structural: the safe behaviour above must come from positive
+        grammar, not from a list of words that happen to be excluded."""
+        from message_router.safety import rules as rules_module
+
+        self.assertFalse(hasattr(rules_module, "_PIN_MODIFIERS"))
+        self.assertTrue(hasattr(rules_module, "_PIN_DETERMINER"))
+        self.assertTrue(hasattr(rules_module, "_PIN_CRED_MODIFIER"))
+        for term in ("sewing", "dowel", "socket", "bobby", "cotter", "breadboard"):
+            self.assertNotIn(term, rules_module._PIN_TARGET, term)
+
+    def test_pinning_actions_and_identifiers_never_match(self):
+        for text in ("Could you pin the message in the chat?",
+                     "Send the pinned message to the group",
+                     "Check the pinned posts for the agenda",
+                     "The function get_pin_layout returns the board map",
+                     "class PinRegistry handles the mapping",
+                     "He was pinpointing the happening on the mapping tool."):
+            a = analyze(text)
+            self.assertNotIn(FindingCategory.CREDENTIAL_SOLICITATION, categories(a), text)
+
     def test_no_credential_value_reaches_any_output(self):
         secret = "8831"
         a = analyze(f"Reply with your PINs {secret} now")
@@ -821,6 +886,96 @@ class SevereDangerousAdviceTests(unittest.TestCase):
             a = analyze(text)
             self.assertIsNot(severity_of(a), Severity.SEVERE, text)
             self.assertFalse(a.hard_veto_required, text)
+
+    def test_cessation_verb_must_govern_a_consumption_action(self):
+        """Grammar A: the verb governs taking/using/administering the treatment."""
+        for text in (
+            "You should stop taking prescribed medication straight away.",
+            "You should stop taking prescribed medications straight away.",
+            "Just quit using prescribed medicine now.",
+            "Just quit using prescribed medicines now.",
+            "You should cease administering the prescribed dose.",
+            "You should cease administering prescribed doses.",
+            "Just stop following prescribed treatment.",
+            "You should stop consuming your tablets tonight.",
+        ):
+            a = analyze(text)
+            self.assertIs(severity_of(a), Severity.SEVERE, text)
+            self.assertTrue(a.hard_veto_required, text)
+
+    def test_cessation_verb_may_govern_the_treatment_directly(self):
+        """Grammar B: the treatment word is the head of what is stopped."""
+        for text in (
+            "You should stop the prescribed medication.",
+            "You should discontinue the prescribed medicine.",
+            "Just cease prescribed treatment.",
+            "You should stop your medications tonight.",
+            "Just throw away your pills.",
+            "You should come off your medication completely.",
+        ):
+            a = analyze(text)
+            self.assertIs(severity_of(a), Severity.SEVERE, text)
+
+    def test_administrative_objects_are_not_treatment_cessation(self):
+        """Regression: a treatment word modifying an administrative noun read
+        as dangerous advice, so asking a pharmacy to pause a delivery was
+        suppressed. The treatment word must be the *head* of what is stopped.
+        """
+        for text in (
+            "Please stop the prescription delivery, we are away next week.",
+            "Please stop the prescription deliveries while we are away.",
+            "Please stop the medication reminder.",
+            "Please stop the medication reminders.",
+            "Please stop the medicine subscription.",
+            "Please stop the prescription subscriptions.",
+            "Please stop the prescription renewal.",
+            "Please stop the medication renewals.",
+            "Please stop the medication shipment.",
+            "Please stop the prescription shipments.",
+            "Please stop the prescription order.",
+            "Please stop the medication orders.",
+            "Please stop the prescription charge.",
+            "Please stop the medication charges.",
+            "Please stop the prescription billing.",
+            "Please stop the refill notifications.",
+            "Please stop the prescription reminder service.",
+            "Please stop the repeat prescription service.",
+            "Please stop the automatic refill renewal.",
+            "Please stop sending the prescription reminder emails.",
+            "Please stop my prescription charges, I have an exemption.",
+            "Please cancel the medication delivery.",
+            "Please cancel the prescription auto-refill.",
+            "Please pause the medication delivery service.",
+        ):
+            a = analyze(text)
+            self.assertIsNot(severity_of(a), Severity.SEVERE, text)
+            self.assertFalse(a.hard_veto_required, text)
+
+    def test_unseen_administrative_nouns_are_safe_by_construction(self):
+        """The head test reads function words, not a list of administrative
+        nouns -- so a noun nobody enumerated is still safe."""
+        for noun in ("dispatch", "courier", "consignment", "logistics run",
+                     "fulfilment batch", "collection slot", "direct debit"):
+            text = "Please stop the prescription %s." % noun
+            a = analyze(text)
+            self.assertIsNot(severity_of(a), Severity.SEVERE, text)
+
+    def test_administrative_and_dangerous_clauses_stay_independent(self):
+        for text, expected in (
+            ("Please stop the prescription delivery. Also stop taking your medications tonight.", True),
+            ("Stop taking your medications tonight. Please stop the prescription delivery.", True),
+            ("Please stop the prescription delivery. Never stop your medicines without guidance.", False),
+            ("The medication list is attached. Please stop the prescription delivery.", False),
+        ):
+            a = analyze(text)
+            self.assertIs(severity_of(a) is Severity.SEVERE, expected, text)
+
+    def test_dose_change_must_govern_the_dose(self):
+        self.assertIs(severity_of(analyze("Just alter a prescribed dosage without guidance.")),
+                      Severity.SEVERE)
+        for text in ("Please change the dosage reminder.",
+                     "Please stop the dosage notification service."):
+            self.assertIsNot(severity_of(analyze(text)), Severity.SEVERE, text)
 
     def test_no_health_content_reaches_any_diagnostic(self):
         detail = "stage 3 hypertension on 5mg amlodipine"

@@ -1070,6 +1070,111 @@ class DangerousAdviceRoutingTests(unittest.TestCase):
             self.assertIsNot(result.action, RoutingAction.SUPPRESS, text)
 
 
+class GovernedObjectRoutingTests(unittest.TestCase):
+    """Integrated regressions for the treatment and credential grammars.
+
+    Both corrections turn on the same question -- what does the verb
+    actually govern -- so both are checked end to end here, including the
+    hard-veto path, provenance, and invariance under context.
+    """
+
+    DANGEROUS = "You should stop taking prescribed medications straight away."
+    ADMINISTRATIVE = "Please stop the prescription delivery, we are away next week."
+    CREDENTIAL = "Reply with your account PIN now"
+    COMPONENT = "Provide the connector pins specification"
+
+    def media(self, kind, text):
+        if kind == "ocr":
+            return MediaAnalysis(IMAGE, ExtractionStatus.SUCCEEDED,
+                                 content=TextContent(text, Provenance.OCR_TEXT))
+        if kind == "asr":
+            return MediaAnalysis(AUDIO, ExtractionStatus.SUCCEEDED,
+                                 content=TextContent(text, Provenance.ASR_TRANSCRIPT))
+        return MediaAnalysis(IMAGE, ExtractionStatus.SUCCEEDED,
+                             content=TextContent(text, Provenance.QR_DERIVED))
+
+    def test_dangerous_treatment_cessation_suppresses(self):
+        for text in (self.DANGEROUS,
+                     "Just quit using prescribed medicines now.",
+                     "You should cease administering the prescribed dose.",
+                     "You should discontinue the prescribed medicine."):
+            _, _, _, result = run_pipeline(text)
+            self.assertIs(result.action, RoutingAction.SUPPRESS, text)
+            self.assertEqual(result.policy_id, "route.safety.hard_veto", text)
+            self.assertTrue(result.hard_veto_applied, text)
+
+    def test_administrative_prescription_requests_are_not_suppressed(self):
+        for text in (self.ADMINISTRATIVE,
+                     "Please stop the medication reminders.",
+                     "Please stop the prescription subscription.",
+                     "Please stop the refill notifications."):
+            a, _, _, result = run_pipeline(text)
+            self.assertIsNot(a.highest_severity, Severity.SEVERE, text)
+            self.assertIsNot(result.action, RoutingAction.SUPPRESS, text)
+
+    def test_constrained_credential_request_suppresses(self):
+        for text in (self.CREDENTIAL, "Please send me your PINs to confirm",
+                     "Enter your ATM PIN into the chat",
+                     "Send your personal identification number"):
+            _, _, _, result = run_pipeline(text)
+            self.assertIs(result.action, RoutingAction.SUPPRESS, text)
+            self.assertEqual(result.policy_id, "route.safety.hard_veto", text)
+
+    def test_component_pin_requests_are_not_suppressed(self):
+        for text in (self.COMPONENT,
+                     "Send me the header pins for the board",
+                     "Provide the electrical pins specification",
+                     "Send me the dowel pins for the frame"):
+            a, _, _, result = run_pipeline(text)
+            self.assertIsNot(a.highest_severity, Severity.SEVERE, text)
+            self.assertIsNot(result.action, RoutingAction.SUPPRESS, text)
+
+    def test_both_families_carry_provenance_and_survive_degradation(self):
+        for label, text in (("medical", self.DANGEROUS), ("credential", self.CREDENTIAL)):
+            for kind, provenance in (("ocr", Provenance.OCR_TEXT),
+                                     ("asr", Provenance.ASR_TRANSCRIPT),
+                                     ("qr", Provenance.QR_DERIVED)):
+                analysis = self.media(kind, text)
+                a, _, _, result = run_pipeline(None, attachment=analysis.media,
+                                               media=(analysis,))
+                self.assertIs(a.highest_severity, Severity.SEVERE, f"{label}/{kind}")
+                self.assertTrue(all(x.provenance is provenance for x in a.findings),
+                                f"{label}/{kind}")
+                self.assertEqual(result.policy_id, "route.safety.hard_veto", f"{label}/{kind}")
+            failed = MediaAnalysis(AUDIO, ExtractionStatus.FAILED)
+            a, _, _, result = run_pipeline(None, attachment=IMAGE,
+                                           media=(self.media("ocr", text), failed))
+            self.assertIs(a.highest_severity, Severity.SEVERE, label)
+            self.assertTrue(a.analysis_incomplete, label)
+            self.assertEqual(result.policy_id, "route.safety.hard_veto", label)
+
+    def test_severe_veto_invariant_under_every_context_change(self):
+        prefs_quiet = RecipientPreferences(quiet_period=QuietPeriod(22 * 60, 7 * 60))
+        prefs_muted = RecipientPreferences(muted_conversation_ids=frozenset({"conv-31b"}))
+        trusted = SenderContext("snd-208", trust_signals=(
+            TrustSignal(TrustCategory.VERIFIED_ACCOUNT, "directory"),
+            TrustSignal(TrustCategory.ESTABLISHED_RELATIONSHIP, "history"),
+        ))
+        variations = (
+            ("validated trust", dict(sender=trusted)),
+            ("high affinity", dict(summary=InteractionSummary(40, replies=35, dismissals=1))),
+            ("low affinity", dict(summary=InteractionSummary(40, replies=0, dismissals=38))),
+            ("direct targeting", dict(directly_addressed=True)),
+            ("near-term event", dict(near_term_event=True)),
+            ("quiet hours", dict(preferences=prefs_quiet, minute=23 * 60)),
+            ("mute", dict(preferences=prefs_muted)),
+            ("channel conversation", dict(conversation=CHANNEL)),
+            ("heavy forwarding", dict(forwarding_count=40)),
+        )
+        for label, text in (("medical", self.DANGEROUS), ("credential", self.CREDENTIAL)):
+            for vname, kwargs in variations:
+                a, _, _, result = run_pipeline(text, **kwargs)
+                self.assertIs(a.highest_severity, Severity.SEVERE, f"{label}/{vname}")
+                self.assertIs(result.action, RoutingAction.SUPPRESS, f"{label}/{vname}")
+                self.assertEqual(result.policy_id, "route.safety.hard_veto", f"{label}/{vname}")
+                self.assertTrue(result.hard_veto_applied, f"{label}/{vname}")
+
+
 class EstablishedLowValueTests(unittest.TestCase):
     """``unknown`` is not ``low``, and only ``low`` may suppress.
 

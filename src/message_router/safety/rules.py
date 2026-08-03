@@ -65,6 +65,50 @@ def _any(patterns: tuple[re.Pattern[str], ...], text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Phrase-head grammar, shared by the rules that must know what a verb governs.
+# ---------------------------------------------------------------------------
+#
+# "stop taking your medication" and "stop the prescription delivery" both put
+# a treatment word within a few tokens of a cessation verb, but only the
+# first is *about* the treatment: in the second, "prescription" modifies
+# "delivery", and the head of the phrase is an administrative noun. The same
+# shape decides "send me your PIN" against "send me the connector pins".
+#
+# Heads are identified positively. A token is the head of its phrase when
+# what follows is a boundary or a **closed-class** word -- determiner,
+# preposition, conjunction, adverb. The alternative would be enumerating the
+# nouns that disqualify it, and those are an open class: delivery, shipment,
+# dispatch, auto-refill; connector, dowel, cotter, retaining. Whatever a
+# pharmacy or a hardware catalogue names next is already covered, because the
+# rule never asks "is this an administrative noun?" or "is this a component?"
+# -- it asks whether the sensitive word is the head, and any unlisted
+# open-class follower answers no.
+_FUNCTION_WORD = (
+    r"(?:without|unless|before|after|until|while|when|since|because|so|and|or|but|"
+    r"then|now|today|tonight|tomorrow|immediately|straight|right|at|from|to|into|on|"
+    r"in|with|for|of|by|as|if|even|though|entirely|completely|altogether|permanently|"
+    r"temporarily|forever|again|anyway|soon|please|thanks|thank|ok|okay|here|back|"
+    r"over|via|through|that|this|it|i|we|you|they|he|she|my|your|our|their|"
+    # A numeral does not change which word is the head -- "your PIN 4417" is
+    # still about the PIN -- and adverbs are closed enough to admit by shape.
+    r"\d[\d,.-]*|\w+ly)"
+)
+#: The governed token is the head of its phrase: end of input, punctuation,
+#: or a closed-class word follows it.
+_NP_HEAD_END = r"(?=$|\s*[.,;:!?)\]\"']|\s+" + _FUNCTION_WORD + r"\b)"
+
+#: A bounded run of determiners, possessives and treatment qualifiers that may
+#: sit between a verb and the noun it governs. Every member is closed-class,
+#: so this run can never swallow an open-class noun and shift which word is
+#: the head.
+_NP_PREFIX = (
+    r"(?:\s+(?:the|a|an|your|my|our|their|his|her|its|this|that|these|those|any|all|"
+    r"of|more|further|remaining|prescribed|prescription|repeat|regular|daily|"
+    r"current|new|old|usual))*"
+)
+
+
+# ---------------------------------------------------------------------------
 # Context classification.
 # ---------------------------------------------------------------------------
 
@@ -264,25 +308,30 @@ _REQUEST_VERB = (
 _RECIPIENT_POSSESSIVE = r"(?:your|the|me|us|it)"
 
 # A bare "pin" is a credential in one sense and a sewing supply, a map
-# marker, a connector, a pinned message, or a variable name in several
-# others. The token is therefore admitted only when it is *not* qualified by
-# one of these, each excluded as its own fixed-width lookbehind. This is an
-# explicit closed list, not stemming or fuzzy matching, and "pinned" and
-# "pinning" never match at all because the token boundary rejects them.
-_PIN_MODIFIERS = (
-    "sewing", "safety", "map", "location", "drop", "push", "bobby", "hair", "rolling",
-    "split", "cotter", "connector", "hardware", "header", "gpio", "breadboard", "chip",
-    "panel", "bowling", "clothes", "lapel", "lynch", "named", "call",
+# marker, a connector, a firing pin, a pinned message, or a variable name in
+# many others. Those senses are an **open class** -- connector, dowel, cotter,
+# retaining, tuning, whatever component someone names next -- so listing the
+# ones that are not credentials can never be finished.
+#
+# The token is therefore admitted by what *is* there rather than by what is
+# not: either the unambiguous full form, or a "pin" whose phrase head it
+# actually is -- a determiner or possessive immediately before it, optionally
+# with one approved credential modifier in between. An unapproved modifier
+# breaks that adjacency and the phrase is simply not a credential target, no
+# matter which modifier it is. "Pinned" and "pinning" never match at all,
+# because the token boundary rejects them.
+_PIN_CRED_MODIFIER = (
+    r"(?:account|security|banking|bank|card|debit[ -]card|credit[ -]card|atm|"
+    r"authentication|auth|access|verification|login|sign[ -]?in)"
 )
-_PIN_NOT_MODIFIED = "".join(f"(?<!{word} )" for word in _PIN_MODIFIERS)
-#: Pinning something in a conversation is not a credential either.
-_PIN_NOT_AN_ACTION = (
-    r"(?!\s+(?:the |this |a |that |it )*"
-    r"(?:message|post|chat|thread|tweet|note|comment|conversation|item|tab)\b)"
+_PIN_DETERMINER = (
+    r"(?:the|a|an|this|that|your|my|our|their|his|her|its|"
+    r"recipient'?s?|customer'?s?)"
 )
 _PIN_TARGET = (
-    r"(?:personal identification numbers?|"
-    + _PIN_NOT_MODIFIED + r"\bpin(?:'s|s)?\b" + _PIN_NOT_AN_ACTION + r")"
+    r"(?:personal identification numbers?"
+    r"|\b" + _PIN_DETERMINER + r"\s+(?:" + _PIN_CRED_MODIFIER + r"\s+)?"
+    r"pin(?:'s|s)?\b" + _NP_HEAD_END + r")"
 )
 
 _SECRET_TARGET = (
@@ -817,6 +866,12 @@ _MEDICATION_OBJECT = (
     r"prescribed treatment|insulin|antibiotic|painkiller|inhaler|treatment)s?"
 )
 _DOSE_OBJECT = r"(?:dose|dosage|tablet|pill)s?"
+_TREATMENT_OBJECT = r"(?:" + _MEDICATION_OBJECT + r"|(?:dose|dosage)s?)"
+
+#: Consumption or administration of a treatment -- the action a dangerous
+#: cessation instruction actually targets.
+_CONSUMPTION_HEAD = r"(?:taking|using|administering|consuming|following)"
+_CESSATION_VERB = r"(?:stop|quit|discontinue|cease|throw away|bin|come off|give up)"
 _CARE_PROVIDER = (
     r"(?:(?:doctor|physician|clinician|prescriber|pharmacist|nurse|paramedic|"
     r"qualified medical professional|healthcare professional|health care professional|"
@@ -849,18 +904,27 @@ _EMERGENCY_SYMPTOM = (
 _UNSAFE_ADVICE_RULES = (
     (
         "ADV_STOP_MEDICATION",
-        r"\b(?:stop|quit|discontinue|throw away|bin|come off)\b[^.]{0,30}"
-        r"\b" + _MEDICATION_OBJECT + r"\b",
+        # A. the verb governs a consumption or administration action, which
+        #    in turn governs the treatment: "stop taking your medication".
+        r"\b" + _CESSATION_VERB + r"\b" + _NP_PREFIX + r"\s+" + _CONSUMPTION_HEAD + r"\b"
+        + _NP_PREFIX + r"\s+" + _TREATMENT_OBJECT + r"\b" + _NP_HEAD_END
+        # B. the verb governs the treatment directly, and the treatment word
+        #    is the head of that phrase: "discontinue the prescribed medicine".
+        + r"|\b" + _CESSATION_VERB + r"\b" + _NP_PREFIX + r"\s+"
+        + _TREATMENT_OBJECT + r"\b" + _NP_HEAD_END,
         DiagnosticCode.MEDICATION_DISCONTINUATION,
         _HARM_IS_INSTRUCTION,
     ),
     (
         "ADV_DANGEROUS_DOSE",
+        # The dose must be the head of what the directive governs, for the
+        # same reason: "change the dosage reminder" is an administrative
+        # request, not a dose change.
         r"\b(?:take|swallow|use)\b[^.]{0,25}\b(?:double|triple|twice|three times|extra|more than)\b"
-        r"[^.]{0,25}\b" + _DOSE_OBJECT + r"\b"
-        r"|\btake\b[^.]{0,15}\b(?:\d{2,})\b[^.]{0,15}\b(?:tablet|pill)s?\b"
-        r"|\b(?:double|triple|halve|change|alter|increase|reduce)\b[^.]{0,20}"
-        r"\b(?:dose|dosage)s?\b",
+        r"[^.]{0,25}\b" + _DOSE_OBJECT + r"\b" + _NP_HEAD_END
+        + r"|\btake\b[^.]{0,15}\b(?:\d{2,})\b[^.]{0,15}\b(?:tablet|pill)s?\b" + _NP_HEAD_END
+        + r"|\b(?:double|triple|halve|change|alter|increase|reduce)\b" + _NP_PREFIX
+        + r"\s+(?:dose|dosage)s?\b" + _NP_HEAD_END,
         DiagnosticCode.DANGEROUS_DOSAGE,
         _HARM_IS_INSTRUCTION,
     ),
