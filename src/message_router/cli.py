@@ -11,11 +11,12 @@ import argparse
 
 UNDER_CONSTRUCTION_MESSAGE = (
     "message_router is a portfolio scaffold for a multimodal message-routing "
-    "project. The independent domain foundation is available to import from "
-    "message_router.domain, with replaceable backend interfaces in "
-    "message_router.ports. The later routing stages are still under "
-    "construction, so this build exposes only a placeholder command-line "
-    "interface."
+    "project. The domain foundation (message_router.domain), request-document "
+    "loading (message_router.io), recipient-scoped history "
+    "(message_router.repositories), and replaceable media adapters "
+    "(message_router.media, message_router.ports) are available to import. "
+    "The routing stages are still under construction, so this build exposes "
+    "only a placeholder command-line interface."
 )
 
 

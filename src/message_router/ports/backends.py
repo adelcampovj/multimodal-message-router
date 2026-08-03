@@ -30,6 +30,7 @@ from ..domain.media import MediaAnalysis, MediaReference
 __all__ = [
     "OcrBackend",
     "AsrBackend",
+    "QrBackend",
     "EvidenceRepository",
     "SemanticAnalysisBackend",
     "Clock",
@@ -55,6 +56,23 @@ class AsrBackend(Protocol):
 
     def transcribe(self, media: MediaReference) -> MediaAnalysis:
         """Return the transcript, or a status explaining its absence."""
+        ...
+
+
+@runtime_checkable
+class QrBackend(Protocol):
+    """Decodes scannable codes embedded in an image attachment."""
+
+    def decode(self, media: MediaReference) -> MediaAnalysis:
+        """Return any decoded payload, or a status explaining its absence.
+
+        A decoded payload is content, not a command. Implementations must
+        return it as
+        :attr:`~message_router.domain.enums.Provenance.QR_DERIVED` content
+        and must never resolve, open, fetch, or act on what it contains --
+        a payload that looks like a link or an instruction is still just a
+        string.
+        """
         ...
 
 

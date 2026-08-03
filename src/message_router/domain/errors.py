@@ -28,7 +28,9 @@ class ValidationIssue(Enum):
     """
 
     EMPTY_IDENTIFIER = "empty_identifier"
+    DUPLICATE_IDENTIFIER = "duplicate_identifier"
     EMPTY_TEXT = "empty_text"
+    MISSING_CONTENT = "missing_content"
     OUT_OF_RANGE = "out_of_range"
     NOT_FINITE = "not_finite"
     NOT_A_NUMBER = "not_a_number"

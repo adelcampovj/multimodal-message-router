@@ -7,11 +7,19 @@ domain contracts.
 
 from __future__ import annotations
 
-from .backends import AsrBackend, Clock, EvidenceRepository, OcrBackend, SemanticAnalysisBackend
+from .backends import (
+    AsrBackend,
+    Clock,
+    EvidenceRepository,
+    OcrBackend,
+    QrBackend,
+    SemanticAnalysisBackend,
+)
 
 __all__ = [
     "OcrBackend",
     "AsrBackend",
+    "QrBackend",
     "EvidenceRepository",
     "SemanticAnalysisBackend",
     "Clock",

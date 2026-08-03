@@ -42,10 +42,15 @@ desktop.ini
 
 # Generated datasets, media, and run outputs -- this project never commits
 # generated or downloaded data; anything under these paths is local-only.
-data/
-media/
-outputs/
-results/
+#
+# Anchored to the repository root with a leading slash. Unanchored, `media/`
+# would also match the source package src/message_router/media/ and silently
+# drop it from every commit; these rules are about generated top-level
+# directories, not about any directory that happens to share the name.
+/data/
+/media/
+/outputs/
+/results/
 
 # Anything resembling transcript, audit, or incident material must never be
 # tracked in this repository.
