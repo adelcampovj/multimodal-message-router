@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multimodal-message-router"
+version = "0.0.0"
+description = "A multimodal message-routing portfolio project (scaffold)."
+readme = "README.md"
+# 3.10 is a deliberate floor: PEP 604 unions (X | Y) and PEP 634 structural
+# pattern matching are both native at 3.10, so annotations stay modern
+# without relying on `from __future__ import annotations` as a crutch --
+# while 3.10 (Oct 2021) is old enough to run on essentially any current CI
+# image or reviewer machine.
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Applies for the whole job: `pip install` and test collection both
+      # import the package, and without this each writes __pycache__/ into
+      # the source tree -- which the public-tree audit correctly rejects.
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # `pip install .` against the checked-out repository leaves
+      # src/<pkg>.egg-info/ (and sometimes build/) behind inside the tree
+      # regardless of editable mode -- the public-tree audit correctly
+      # rejects both. Installing instead from a copy of only pyproject.toml
+      # + src/, built in an OS temp directory outside the checkout, still
+      # proves the locally checked-out package metadata and source are
+      # installable, but leaves the checkout itself untouched. `python {0}`
+      # runs this step's body as a Python script, so the same code is
+      # correct on both the Linux and Windows runners in the matrix.
+      - name: Install package from an external temporary copy
+        shell: python {0}
+        run: |
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          repo_root = Path.cwd()
+          with tempfile.TemporaryDirectory() as tmp:
+              tmp_path = Path(tmp)
+              shutil.copy2(repo_root / "pyproject.toml", tmp_path / "pyproject.toml")
+              shutil.copytree(repo_root / "src", tmp_path / "src")
+              subprocess.run(
+                  [sys.executable, "-m", "pip", "install", "--no-deps", str(tmp_path)],
+                  check=True,
+              )
+          # `tmp` is removed automatically on exiting the `with` block --
+          # nothing left to clean up, inside or outside the checkout.
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Run public-tree audit
+        run: python scripts/audit_public_tree.py
+
+      - name: Verify CLI help
+        run: python -m message_router --help
