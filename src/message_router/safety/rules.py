@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 
 from ..domain.enums import Reliability
 from .models import DiagnosticCode, FindingCategory, Severity
-from .normalization import NormalizedText, SQUEEZE_MIN_LENGTH, near
+from .normalization import LINE_BOUNDARY, NormalizedText, SQUEEZE_MIN_LENGTH, near
 
 __all__ = ["RuleHit", "ContextFlags", "classify_context", "evaluate_content", "evaluate_propagation"]
 
@@ -138,7 +138,10 @@ _WARNING_PATTERNS = _compile_all(
     # them as advisories would silence the unsafe-advice and secrecy rules
     # that exist precisely to catch them.
     r"\b(?:never|do ?n[o']?t|dont|don t)\b[^.]{0,40}"
-    r"\b(?:share|give|send|disclose|reveal|tell|enter)\b[^.]{0,30}"
+    # The transmission actions belong here for the same reason they are a
+    # request: "never message support your PIN" is the warning form of the
+    # very construction the credential layer treats as a disclosure.
+    r"\b(?:share|give|send|disclose|reveal|tell|enter|message|dm|text|whatsapp)\b[^.]{0,30}"
     r"\b(?:otp|pins?|personal identification numbers?|password|passcode|code|codes|"
     r"card|cvv|credentials|login|details|account details|security answer)\b",
     r"\bwe (?:will )?never (?:ask|request|call|email|text)\b",
@@ -242,9 +245,72 @@ def classify_context(norm: NormalizedText) -> ContextFlags:
     )
 
 
-#: Clause boundaries. Deliberately not a parser: sentence terminators,
-#: semicolons, colons and line breaks only.
-_CLAUSE_BOUNDARY_RE = re.compile(r"[.!?;:\n]+")
+#: Strong clause boundaries. Deliberately not a parser: sentence
+#: terminators, semicolons, colons, and the internal line-break marker.
+_CLAUSE_BOUNDARY_RE = re.compile(r"[.!?;:\n" + LINE_BOUNDARY + r"]+")
+
+#: Weak separators: a comma followed by a transition word, or one of a few
+#: conjunctions that routinely join two independent clauses.
+#:
+#: These are *candidates*, never boundaries on their own. "Doctors and
+#: nurses", "the PIN and account number", and an ordinary list comma all
+#: contain these tokens and must not split. A candidate becomes a boundary
+#: only when both sides independently carry structure worth evaluating --
+#: see :func:`_side_is_independent` -- which is a structural test over the
+#: existing framing and safety patterns, not an inference about meaning.
+_WEAK_SEPARATOR_RE = _c(
+    r",\s+(?:but|however|yet|nevertheless|instead|then|therefore|still)\b"
+    r"|\s+(?:but|yet|and then|while|although)\b"
+)
+
+
+def _side_is_independent(side: str) -> bool:
+    """True when a side carries framing or an independently matchable rule.
+
+    Structural only: it asks whether an existing pattern fires, never what
+    the words mean. Requiring this on *both* sides is what keeps a noun
+    phrase like "doctors and nurses" or a coordinated object like "the PIN
+    and account number" from being torn in half.
+    """
+    stripped = side.strip()
+    if len(stripped) < 3:
+        return False
+    flags = _flags_for(stripped)
+    if flags.warning or flags.notification or flags.educational or flags.quoted:
+        return True
+    if _any(_ADVICE_CRITICAL_CONTEXT, stripped):
+        return True
+    for _rid, pattern, _diag, _neg in _UNSAFE_COMPILED:
+        if pattern.search(stripped):
+            return True
+    for _rid, pattern, _diag in _INJECTION_COMPILED:
+        if pattern.search(stripped):
+            return True
+    for _rid, request_pattern, _target, _diag in _CREDENTIAL_COMPILED:
+        if request_pattern.search(stripped):
+            return True
+    return bool(_MESSAGE_TRANSMISSION_RE.search(stripped))
+
+
+def _segment(text: str) -> list[tuple[int, int]]:
+    """Clause spans as ``(start, end)``, strong boundaries then weak ones."""
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for match in _CLAUSE_BOUNDARY_RE.finditer(text):
+        spans.append((start, match.start()))
+        start = match.end()
+    spans.append((start, len(text)))
+
+    refined: list[tuple[int, int]] = []
+    for span_start, span_end in spans:
+        cursor = span_start
+        for match in _WEAK_SEPARATOR_RE.finditer(text, span_start, span_end):
+            left, right = text[cursor:match.start()], text[match.end():span_end]
+            if _side_is_independent(left) and _side_is_independent(right):
+                refined.append((cursor, match.start()))
+                cursor = match.end()
+        refined.append((cursor, span_end))
+    return refined
 #: A clause that is itself a quotation, and the framing that introduces one.
 _QUOTE_ENCLOSED_RE = _c(r"^[\"'“‘(\[]|[\"'”’)\]]$")
 _QUOTE_INTRODUCER_RE = _c(
@@ -264,38 +330,140 @@ class _LocalContext:
     framing crosses a boundary.
     """
 
-    __slots__ = ("_spans", "_flags", "_fallback")
+    __slots__ = ("_spans", "_flags", "_fallback", "_quoted")
 
     def __init__(self, text: str) -> None:
-        self._spans: list[tuple[int, int, str]] = []
-        start = 0
-        for match in _CLAUSE_BOUNDARY_RE.finditer(text):
-            self._spans.append((start, match.start(), text[start:match.start()]))
-            start = match.end()
-        self._spans.append((start, len(text), text[start:]))
+        self._spans = [(start, end, text[start:end]) for start, end in _segment(text)]
         self._fallback = _flags_for(text)
+        self._quoted = _quoted_spans(text)
 
         raw = [_flags_for(clause) for _, _, clause in self._spans]
+        enclosed = _enclosing_quotation(tuple(clause for _, _, clause in self._spans))
         resolved: list[ContextFlags] = []
         for index, flags in enumerate(raw):
             clause = self._spans[index][2].strip()
-            if index and _QUOTE_ENCLOSED_RE.search(clause):
+            # A quotation that runs past a line break is still one quotation.
+            # While it stays open, the clauses inside it keep the framing of
+            # the clause that opened it.
+            if index and (enclosed[index] or _QUOTE_ENCLOSED_RE.search(clause)):
                 previous = resolved[index - 1]
                 flags = ContextFlags(
                     warning=flags.warning or previous.warning,
                     notification=flags.notification,
                     educational=flags.educational or previous.educational,
-                    quoted=flags.quoted or previous.quoted,
+                    quoted=flags.quoted or previous.quoted or enclosed[index],
                 )
             resolved.append(flags)
         self._flags = resolved
 
+    @property
+    def bounds(self) -> tuple[tuple[int, int], ...]:
+        """The resolved clause spans, for scanning one clause at a time."""
+        return tuple((start, end) for start, end, _clause in self._spans)
+
     def at(self, position: int) -> ContextFlags:
         """Framing in force where a rule actually matched."""
+        flags = self._fallback
         for index, (start, end, _clause) in enumerate(self._spans):
             if start <= position <= end:
-                return self._flags[index]
-        return self._fallback
+                flags = self._flags[index]
+                break
+        # A quotation inside a clause frames what is inside it and nothing
+        # else: "a scam message reads '<demand>' -- report it" is one clause,
+        # so clause-level framing alone cannot tell the report from the demand.
+        for start, end in self._quoted:
+            if start <= position <= end:
+                return ContextFlags(
+                    warning=flags.warning,
+                    notification=flags.notification,
+                    educational=flags.educational,
+                    quoted=True,
+                )
+        return flags
+
+
+#: Marks that open and close a quotation. Apostrophes are deliberately
+#: excluded from both: ``'`` and ``’`` are contraction and possessive marks
+#: far more often than quotes, and counting them would let "we don't share
+#: codes" open a quotation that protects everything after it.
+_OPEN_QUOTES = "\"“"
+_CLOSE_QUOTES = "\"”"
+
+
+def _quote_open_after(clause: str, open_now: bool) -> bool:
+    """Whether a quotation is still open once this clause has been read."""
+    for mark in clause:
+        if open_now:
+            if mark in _CLOSE_QUOTES:
+                open_now = False
+        elif mark in _OPEN_QUOTES:
+            open_now = True
+    return open_now
+
+
+def _enclosing_quotation(clauses: tuple[str, ...]) -> tuple[bool, ...]:
+    """Which clauses sit inside a quotation that actually closes.
+
+    The closure requirement is the safeguard. A quotation is a span with two
+    ends; a lone stray mark is punctuation. Without this, one unmatched
+    quote character would silently protect every clause after it, which is a
+    bypass an attacker can type. So an unterminated opening protects nothing.
+    """
+    open_after: list[bool] = []
+    state = False
+    for clause in clauses:
+        state = _quote_open_after(clause, state)
+        open_after.append(state)
+
+    terminates = [False] * len(clauses)
+    closed_later = False
+    for index in range(len(clauses) - 1, -1, -1):
+        if not open_after[index]:
+            closed_later = True
+        terminates[index] = closed_later
+
+    return tuple(
+        index > 0 and open_after[index - 1] and terminates[index]
+        for index in range(len(clauses))
+    )
+
+
+def _clause_scan(
+    pattern: re.Pattern[str], text: str, local: _LocalContext
+) -> list[re.Match[str]]:
+    """Every match of ``pattern``, each confined to a single clause.
+
+    Scanning the whole string looks equivalent and is not, for two reasons.
+    A match may *start* in a framed clause and run into an actionable one,
+    and it is then judged by the framing where it started. And because
+    ``finditer`` yields non-overlapping matches, that first match consumes
+    the real request, so no second match is ever offered for the clause that
+    mattered. Bounding each scan to one clause makes both impossible, and
+    makes ``local.at(match.start())`` exact by construction.
+    """
+    found: list[re.Match[str]] = []
+    for start, end in local.bounds:
+        found.extend(pattern.finditer(text, start, end))
+    return found
+
+
+def _quoted_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Character ranges enclosed by a quotation that actually closes.
+
+    An opening mark with no partner yields nothing, for the reason given in
+    :func:`_enclosing_quotation`: otherwise a single typed quote character
+    would frame the whole rest of the message.
+    """
+    spans: list[tuple[int, int]] = []
+    start_mark: int | None = None
+    for index, mark in enumerate(text):
+        if start_mark is None:
+            if mark in _OPEN_QUOTES:
+                start_mark = index
+        elif mark in _CLOSE_QUOTES:
+            spans.append((start_mark, index))
+            start_mark = None
+    return tuple(spans)
 
 
 def _flags_for(clause: str) -> ContextFlags:
@@ -368,7 +536,7 @@ _INJECTION_COMPILED = tuple((rid, _c(pat), diag) for rid, pat, diag in _INJECTIO
 def _evaluate_injection(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
     hits: list[RuleHit] = []
     for rule_id, pattern, diagnostic in _INJECTION_COMPILED:
-        contexts = [local.at(m.start()) for m in pattern.finditer(norm.folded)]
+        contexts = [local.at(m.start()) for m in _clause_scan(pattern, norm.folded, local)]
         if not contexts:
             continue
         # An instruction that stands unframed somewhere is an instruction,
@@ -474,21 +642,47 @@ _SQUEEZED_REQUEST = _compile_all(
 # must stay quiet. So the action is admitted only when it governs *both* a
 # bounded recipient and the credential being transmitted; a bare "message"
 # never enters the general request-verb list.
-_MESSAGE_ACTION = r"(?:message|dm|text|whatsapp)"
-_TRANSMISSION_RECIPIENT = (
-    r"(?:me|us|him|her|them|support|admin|the team|customer service|"
-    r"customer support|the agent|the operator)"
+_MESSAGE_ACTION = r"(?:direct[- ]?message|message|dm|text|whatsapp)"
+#: A reviewed, closed set of support-desk destinations. Deliberately not
+#: open: a display name, a company, or an arbitrary noun must never become a
+#: recipient, or "send the connector pins to the vendor" would read as a
+#: credential request. Determiners and natural plurals are allowed; nothing
+#: beyond this list is inferred.
+#: A reviewed qualifier and a reviewed head. Both lists are closed, so the
+#: cross product is closed too -- it admits "customer support team" and
+#: "account representative" without ever inferring a noun that is not in
+#: one of these two lists.
+_ROLE_QUALIFIER = r"(?:customer (?:support|service)|customer|support|account|service|help ?)"
+_ROLE_HEAD = r"(?:representatives?|agents?|teams?|desks?|operators?|admins?)"
+_TRANSMISSION_ROLE = (
+    r"(?:(?:" + _ROLE_QUALIFIER + r"\s*)?" + _ROLE_HEAD
+    + r"|customer (?:support|service)|support)"
 )
+_TRANSMISSION_DESTINATION = (
+    r"(?:me|us|him|her|them|(?:the|our|your|their)\s+" + _TRANSMISSION_ROLE
+    + r"|" + _TRANSMISSION_ROLE + r")"
+)
+#: The spelled-out credential may carry a determiner or possessive; the
+#: short forms already carry their own.
+_FULL_FORM_CREDENTIAL = (
+    r"(?:(?:the|your|my|our|their|a)\s+)?personal identification numbers?"
+)
+_TRANSMITTED_CREDENTIAL = r"(?:" + _FULL_FORM_CREDENTIAL + r"|" + _SECRET_TARGET + r")"
+
 _MESSAGE_TRANSMISSION_RE = _c(
-    # message me your PIN  /  message us your account PINs
-    r"\b" + _MESSAGE_ACTION + r"\s+" + _TRANSMISSION_RECIPIENT + r"\s+(?:with\s+)?"
-    + _SECRET_TARGET
-    # message the security PIN to support  /  message your banking PIN to me
-    + r"|\b" + _MESSAGE_ACTION + r"\s+" + _SECRET_TARGET
-    + r"[^.]{0,20}\bto\s+" + _TRANSMISSION_RECIPIENT + r"\b"
-    # send me a message with your card PIN  /  send us a message containing ...
-    + r"|\bsend\s+(?:" + _TRANSMISSION_RECIPIENT + r"\s+)?an?\s+"
-    + _MESSAGE_ACTION + r"\s+(?:with|containing|including|holding)\s+" + _SECRET_TARGET
+    # message me your PIN  /  direct-message the service desk your PIN
+    r"\b" + _MESSAGE_ACTION + r"\s+" + _TRANSMISSION_DESTINATION + r"\s+(?:with\s+)?"
+    + _TRANSMITTED_CREDENTIAL
+    # message the account PIN to the support representative
+    + r"|\b" + _MESSAGE_ACTION + r"\s+" + _TRANSMITTED_CREDENTIAL
+    + r"[^.]{0,20}\bto\s+" + _TRANSMISSION_DESTINATION + r"\b"
+    # send support a message with your security PIN
+    + r"|\bsend\s+(?:" + _TRANSMISSION_DESTINATION + r"\s+)?an?\s+"
+    + _MESSAGE_ACTION + r"\s+(?:with|containing|including|holding)\s+"
+    + _TRANSMITTED_CREDENTIAL
+    # send a message to support with your security PIN
+    + r"|\bsend\s+an?\s+" + _MESSAGE_ACTION + r"\s+to\s+" + _TRANSMISSION_DESTINATION
+    + r"\s+(?:with|containing|including|holding)\s+" + _TRANSMITTED_CREDENTIAL
 )
 
 
@@ -497,8 +691,8 @@ def _evaluate_credentials(norm: NormalizedText, local: _LocalContext) -> list[Ru
     hits: list[RuleHit] = []
 
     for rule_id, request_pattern, target_pattern, diagnostic in _CREDENTIAL_COMPILED:
-        target_contexts = [local.at(m.start()) for m in target_pattern.finditer(text)]
-        request_contexts = [local.at(m.start()) for m in request_pattern.finditer(text)]
+        target_contexts = [local.at(m.start()) for m in _clause_scan(target_pattern, text, local)]
+        request_contexts = [local.at(m.start()) for m in _clause_scan(request_pattern, text, local)]
         target_present = bool(target_contexts)
 
         if not target_present:
@@ -563,7 +757,7 @@ def _evaluate_credentials(norm: NormalizedText, local: _LocalContext) -> list[Ru
     # the general request verbs on purpose: a bare "message" would flag "check
     # the message for your PIN", so the action has to govern both a recipient
     # and the credential being transmitted.
-    for match in _MESSAGE_TRANSMISSION_RE.finditer(text):
+    for match in _clause_scan(_MESSAGE_TRANSMISSION_RE, text, local):
         ctx = local.at(match.start())
         if ctx.is_advisory:
             continue
@@ -974,9 +1168,9 @@ _PROFESSIONAL_GUIDANCE = _compile_all(
 #: *within* one clause, because a global "the text contains 'not' somewhere"
 #: exemption is exactly how a warning in one sentence ends up cancelling a
 #: dangerous instruction in the next.
-#: One clause splitter, shared with the context resolver so a colon that
-#: introduces an instruction separates it from whatever framed the sentence.
-_CLAUSE_SPLIT_RE = _CLAUSE_BOUNDARY_RE
+#: Clause text, from the one shared segmentation used by the context
+#: resolver -- so a colon, a line break, or a bounded weak separator splits
+#: an instruction from whatever framed the sentence.
 
 # A negator standing *before* a harmful action turns the clause into a
 # warning against it. Position matters: "don't stop your medication" is
@@ -1039,8 +1233,19 @@ _ADVICE_DIRECTIVE = _compile_all(
     r"\b(?:calling|going|seeing|seeking|contacting|visiting|attending|ringing|dialling|dialing)\b",
 )
 
+#: A bounded list marker. A line break already ends a clause, so a bullet
+#: or an item number is decoration on the front of the next one -- but the
+#: imperative test below reads the text *before* the harmful verb, and an
+#: unrecognised "- " there is enough to demote a plain instruction. Bounded
+#: to marker characters and one- or two-digit item numbers, and requiring
+#: trailing space, so "-5 degrees" and "3.5 ml" are untouched.
+_LIST_MARKER = r"(?:[-*•–—·]+|\(?\d{1,2}[.)])"
+
 #: A clause whose harmful verb sits at the front is an imperative.
-_IMPERATIVE_PREFIX_RE = _c(r"^(?:\s*(?:and|then|also|so|but|just|please|ok|okay|hey|,)\s*)*$")
+_IMPERATIVE_PREFIX_RE = _c(
+    r"^\s*(?:" + _LIST_MARKER + r"\s+)?"
+    + r"(?:\s*(?:and|then|also|so|but|just|please|ok|okay|hey|,)\s*)*$"
+)
 
 #: ``True`` when the pattern itself contains the harmful negation, so a
 #: leading negator is the *harmful* form rather than the warning form.
@@ -1163,7 +1368,7 @@ _UNSAFE_COMPILED = tuple(
 
 
 def _clauses(text: str) -> tuple[str, ...]:
-    return tuple(part for part in (p.strip() for p in _CLAUSE_SPLIT_RE.split(text)) if part)
+    return tuple(part for part in (text[a:b].strip() for a, b in _segment(text)) if part)
 
 
 def _advice_is_warning(clause: str, start: int, harm_is_negation: bool) -> bool:

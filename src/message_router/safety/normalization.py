@@ -29,6 +29,7 @@ from dataclasses import dataclass
 __all__ = [
     "MAX_ANALYZED_CHARS",
     "SQUEEZE_MIN_LENGTH",
+    "LINE_BOUNDARY",
     "NormalizedText",
     "normalize",
     "near",
@@ -65,6 +66,30 @@ _SUBSTITUTIONS = str.maketrans({"0": "o", "1": "i", "3": "e", "5": "s", "@": "a"
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+#: Internal, content-free stand-in for a line break.
+#:
+#: A line break is a clause boundary as real as a full stop -- people put an
+#: instruction on its own line constantly -- but collapsing it into a space
+#: destroys that boundary before any clause-local rule can see it, which
+#: lets a framing line silently downgrade the line after it. Whitespace
+#: still collapses; the boundary is kept as one deterministic marker first.
+#:
+#: ASCII START OF HEADING is used because it survives NFKC, case folding and
+#: homoglyph mapping unchanged, is *not* matched by ``\s`` so the collapse
+#: below leaves it alone, and is removed from the squeezed view by the
+#: non-alphanumeric filter. The separator controls (``\x1c``-``\x1f``) look
+#: like the natural choice and are not: Python classifies them as
+#: whitespace, so the collapse would turn them straight back into spaces.
+#: It never leaves this layer: clause segmentation splits on it, so no
+#: finding, contributor, diagnostic, serialization or error can carry it.
+LINE_BOUNDARY = "\x01"
+
+#: Any run of line breaks -- LF, CRLF, CR, blank lines -- is one boundary.
+#: Horizontal space is absorbed on both sides *and between* the breaks, so a
+#: blank line that happens to contain spaces stays one boundary rather than
+#: becoming two with an empty clause wedged between them.
+_LINE_BREAK_RUN_RE = re.compile(r"[ \t\f\v]*(?:(?:\r\n|\r|\n)[ \t\f\v]*)+")
 
 # Zero-width and bidirectional-control characters, which can hide a word
 # boundary from a human reader while leaving the text machine-readable.
@@ -107,7 +132,11 @@ def normalize(text: str) -> NormalizedText:
     working = unicodedata.normalize("NFKC", working)
     working = _INVISIBLE_RE.sub("", working)
     working = working.translate(_HOMOGLYPHS)
+    # Line breaks become the boundary marker *before* whitespace collapses,
+    # which is the only reason a multi-line message keeps its clauses.
+    working = _LINE_BREAK_RUN_RE.sub(LINE_BOUNDARY, working)
     folded = _WHITESPACE_RE.sub(" ", working.casefold()).strip()
+    folded = folded.strip(LINE_BOUNDARY + " ")
 
     squeezed = _NON_ALNUM_RE.sub("", folded.translate(_SUBSTITUTIONS))
 
