@@ -11,8 +11,11 @@ import argparse
 
 UNDER_CONSTRUCTION_MESSAGE = (
     "message_router is a portfolio scaffold for a multimodal message-routing "
-    "project. The routing implementation is under construction. This build "
-    "exposes only a placeholder command-line interface."
+    "project. The independent domain foundation is available to import from "
+    "message_router.domain, with replaceable backend interfaces in "
+    "message_router.ports. The later routing stages are still under "
+    "construction, so this build exposes only a placeholder command-line "
+    "interface."
 )
 
 
