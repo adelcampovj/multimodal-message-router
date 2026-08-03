@@ -68,6 +68,7 @@ READER = RecipientScope("rcp-4kq")
 DIRECT = ConversationContext("conv-31b", ConversationSurface.DIRECT)
 CHANNEL = ConversationContext("conv-88f", ConversationSurface.CHANNEL, 500)
 IMAGE = MediaReference("att-55c", MediaKind.IMAGE)
+IMAGE_B = MediaReference("att-66d", MediaKind.IMAGE)
 AUDIO = MediaReference("att-77d", MediaKind.AUDIO)
 
 ALL_LEVELS = tuple(FeatureLevel)
@@ -286,9 +287,23 @@ class SuspiciousCombinationTests(unittest.TestCase):
             self.assertIsNot(result.action, RoutingAction.SUPPRESS, family)
 
     def test_corroborating_families_cannot_combine_without_a_substantive_one(self):
-        result = self.combination(RiskFamily.MALICIOUS_PRESSURE, RiskFamily.DECEPTIVE_LINK,
-                                  RiskFamily.CORROBORATING_MODALITY)
+        result = self.combination(RiskFamily.MALICIOUS_PRESSURE, RiskFamily.DECEPTIVE_LINK)
         self.assertIsNot(result.action, RoutingAction.SUPPRESS)
+
+    def test_no_family_stands_for_seeing_the_same_thing_twice(self):
+        """Regression: a "second modality agreed" family let one indicator
+        read twice complete a two-family suppression. Repetition is a reason
+        to believe an indicator, not a second indicator, so no such family
+        exists and none of the corroborator sets can name one."""
+        from message_router.routing.policy import RISK_COMBINATIONS
+
+        for family in RiskFamily:
+            self.assertNotIn("corrobor", family.value, family)
+            self.assertNotIn("modality", family.value, family)
+        named = {f for _, anchor, corr in RISK_COMBINATIONS for f in ({anchor} | corr)}
+        self.assertTrue(named <= set(RiskFamily))
+        for family in named:
+            self.assertNotIn("modality", family.value, family)
 
     def test_high_propagation_with_no_value_suppresses(self):
         a = self.suspicious((FindingCategory.PROPAGATION_RISK,))
@@ -828,6 +843,112 @@ class ScamSuppressionTests(unittest.TestCase):
             _, _, _, result = run_pipeline(text)
             self.assertIs(result.action, RoutingAction.DEFER, label)
             self.assertFalse(result.policy_id.startswith("route.risk."), f"{label}: {result.policy_id}")
+
+
+class CrossModalCorroborationTests(unittest.TestCase):
+    """Regression: one indicator read twice completed a two-family suppression.
+
+    A caption and the image it was printed on are two *sources*, not two
+    reasons. Corroboration credit is therefore counted over deduplicated
+    root causes -- risk family, rule identifier, diagnostic -- while the
+    findings themselves keep their own provenance untouched.
+    """
+
+    DEMAND = "Pay now."
+    LINK = "Open http://secure-verify-account-billing.example/x"
+
+    def ocr(self, text, ref=IMAGE):
+        return MediaAnalysis(ref, ExtractionStatus.SUCCEEDED,
+                             content=TextContent(text, Provenance.OCR_TEXT))
+
+    def asr(self, text):
+        return MediaAnalysis(AUDIO, ExtractionStatus.SUCCEEDED,
+                             content=TextContent(text, Provenance.ASR_TRANSCRIPT))
+
+    def qr(self, text, ref=IMAGE):
+        return MediaAnalysis(ref, ExtractionStatus.SUCCEEDED,
+                             content=TextContent(text, Provenance.QR_DERIVED))
+
+    def test_the_same_indicator_repeated_never_becomes_two_reasons(self):
+        cases = (
+            ("authored + OCR", dict(text=self.DEMAND, media=(self.ocr(self.DEMAND),))),
+            ("authored + ASR", dict(text=self.DEMAND, media=(self.asr(self.DEMAND),))),
+            ("OCR + QR", dict(text=None, attachment=IMAGE,
+                              media=(self.ocr(self.DEMAND), self.qr(self.DEMAND, ref=IMAGE_B)))),
+            ("capitalization variant", dict(text=self.DEMAND, media=(self.ocr("PAY NOW."),))),
+            ("punctuation variant", dict(text=self.DEMAND, media=(self.ocr("Pay now!!!"),))),
+            ("normalization variant", dict(text=self.DEMAND, media=(self.ocr("p a y  n o w."),))),
+            ("duplicate backend output",
+             dict(text=None, attachment=IMAGE,
+                  media=(self.ocr(self.DEMAND), self.ocr(self.DEMAND, ref=IMAGE_B)))),
+            ("repeated diagnostics", dict(text="Pay now. Pay immediately. Pay today.")),
+            ("aliases of one cause", dict(text=self.DEMAND,
+                                          media=(self.ocr("Send payment now."),))),
+            ("one family three times", dict(text=self.DEMAND,
+                                            media=(self.ocr(self.DEMAND), self.asr(self.DEMAND)))),
+        )
+        for label, kwargs in cases:
+            kwargs = dict(kwargs)
+            text = kwargs.pop("text")
+            _, _, f, result = run_pipeline(text, **kwargs)
+            self.assertEqual(len(f.risk_root_causes), 1, f"{label}: {f.risk_root_causes}")
+            self.assertEqual(len(f.risk_families), 1, label)
+            self.assertIsNot(result.action, RoutingAction.SUPPRESS, label)
+
+    def test_distinct_families_across_modalities_still_corroborate(self):
+        cases = (
+            ("payment + link", dict(text=self.DEMAND, media=(self.ocr(self.LINK),))),
+            ("identity + credential",
+             dict(text="This is an official notice from your bank.",
+                  media=(self.asr("Reply with your PINs now"),))),
+            ("three distinct families",
+             dict(text="Your subscription will be terminated. "
+                       "Send payment by wire transfer today.")),
+        )
+        for label, kwargs in cases:
+            kwargs = dict(kwargs)
+            text = kwargs.pop("text")
+            _, _, f, result = run_pipeline(text, **kwargs)
+            self.assertGreaterEqual(len(f.risk_root_causes), 2, label)
+            self.assertIs(result.action, RoutingAction.SUPPRESS, label)
+
+    def test_suspicious_combination_keeps_its_severity_and_claims_no_veto(self):
+        a, _, f, result = run_pipeline(
+            "Your subscription will be terminated. Send payment by wire transfer today."
+        )
+        self.assertIs(a.highest_severity, Severity.SUSPICIOUS)
+        self.assertFalse(a.hard_veto_required)
+        self.assertFalse(result.hard_veto_applied)
+        self.assertTrue(result.policy_id.startswith("route.risk."))
+
+    def test_findings_and_provenance_survive_deduplication(self):
+        a, _, f, _ = run_pipeline(self.DEMAND, media=(self.ocr(self.DEMAND),))
+        provenances = {finding.provenance for finding in a.findings}
+        self.assertEqual(provenances, {Provenance.AUTHORED_TEXT, Provenance.OCR_TEXT})
+        self.assertGreater(len(a.findings), 1)
+        self.assertEqual(len(f.risk_root_causes), 1)
+        self.assertTrue(f.cross_modal_corroboration is False)
+
+    def test_severe_evidence_still_vetoes_alongside_duplicates(self):
+        a, _, _, result = run_pipeline("Send me your PINs now.",
+                                       media=(self.ocr("Send me your PINs now."),))
+        self.assertTrue(a.hard_veto_required)
+        self.assertEqual(result.policy_id, "route.safety.hard_veto")
+        self.assertTrue(result.hard_veto_applied)
+
+    def test_inputs_are_not_mutated_and_ordering_is_deterministic(self):
+        a, c, f, _ = run_pipeline(self.DEMAND, media=(self.ocr(self.DEMAND),))
+        snapshot = (a.findings, a.highest_severity, a.hard_veto_required, a.diagnostics,
+                    c.selected, c.contributors)
+        first = route(a, c, f)
+        second = route(a, c, f)
+        self.assertEqual(
+            (a.findings, a.highest_severity, a.hard_veto_required, a.diagnostics,
+             c.selected, c.contributors), snapshot)
+        self.assertEqual(first.serialize(), second.serialize())
+        keys = [cause.sort_key() for cause in sorted(f.risk_root_causes,
+                                                     key=lambda x: x.sort_key())]
+        self.assertEqual(keys, sorted(keys))
 
 
 class DirectRequestUrgencyTests(unittest.TestCase):

@@ -75,8 +75,8 @@ _WARNING_PATTERNS = _compile_all(
     # that exist precisely to catch them.
     r"\b(?:never|do ?n[o']?t|dont|don t)\b[^.]{0,40}"
     r"\b(?:share|give|send|disclose|reveal|tell|enter)\b[^.]{0,30}"
-    r"\b(?:otp|pin|password|passcode|code|codes|card|cvv|credentials|"
-    r"login|details|account details|security answer)\b",
+    r"\b(?:otp|pins?|personal identification numbers?|password|passcode|code|codes|"
+    r"card|cvv|credentials|login|details|account details|security answer)\b",
     r"\bwe (?:will )?never (?:ask|request|call|email|text)\b",
     r"\bno ?one (?:from|at)\b[^.]{0,40}\bwill (?:ever )?ask\b",
     r"\b(?:scam|phishing|fraud) (?:alert|warning|attempt)\b",
@@ -126,7 +126,8 @@ _PRONOUN_WARNING_RE = _c(
     r"\b(?:it|them|this|that|these|those)\b"
 )
 _SECRET_NOUN_RE = _c(
-    r"(?:otp|one[\s-]?time[\s-]?(?:password|code|pin)|\bpin\b|passcode|password|"
+    r"(?:otp|one[\s-]?time[\s-]?(?:password|code|pin)|\bpins?\b|"
+    r"personal identification numbers?|passcode|password|"
     r"verification code|login code|security code|access code|recovery code|"
     r"authentication code|auth code|2fa code|\bcode\b|cvv|card number)"
 )
@@ -258,12 +259,34 @@ def _evaluate_injection(norm: NormalizedText, ctx: ContextFlags) -> list[RuleHit
 
 _REQUEST_VERB = (
     r"(?:send|share|give|tell|forward|reply with|provide|submit|enter|type|confirm|"
-    r"verify|read out|text|paste|hand over)"
+    r"verify|read out|text|paste|hand over|reveal|disclose|transmit)"
 )
 _RECIPIENT_POSSESSIVE = r"(?:your|the|me|us|it)"
 
+# A bare "pin" is a credential in one sense and a sewing supply, a map
+# marker, a connector, a pinned message, or a variable name in several
+# others. The token is therefore admitted only when it is *not* qualified by
+# one of these, each excluded as its own fixed-width lookbehind. This is an
+# explicit closed list, not stemming or fuzzy matching, and "pinned" and
+# "pinning" never match at all because the token boundary rejects them.
+_PIN_MODIFIERS = (
+    "sewing", "safety", "map", "location", "drop", "push", "bobby", "hair", "rolling",
+    "split", "cotter", "connector", "hardware", "header", "gpio", "breadboard", "chip",
+    "panel", "bowling", "clothes", "lapel", "lynch", "named", "call",
+)
+_PIN_NOT_MODIFIED = "".join(f"(?<!{word} )" for word in _PIN_MODIFIERS)
+#: Pinning something in a conversation is not a credential either.
+_PIN_NOT_AN_ACTION = (
+    r"(?!\s+(?:the |this |a |that |it )*"
+    r"(?:message|post|chat|thread|tweet|note|comment|conversation|item|tab)\b)"
+)
+_PIN_TARGET = (
+    r"(?:personal identification numbers?|"
+    + _PIN_NOT_MODIFIED + r"\bpin(?:'s|s)?\b" + _PIN_NOT_AN_ACTION + r")"
+)
+
 _SECRET_TARGET = (
-    r"(?:otp|one[\s-]?time[\s-]?(?:password|code|pin)|\bpin\b|passcode|password|"
+    r"(?:otp|one[\s-]?time[\s-]?(?:password|code|pin)|" + _PIN_TARGET + r"|passcode|password|"
     r"verification code|login code|security code|access code|recovery code|"
     r"authentication code|auth code|2fa code|security answer|secret question)"
 )
@@ -698,8 +721,9 @@ def _evaluate_links(norm: NormalizedText, ctx: ContextFlags) -> list[RuleHit]:
 # ---------------------------------------------------------------------------
 
 _PROFESSIONAL_GUIDANCE = _compile_all(
-    r"\b(?:my|your|the) (?:doctor|gp|physician|consultant|pharmacist|nurse)\b[^.]{0,30}"
-    r"\b(?:said|says|advised|told|recommended|prescribed)\b",
+    r"\b(?:my|your|the) (?:doctor|gp|physician|consultant|pharmacist|nurse|clinician|"
+    r"prescriber|doctors|physicians|consultants|pharmacists|nurses|clinicians|prescribers)\b"
+    r"[^.]{0,30}\b(?:said|says|advised|told|recommended|prescribed)\b",
     r"\bas (?:prescribed|directed|advised) by\b",
     r"\bunder (?:medical|professional) supervision\b",
     r"\bfollow(?:ing)? (?:your|the) (?:doctor|gp|prescription)\b",
@@ -725,7 +749,9 @@ _ADVICE_NEGATOR = _compile_all(
 # there, so a position-aware check separates them.
 _SEEK_GUIDANCE_FIRST = _compile_all(
     r"\b(?:ask|consult|speak (?:to|with)|talk to|check with|contact|call|see)\b[^.]{0,25}"
-    r"\b(?:doctor|gp|physician|clinician|pharmacist|nurse|specialist|consultant)\b",
+    r"\b(?:doctor|gp|physician|clinician|pharmacist|nurse|specialist|consultant|"
+    r"prescriber|doctors|physicians|clinicians|pharmacists|nurses|specialists|"
+    r"consultants|prescribers|qualified medical professionals?|healthcare professionals?)\b",
     r"\b(?:professional|medical) (?:guidance|advice|supervision)\b",
 )
 
@@ -761,6 +787,13 @@ _ADVICE_DIRECTIVE = _compile_all(
     r"\byou(?:'ll| will) be fine\b",
     r"\bno need to\b",
     r"\btrust me\b",
+    # "do X instead of <seeking help>" is a substitution instruction even
+    # when the clause opens with a bare imperative, so the harmful phrase
+    # sits mid-clause and the imperative test above cannot see it. Bounded
+    # to acts of seeking help; past-tense narration is already excluded
+    # because the harmful verbs are token-bounded.
+    r"\binstead of\b[^.]{0,25}"
+    r"\b(?:calling|going|seeing|seeking|contacting|visiting|attending|ringing|dialling|dialing)\b",
 )
 
 #: A clause whose harmful verb sits at the front is an imperative.
@@ -771,51 +804,95 @@ _IMPERATIVE_PREFIX_RE = _c(r"^(?:\s*(?:and|then|also|so|but|just|please|ok|okay|
 _HARM_IS_NEGATION = True
 _HARM_IS_INSTRUCTION = False
 
+# Bounded object vocabularies, shared by the rules below so singular and
+# plural forms cannot drift apart. Each is an explicit alternation with one
+# grouped optional plural suffix -- not stemming, not fuzzy matching, and
+# not a medical dictionary. A trailing ``\b`` in the rule keeps every
+# alternative token-bounded, so none of these matches inside a longer word.
+#
+# ``gp`` deliberately carries no plural suffix: "gps" is a navigation
+# device far more often than it is two general practitioners.
+_MEDICATION_OBJECT = (
+    r"(?:medication|medicine|tablet|pill|prescription|prescribed drug|"
+    r"prescribed treatment|insulin|antibiotic|painkiller|inhaler|treatment)s?"
+)
+_DOSE_OBJECT = r"(?:dose|dosage|tablet|pill)s?"
+_CARE_PROVIDER = (
+    r"(?:(?:doctor|physician|clinician|prescriber|pharmacist|nurse|paramedic|"
+    r"qualified medical professional|healthcare professional|health care professional|"
+    r"medical professional)s?|gp)"
+)
+# Reaching for help, not merely naming a place. Requiring the verb is what
+# keeps "don't park near the emergency room" from reading as a refusal of
+# care: the terms below are only dangerous as the object of seeking help.
+_SEEK_CARE_VERB = (
+    r"(?:call|calling|contact|contacting|ring|ringing|dial|dialling|dialing|"
+    r"go to|going to|visit|visiting|attend|attending|see|seeing|seek|seeking|"
+    r"get|getting|use|using)"
+)
+_EMERGENCY_CARE_OBJECT = (
+    r"(?:(?:an? |the )?ambulances?|(?:the )?ambulance crew|(?:the )?hospital|"
+    r"(?:the )?emergency (?:care|services?|department|rooms?)|(?:the )?a ?& ?e|"
+    r"urgent medical help|immediate medical attention|9 ?1 ?1|9 ?9 ?9|1 ?1 ?2|"
+    r"(?:a |the )?" + _CARE_PROVIDER + r"|help)"
+)
+_CONCEALMENT_TARGET = (
+    r"(?:" + _CARE_PROVIDER + r"|(?:the )?hospital|(?:the )?emergency services?|"
+    r"(?:the )?ambulance crew)"
+)
+_EMERGENCY_SYMPTOM = (
+    r"(?:chest pain|difficulty breathing|trouble breathing|shortness of breath|"
+    r"heavy bleeding|seizure|stroke|overdose|numbness|slurred speech|"
+    r"emergency symptom|symptom|dangerous condition)s?"
+)
+
 _UNSAFE_ADVICE_RULES = (
     (
         "ADV_STOP_MEDICATION",
         r"\b(?:stop|quit|discontinue|throw away|bin|come off)\b[^.]{0,30}"
-        r"\b(?:medication|medicine|tablets|pills|prescription|insulin|antibiotics|inhaler|treatment)\b",
+        r"\b" + _MEDICATION_OBJECT + r"\b",
         DiagnosticCode.MEDICATION_DISCONTINUATION,
         _HARM_IS_INSTRUCTION,
     ),
     (
         "ADV_DANGEROUS_DOSE",
         r"\b(?:take|swallow|use)\b[^.]{0,25}\b(?:double|triple|twice|three times|extra|more than)\b"
-        r"[^.]{0,25}\b(?:dose|doses|tablets|pills)\b"
-        r"|\btake\b[^.]{0,15}\b(?:\d{2,})\b[^.]{0,15}\b(?:tablets|pills)\b"
-        r"|\b(?:double|triple|halve)\b[^.]{0,20}\b(?:dose|dosage)\b",
+        r"[^.]{0,25}\b" + _DOSE_OBJECT + r"\b"
+        r"|\btake\b[^.]{0,15}\b(?:\d{2,})\b[^.]{0,15}\b(?:tablet|pill)s?\b"
+        r"|\b(?:double|triple|halve|change|alter|increase|reduce)\b[^.]{0,20}"
+        r"\b(?:dose|dosage)s?\b",
         DiagnosticCode.DANGEROUS_DOSAGE,
         _HARM_IS_INSTRUCTION,
     ),
     (
         "ADV_HARMFUL_INGESTION",
         r"\b(?:drink|swallow|ingest|inhale|gargle)\b[^.]{0,25}"
-        r"\b(?:bleach|disinfectant|antifreeze|petrol|gasoline|turpentine|hydrogen peroxide)\b",
+        r"\b(?:bleach|disinfectant|antifreeze|petrol|gasoline|turpentine|"
+        r"hydrogen peroxide|cleaning product)s?\b",
         DiagnosticCode.HARMFUL_INGESTION,
         _HARM_IS_INSTRUCTION,
     ),
     (
         "ADV_IGNORE_EMERGENCY_SYMPTOMS",
         r"\b(?:ignore|dismiss|push through|sleep off|walk off|shake off)\b[^.]{0,30}"
-        r"\b(?:chest pain|difficulty breathing|trouble breathing|shortness of breath|"
-        r"heavy bleeding|seizure|stroke|overdose|numbness|slurred speech|symptoms)\b",
+        r"\b" + _EMERGENCY_SYMPTOM + r"\b",
         DiagnosticCode.EMERGENCY_SYMPTOMS_IGNORED,
         _HARM_IS_INSTRUCTION,
     ),
     (
         "ADV_AVOID_EMERGENCY_CARE",
-        r"\b(?:do ?n[o']?t|dont|no need to|avoid)\b[^.]{0,30}"
-        r"\b(?:call an ambulance|go to (?:the )?hospital|emergency room|a ?& ?e|call 9 ?1 ?1|call 9 ?9 ?9|call 1 ?1 ?2|see a doctor|seek help)\b"
-        r"|\binstead of\b[^.]{0,25}"
-        r"\b(?:calling an ambulance|going to (?:the )?hospital|the emergency room|seeing a doctor|seeking help)\b",
+        r"\b(?:do ?n[o']?t|dont|no need to|avoid)\b[^.]{0,25}"
+        r"\b" + _SEEK_CARE_VERB + r"\b[^.]{0,15}\b" + _EMERGENCY_CARE_OBJECT + r"\b"
+        r"|\binstead of\b[^.]{0,20}\b" + _SEEK_CARE_VERB + r"\b[^.]{0,15}"
+        r"\b" + _EMERGENCY_CARE_OBJECT + r"\b",
         DiagnosticCode.EMERGENCY_CARE_DISCOURAGED,
         _HARM_IS_NEGATION,
     ),
     (
         "ADV_CONCEAL_FROM_CARE",
-        r"\b(?:do ?n[o']?t|dont|never)\b[^.]{0,25}\b(?:tell|mention|inform|show)\b[^.]{0,25}"
-        r"\b(?:doctor|gp|hospital|nurse|paramedic|pharmacist)\b",
+        r"\b(?:do ?n[o']?t|dont|never)\b[^.]{0,25}"
+        r"\b(?:tell|mention|inform|show|report(?: to)?|disclose(?: to)?)\b[^.]{0,25}"
+        r"\b" + _CONCEALMENT_TARGET + r"\b",
         DiagnosticCode.CONCEALMENT_FROM_CARE,
         _HARM_IS_NEGATION,
     ),

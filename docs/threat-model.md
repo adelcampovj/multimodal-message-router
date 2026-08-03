@@ -158,6 +158,23 @@ receive identical analysis.
   a quotation, or a clinician-guided statement. Severe discharges through
   the ordinary hard veto; there is no medical-specific routing path, and
   trust, affinity, relevance, and urgency cannot reach it.
+
+  The object vocabularies are **bounded and parity-checked**: explicit
+  alternations with one grouped optional plural suffix, shared between the
+  rules so singular and plural cannot drift apart. There is no stemming, no
+  fuzzy matching, and no medical dictionary — an earlier version was
+  singular-only, and pluralizing one noun was enough to slip past every
+  family. Emergency-care terms are dangerous only as the object of *seeking
+  help*: requiring that verb is what separates "don't go to the emergency
+  room" from "don't park near the emergency room".
+
+* **A credential named "pin" is bounded by its other meanings.** The token is
+  admitted only when it is not qualified by a closed list of unrelated
+  senses — sewing, map, location, connector, header, a pinned message, a
+  variable name. "Pinned" and "pinning" never match at all, because the
+  token boundary rejects them. The short-token exclusion in squeezed
+  matching is unchanged: it is what stops three letters matching inside
+  ordinary prose.
 * **Processing is bounded** at 20,000 characters per source; longer content
   is analysed up to the limit and flagged as truncated.
 

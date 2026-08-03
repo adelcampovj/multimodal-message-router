@@ -66,26 +66,42 @@ Suspicious risk suppresses only in explicit conjunctions, and never by
 mutating severity or fabricating a veto. A message suppressed here is still
 `suspicious` afterwards, and `hard_veto_applied` is `false`.
 
-The unit of corroboration is a **risk family**, projected from safety
-findings by their fixed diagnostic codes. Two findings that express the same
-underlying indicator map to the same family and therefore count once, so a
-single pattern cannot corroborate itself. Each rule pairs an *anchor* family
-with a disjoint set of corroborating families:
+The unit of corroboration is a **risk family**, projected from deduplicated
+*root causes*. A root cause is the triple (risk family, safety rule
+identifier, diagnostic code) — closed vocabularies only, never message text,
+a URL, a transcript, or anything secret-bearing. Two findings that express
+the same underlying indicator share a root cause and therefore count once,
+so a single pattern cannot corroborate itself.
+
+Provenance is deliberately **not** part of that key, and that is the whole
+point. A caption and the image it was printed on are two sources, not two
+reasons; the same demand read from authored text and from OCR is one cause.
+There is no "a second modality agreed" family, because admitting one would
+let a single indicator complete a two-family suppression by being read
+twice. Cross-modal agreement between *different* causes is still recorded on
+the feature bundle for auditability, and routing never reads it.
+
+Evidence and corroboration credit are separate things: every finding
+survives deduplication intact, keeps its own provenance, and is never
+merged, dropped, or rewritten. Only the counting changes.
+
+Each rule pairs an *anchor* family with a disjoint set of corroborating
+families:
 
 | Policy | Anchor | Corroborated by |
 |---|---|---|
 | `identity_credential` | identity inconsistency | information request, coercive payment, unusual channel, advance fee |
 | `payment_link` | deceptive link | coercive payment, unusual channel, information request, advance fee |
-| `advance_fee_pressure` | advance fee | pressure, coercive payment, unusual channel, second modality |
-| `unusual_channel` | unusual payment channel | coercive payment, pressure, second modality |
-| `coercion_pressure` | coercive payment | pressure, second modality |
+| `advance_fee_pressure` | advance fee | pressure, coercive payment, unusual channel |
+| `unusual_channel` | unusual payment channel | coercive payment, pressure |
+| `coercion_pressure` | coercive payment | pressure |
 | `propagation_low_value` | high circulation | established low relevance **and** utility, with suspicious risk |
 
-At least one side must be **substantive**. Manufactured pressure, a second
-modality repeating the same thing, and a domain that merely looks wrong are
-corroborators: they strengthen a substantive family and never combine into a
-suppression on their own. Urgency wording is not a family at all — a
-countdown must not corroborate itself.
+At least one side must be **substantive**. Manufactured pressure and a
+domain that merely looks wrong are corroborators: they strengthen a
+substantive family and never combine into a suppression on their own.
+Urgency wording is not a family at all — a countdown must not corroborate
+itself — and neither is repetition across sources.
 
 Only findings the safety layer reported as at least suspicious *and* not
 ambiguous qualify, so a weak mention and a quoted or educational match never

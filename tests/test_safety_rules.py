@@ -282,6 +282,105 @@ class CredentialTests(unittest.TestCase):
         self.assertIsNot(severity_of(a), Severity.SEVERE)
 
 
+class PinCredentialTests(unittest.TestCase):
+    """Regression: a plural PIN request went undetected.
+
+    The target was singular-only, and the squeezed evasion fallback
+    deliberately excludes short tokens, so nothing caught it. Widening the
+    token brings its own problem -- "pin" is also a sewing supply, a map
+    marker, a connector, and a verb -- so the token is admitted only when it
+    is not qualified by one of a closed list of other meanings.
+    """
+
+    REQUESTS = (
+        "Please send me your PIN to confirm",
+        "Please send me your PINs to confirm",
+        "Provide the PIN so I can continue",
+        "Provide the PINs so I can continue",
+        "Reply with your PIN now",
+        "Reply with your PINs now",
+        "Share your personal identification number with me",
+        "Share your personal identification numbers with me",
+        "Reveal the PIN to me now",
+        "Disclose the PINs to me now",
+        "Enter the PIN into the chat so I can check",
+    )
+
+    NON_CREDENTIAL = (
+        "Could you send me the sewing pins from the drawer?",
+        "Please share the map pins for the route",
+        "Send me the location pins for tomorrow",
+        "Could you pin the message in the chat?",
+        "The pinned message has the details",
+        "Check the pinned post for the agenda",
+        "Send me the header pins for the board",
+        "Provide the connector pins specification",
+        "In the sample the variable named pin is read from config",
+        "The parameter named pins holds the list",
+        "Could you send me the bowling pins picture?",
+        "The spinning wheel and the pinnacle are unrelated.",
+    )
+
+    SAFE_CREDENTIAL_CONTEXT = (
+        "A PIN is a personal identification number used at a terminal.",
+        "PINs are stored only in hashed form.",
+        "This training module explains how attackers ask people to share your PINs.",
+        "Your PIN is 4417. It expires in 10 minutes.",
+        "We will never ask for your PIN. Never share your PIN with anyone.",
+        "Never share your PINs with anyone.",
+        "Beware of fraud: no one from the bank will ever ask for your PINs.",
+        "You can reset your PIN in the app settings.",
+        "Someone sent me a message saying reply with your PINs. Is this a scam?",
+    )
+
+    def test_disclosure_requests_are_severe(self):
+        for text in self.REQUESTS:
+            a = analyze(text)
+            self.assertIs(severity_of(a), Severity.SEVERE, text)
+            self.assertTrue(a.hard_veto_required, text)
+            self.assertIn(FindingCategory.CREDENTIAL_SOLICITATION, categories(a), text)
+
+    def test_requests_detected_in_every_untrusted_provenance(self):
+        payload = "Please send me your PINs to confirm"
+        for provenance, ref in (
+            (Provenance.OCR_TEXT, IMAGE),
+            (Provenance.QR_DERIVED, IMAGE),
+            (Provenance.ASR_TRANSCRIPT, AUDIO),
+        ):
+            analysis = MediaAnalysis(ref, ExtractionStatus.SUCCEEDED,
+                                     content=TextContent(payload, provenance))
+            a = analyze_message(message(attachment=ref), media_analyses=(analysis,))
+            self.assertIs(severity_of(a), Severity.SEVERE, provenance)
+            self.assertTrue(all(f.provenance is provenance for f in a.findings), provenance)
+
+    def test_other_meanings_of_pin_are_never_credential_findings(self):
+        for text in self.NON_CREDENTIAL:
+            a = analyze(text)
+            self.assertIsNot(severity_of(a), Severity.SEVERE, text)
+            self.assertNotIn(FindingCategory.CREDENTIAL_SOLICITATION, categories(a), text)
+
+    def test_warnings_notices_and_education_stay_non_severe(self):
+        for text in self.SAFE_CREDENTIAL_CONTEXT:
+            a = analyze(text)
+            self.assertIsNot(severity_of(a), Severity.SEVERE, text)
+            self.assertFalse(a.hard_veto_required, text)
+
+    def test_short_token_squeezed_exclusion_is_preserved(self):
+        from message_router.safety import rules as rules_module
+
+        for pattern in rules_module._SQUEEZED_TARGETS:
+            self.assertNotIn("pin", pattern.pattern)
+
+    def test_no_credential_value_reaches_any_output(self):
+        secret = "8831"
+        a = analyze(f"Reply with your PINs {secret} now")
+        self.assertIs(severity_of(a), Severity.SEVERE)
+        rendered = " ".join([repr(a)] + [repr(f) for f in a.findings]
+                            + [d.value for d in a.diagnostics])
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn("Reply with your", rendered)
+
+
 # ---------------------------------------------------------------------------
 # Payment and scams.
 # ---------------------------------------------------------------------------
@@ -635,6 +734,93 @@ class SevereDangerousAdviceTests(unittest.TestCase):
         ):
             a = analyze(text)
             self.assertIsNot(severity_of(a), Severity.SEVERE, text)
+
+    def test_singular_and_plural_forms_are_treated_alike(self):
+        """Regression: the object lists were singular-only, so pluralizing a
+        noun defeated every dangerous-advice family. A trivially reachable
+        variation must not decide whether a hard veto fires."""
+        pairs = (
+            ("You should stop taking your medication straight away.",
+             "You should stop taking your medications straight away."),
+            ("You should stop taking your medicine straight away.",
+             "You should stop taking your medicines straight away."),
+            ("You should stop taking your prescribed drug straight away.",
+             "You should stop taking your prescribed drugs straight away."),
+            ("You should stop taking your antibiotic straight away.",
+             "You should stop taking your antibiotics straight away."),
+            ("You should stop using your inhaler straight away.",
+             "You should stop using your inhalers straight away."),
+            ("You should change your dose straight away.",
+             "You should change your doses straight away."),
+            ("Just alter your dosage tonight.", "Just alter your dosages tonight."),
+            ("Ignore the emergency symptom and go back to sleep.",
+             "Ignore the emergency symptoms and go back to sleep."),
+            ("Ignore the seizure and go back to sleep.",
+             "Ignore the seizures and go back to sleep."),
+            ("Don't call an ambulance, it will pass.",
+             "Don't call ambulances, it will pass."),
+            ("Don't tell the doctor about the dangerous condition.",
+             "Don't tell the doctors about the dangerous conditions."),
+            ("Don't tell the paramedic about the seizure.",
+             "Don't tell the paramedics about the seizure."),
+            ("Don't tell the pharmacist about the tablets.",
+             "Don't tell the pharmacists about the tablets."),
+        )
+        for singular, plural in pairs:
+            for text in (singular, plural):
+                a = analyze(text)
+                self.assertIs(severity_of(a), Severity.SEVERE, text)
+                self.assertTrue(a.hard_veto_required, text)
+
+    def test_bounded_provider_and_emergency_vocabulary(self):
+        for text in (
+            "Don't tell the clinician about the seizure.",
+            "Don't tell the clinicians about the seizure.",
+            "Don't tell the prescriber about the overdose.",
+            "Don't tell the emergency services about the overdose.",
+            "Don't tell the ambulance crew about the overdose.",
+            "Don't go to the emergency room, it will pass.",
+            "Don't go to the emergency department, it will pass.",
+            "Don't seek emergency care, it will pass.",
+            "Don't get urgent medical help, it will pass.",
+            "Don't see the doctors about it, it will pass.",
+            "Take a hot bath instead of calling an ambulance.",
+            "Drink the cleaning products to clear it out.",
+        ):
+            a = analyze(text)
+            self.assertIs(severity_of(a), Severity.SEVERE, text)
+
+    def test_naming_a_care_setting_is_not_refusing_care(self):
+        """The emergency vocabulary is dangerous only as the object of
+        seeking help. Requiring that verb is what keeps ordinary logistics
+        out of it."""
+        for text in (
+            "Don't park near the emergency room entrance.",
+            "Avoid the hospital roundabout at rush hour.",
+            "The doctors surgery is closed on Monday.",
+            "The ambulance was parked outside all afternoon.",
+            "Don't forget the hospital parking permit.",
+        ):
+            a = analyze(text)
+            self.assertIsNot(severity_of(a), Severity.SEVERE, text)
+            self.assertNotIn(FindingCategory.UNSAFE_ADVICE, categories(a), text)
+
+    def test_plural_safe_forms_stay_safe(self):
+        for text in (
+            "Do not stop taking prescribed medications without consulting a clinician.",
+            "Never stop taking your medicines without professional guidance.",
+            "Never change your doses without professional guidance.",
+            "Please speak to your clinicians before changing anything.",
+            "My doctors said to stop taking my tablets after this week.",
+            "If it gets worse, call the emergency services straight away.",
+            "Your repeat prescriptions are ready to collect from the pharmacy.",
+            "This article explains why you should never stop taking prescribed medications.",
+            "Back in 2019 she stopped taking her tablets for a week.",
+            "If someone tells you to ignore chest pains, that is dangerous advice.",
+        ):
+            a = analyze(text)
+            self.assertIsNot(severity_of(a), Severity.SEVERE, text)
+            self.assertFalse(a.hard_veto_required, text)
 
     def test_no_health_content_reaches_any_diagnostic(self):
         detail = "stage 3 hypertension on 5mg amlodipine"

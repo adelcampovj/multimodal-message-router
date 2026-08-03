@@ -455,6 +455,28 @@ class RiskFamilyProjectionTests(unittest.TestCase):
             len([f for f in families if f is RiskFamily.MALICIOUS_PRESSURE]), 1
         )
 
+    def test_root_cause_key_is_structured_and_content_free(self):
+        from message_router.analysis import RiskRootCause
+        import dataclasses
+
+        names = {f.name for f in dataclasses.fields(RiskRootCause)}
+        self.assertEqual(names, {"family", "rule_id", "diagnostic"})
+        for term in ("text", "content", "payload", "url", "value", "provenance", "source"):
+            for name in names:
+                self.assertNotIn(term, name.lower(), name)
+        self.assertTrue(RiskRootCause.__dataclass_params__.frozen)
+
+    def test_root_causes_carry_no_message_content(self):
+        secret = "meet me behind the depot at midnight"
+        msg = message(f"{secret}. Pay now or your account will be suspended.")
+        assessment = analyze_message(msg)
+        result = classify(((msg.body.value, Provenance.AUTHORED_TEXT),), assessment)
+        f = extract_features(msg, assessment, result)
+        rendered = repr(f.risk_root_causes)
+        self.assertTrue(f.risk_root_causes)
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn("depot", rendered)
+
     def test_projection_never_changes_severity(self):
         msg = message("Pay now and keep this confidential, don't tell anyone.")
         assessment = analyze_message(msg)

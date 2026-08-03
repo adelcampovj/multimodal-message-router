@@ -53,6 +53,7 @@ __all__ = [
     "Completeness",
     "ContentAvailability",
     "RiskFamily",
+    "RiskRootCause",
     "FeatureContributor",
     "Feature",
     "DecisionFeatures",
@@ -167,10 +168,16 @@ class RiskFamily(Enum):
     indicator map to the same family and therefore count once, which is what
     stops a single pattern from looking like independent corroboration.
 
+    Every member names something a message *does*. There is deliberately no
+    member for "the same thing was seen twice": a second source repeating
+    one indicator is a reason to believe the indicator, not a second
+    indicator, and admitting it here would let one pattern complete a
+    two-family suppression by being read twice.
+
     :attr:`is_substantive` marks the families that can carry a suppression
-    on their own account. The rest -- manufactured pressure, a second
-    modality repeating the same thing, a domain that merely looks wrong --
-    corroborate a substantive family and never stand in for one.
+    on their own account. The rest -- manufactured pressure, a domain that
+    merely looks wrong -- corroborate a substantive family and never stand
+    in for one.
     """
 
     MALICIOUS_PRESSURE = "malicious_pressure"
@@ -180,7 +187,6 @@ class RiskFamily(Enum):
     IDENTITY_INCONSISTENCY = "identity_inconsistency"
     ADVANCE_FEE = "advance_fee"
     UNUSUAL_PAYMENT_CHANNEL = "unusual_payment_channel"
-    CORROBORATING_MODALITY = "corroborating_modality"
 
     @property
     def is_substantive(self) -> bool:
@@ -188,11 +194,7 @@ class RiskFamily(Enum):
 
 
 _CORROBORATING_ONLY = frozenset(
-    {
-        RiskFamily.MALICIOUS_PRESSURE,
-        RiskFamily.DECEPTIVE_LINK,
-        RiskFamily.CORROBORATING_MODALITY,
-    }
+    {RiskFamily.MALICIOUS_PRESSURE, RiskFamily.DECEPTIVE_LINK}
 )
 
 #: Fixed diagnostic-to-family map. ``ARTIFICIAL_TIME_PRESSURE`` is
@@ -219,27 +221,86 @@ _DIAGNOSTIC_RISK_FAMILIES = {
 }
 
 
-def _risk_families(assessment: SafetyAssessment) -> frozenset[RiskFamily]:
-    """Project corroborated risk families. Severity is read, never changed.
+@dataclass(frozen=True)
+class RiskRootCause:
+    """One underlying indicator, identified without reference to content.
+
+    The key is the risk family, the safety rule that fired, and its fixed
+    diagnostic code -- all closed vocabularies. No message text, URL,
+    transcript, or secret-bearing value is stored or compared, so two
+    findings are "the same cause" because the same rule fired for the same
+    reason, never because their text looked alike.
+
+    Provenance is deliberately **not** part of the key. That is the whole
+    point: one indicator read twice, once from a caption and once from the
+    image it was printed on, is one reason to be suspicious, not two.
+    """
+
+    family: "RiskFamily"
+    rule_id: str
+    diagnostic: DiagnosticCode
+
+    def sort_key(self) -> tuple:
+        return (self.family.value, self.rule_id, self.diagnostic.value)
+
+
+def _risk_root_causes(assessment: SafetyAssessment) -> frozenset[RiskRootCause]:
+    """Project the distinct underlying indicators. Severity is read, never changed.
 
     Only findings the safety layer reported as at least suspicious *and* not
     ambiguous qualify: a weak mention and a hedged, quoted, or educational
     match are exactly the material that must not accumulate into a
     suppression.
+
+    Findings themselves are untouched -- none is merged, dropped, or
+    rewritten, and every one keeps its own provenance for audit. What is
+    deduplicated here is corroboration *credit*, not evidence.
     """
-    qualifying = [
-        finding
+    return frozenset(
+        RiskRootCause(
+            family=_DIAGNOSTIC_RISK_FAMILIES[finding.diagnostic],
+            rule_id=finding.rule_id,
+            diagnostic=finding.diagnostic,
+        )
         for finding in assessment.findings
-        if finding.severity.rank >= Severity.SUSPICIOUS.rank and not finding.ambiguous
-    ]
-    families = {
-        _DIAGNOSTIC_RISK_FAMILIES[finding.diagnostic]
-        for finding in qualifying
-        if finding.diagnostic in _DIAGNOSTIC_RISK_FAMILIES
-    }
-    if families and len({finding.provenance for finding in qualifying}) >= 2:
-        families.add(RiskFamily.CORROBORATING_MODALITY)
-    return frozenset(families)
+        if finding.severity.rank >= Severity.SUSPICIOUS.rank
+        and not finding.ambiguous
+        and finding.diagnostic in _DIAGNOSTIC_RISK_FAMILIES
+    )
+
+
+def _risk_families(root_causes: frozenset[RiskRootCause]) -> frozenset[RiskFamily]:
+    """The families the distinct root causes belong to.
+
+    Derived from the deduplicated causes, so repeating one indicator across
+    modalities cannot widen this set.
+    """
+    return frozenset(cause.family for cause in root_causes)
+
+
+def _cross_modal_corroboration(assessment: SafetyAssessment) -> bool:
+    """Whether two *different* qualifying indicators came from different sources.
+
+    Recorded for auditability only. It is deliberately not a risk family and
+    routing never reads it: a second modality repeating the same thing is
+    not a second reason, and this must never be what completes a two-family
+    suppression.
+    """
+    seen: dict[RiskRootCause, set] = {}
+    for finding in assessment.findings:
+        if finding.severity.rank < Severity.SUSPICIOUS.rank or finding.ambiguous:
+            continue
+        if finding.diagnostic not in _DIAGNOSTIC_RISK_FAMILIES:
+            continue
+        cause = RiskRootCause(
+            family=_DIAGNOSTIC_RISK_FAMILIES[finding.diagnostic],
+            rule_id=finding.rule_id,
+            diagnostic=finding.diagnostic,
+        )
+        seen.setdefault(cause, set()).add(finding.provenance)
+    if len(seen) < 2:
+        return False
+    return len({p for provenances in seen.values() for p in provenances}) >= 2
 
 
 @dataclass(frozen=True)
@@ -298,6 +359,8 @@ class DecisionFeatures:
     hard_veto_required: bool = False
     risk_categories: frozenset[FindingCategory] = frozenset()
     risk_families: frozenset[RiskFamily] = frozenset()
+    risk_root_causes: frozenset["RiskRootCause"] = frozenset()
+    cross_modal_corroboration: bool = False
     modality_consistency: ModalityConsistency = ModalityConsistency.NOT_APPLICABLE
     completeness: Completeness = Completeness.COMPLETE_FOR_AVAILABLE_INPUTS
     content_availability: ContentAvailability = ContentAvailability.NO_USABLE_CONTENT
@@ -653,12 +716,15 @@ def extract_features(
                                     Provenance.DERIVED_SIGNAL, ambiguous=ambiguous),))
     )
 
+    root_causes = _risk_root_causes(assessment)
     return DecisionFeatures(
         features=tuple(sorted(features, key=lambda f: f.family.value)),
         highest_severity=severity,
         hard_veto_required=veto,
         risk_categories=assessment.categories,
-        risk_families=_risk_families(assessment),
+        risk_families=_risk_families(root_causes),
+        risk_root_causes=root_causes,
+        cross_modal_corroboration=_cross_modal_corroboration(assessment),
         modality_consistency=consistency,
         completeness=completeness,
         content_availability=availability,

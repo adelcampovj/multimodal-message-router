@@ -126,9 +126,11 @@ _DEGRADED_CONSISTENCY = frozenset(
 #: The explicit suspicious combinations, as data: ``(policy_id, anchor,
 #: corroborators)``. A combination fires only when the anchor family and at
 #: least one corroborating family are both present, which is two independent
-#: families by construction; families are projected from safety findings by
-#: fixed diagnostic code, so two expressions of the same indicator collapse
-#: to one family and cannot corroborate each other.
+#: families by construction; families are projected from deduplicated *root
+#: causes* -- risk family, rule identifier, diagnostic -- so two expressions
+#: of one indicator, however many sources repeat it, collapse to a single
+#: cause and cannot corroborate each other. Reading the same thing twice is
+#: a reason to believe it, not a second reason.
 #:
 #: Every entry is additionally required to contain a *substantive* family --
 #: asserted by a test over this table rather than trusted -- so manufactured
@@ -151,18 +153,17 @@ RISK_COMBINATIONS: tuple[tuple[str, RiskFamily, frozenset[RiskFamily]], ...] = (
         "route.risk.advance_fee_pressure_suppress",
         RiskFamily.ADVANCE_FEE,
         frozenset({RiskFamily.MALICIOUS_PRESSURE, RiskFamily.COERCIVE_PAYMENT,
-                   RiskFamily.UNUSUAL_PAYMENT_CHANNEL, RiskFamily.CORROBORATING_MODALITY}),
+                   RiskFamily.UNUSUAL_PAYMENT_CHANNEL}),
     ),
     (
         "route.risk.unusual_channel_suppress",
         RiskFamily.UNUSUAL_PAYMENT_CHANNEL,
-        frozenset({RiskFamily.COERCIVE_PAYMENT, RiskFamily.MALICIOUS_PRESSURE,
-                   RiskFamily.CORROBORATING_MODALITY}),
+        frozenset({RiskFamily.COERCIVE_PAYMENT, RiskFamily.MALICIOUS_PRESSURE}),
     ),
     (
         "route.risk.coercion_pressure_suppress",
         RiskFamily.COERCIVE_PAYMENT,
-        frozenset({RiskFamily.MALICIOUS_PRESSURE, RiskFamily.CORROBORATING_MODALITY}),
+        frozenset({RiskFamily.MALICIOUS_PRESSURE}),
     ),
 )
 
