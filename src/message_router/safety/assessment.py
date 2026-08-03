@@ -271,7 +271,9 @@ class SafetyAnalyzer:
 
         token_sets = []
         for piece in pieces:
-            tokens = {t for t in piece.normalized.folded.split() if len(t) > 3}
+            # The security view, so a token split by an invisible character
+            # in one modality still compares equal to the same word in another.
+            tokens = {t for t in piece.normalized.security.split() if len(t) > 3}
             token_sets.append((piece, tokens))
 
         for index, (left, left_tokens) in enumerate(token_sets):

@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 
 from ..domain.enums import Reliability
 from .models import DiagnosticCode, FindingCategory, Severity
-from .normalization import LINE_BOUNDARY, NormalizedText, SQUEEZE_MIN_LENGTH, near
+from .normalization import NormalizedText, SQUEEZE_MIN_LENGTH, near
 
 __all__ = ["RuleHit", "ContextFlags", "classify_context", "evaluate_content", "evaluate_propagation"]
 
@@ -236,7 +236,7 @@ def classify_context(norm: NormalizedText) -> ContextFlags:
     as though it did turns "this article explains phishing" into a prefix
     that downgrades whatever follows it.
     """
-    text = norm.folded
+    text = norm.security
     return ContextFlags(
         warning=_any(_WARNING_PATTERNS, text) or _is_pronoun_warning(text),
         notification=_any(_NOTIFICATION_PATTERNS, text),
@@ -245,9 +245,11 @@ def classify_context(norm: NormalizedText) -> ContextFlags:
     )
 
 
-#: Strong clause boundaries. Deliberately not a parser: sentence
-#: terminators, semicolons, colons, and the internal line-break marker.
-_CLAUSE_BOUNDARY_RE = re.compile(r"[.!?;:\n" + LINE_BOUNDARY + r"]+")
+#: Strong clause boundaries spelled *in* the text. Deliberately not a
+#: parser: sentence terminators, semicolons and colons only. Line breaks are
+#: absent on purpose -- they arrive as typed boundaries from normalization,
+#: which is what stops untrusted content from spelling one.
+_CLAUSE_BOUNDARY_RE = re.compile(r"[.!?;:]+")
 
 #: Weak separators: a comma followed by a transition word, or one of a few
 #: conjunctions that routinely join two independent clauses.
@@ -292,13 +294,29 @@ def _side_is_independent(side: str) -> bool:
     return bool(_MESSAGE_TRANSMISSION_RE.search(stripped))
 
 
-def _segment(text: str) -> list[tuple[int, int]]:
-    """Clause spans as ``(start, end)``, strong boundaries then weak ones."""
+def _segment(text: str, boundaries: tuple[int, ...] = ()) -> list[tuple[int, int]]:
+    """Clause spans as ``(start, end)``, strong boundaries then weak ones.
+
+    ``boundaries`` are the *typed* offsets normalization produced from real
+    line breaks. They are handed in rather than searched for, because a
+    boundary the caller can find in the text is a boundary the message can
+    write. Punctuation cuts are still read from the text -- a full stop is a
+    full stop whoever typed it -- but a line break is a claim about
+    structure, and only the normalizer is allowed to make one.
+    """
+    cuts = [(match.start(), match.end()) for match in _CLAUSE_BOUNDARY_RE.finditer(text)]
+    # A typed boundary is the single joining space between two segments.
+    cuts.extend((offset, offset + 1) for offset in boundaries)
+    cuts.sort()
+
     spans: list[tuple[int, int]] = []
     start = 0
-    for match in _CLAUSE_BOUNDARY_RE.finditer(text):
-        spans.append((start, match.start()))
-        start = match.end()
+    for cut_start, cut_end in cuts:
+        if cut_start < start:          # already consumed by an adjacent cut
+            start = max(start, cut_end)
+            continue
+        spans.append((start, cut_start))
+        start = cut_end
     spans.append((start, len(text)))
 
     refined: list[tuple[int, int]] = []
@@ -332,8 +350,10 @@ class _LocalContext:
 
     __slots__ = ("_spans", "_flags", "_fallback", "_quoted")
 
-    def __init__(self, text: str) -> None:
-        self._spans = [(start, end, text[start:end]) for start, end in _segment(text)]
+    def __init__(self, text: str, boundaries: tuple[int, ...] = ()) -> None:
+        self._spans = [
+            (start, end, text[start:end]) for start, end in _segment(text, boundaries)
+        ]
         self._fallback = _flags_for(text)
         self._quoted = _quoted_spans(text)
 
@@ -536,7 +556,7 @@ _INJECTION_COMPILED = tuple((rid, _c(pat), diag) for rid, pat, diag in _INJECTIO
 def _evaluate_injection(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
     hits: list[RuleHit] = []
     for rule_id, pattern, diagnostic in _INJECTION_COMPILED:
-        contexts = [local.at(m.start()) for m in _clause_scan(pattern, norm.folded, local)]
+        contexts = [local.at(m.start()) for m in _clause_scan(pattern, norm.security, local)]
         if not contexts:
             continue
         # An instruction that stands unframed somewhere is an instruction,
@@ -687,7 +707,7 @@ _MESSAGE_TRANSMISSION_RE = _c(
 
 
 def _evaluate_credentials(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
-    text = norm.folded
+    text = norm.security
     hits: list[RuleHit] = []
 
     for rule_id, request_pattern, target_pattern, diagnostic in _CREDENTIAL_COMPILED:
@@ -850,7 +870,7 @@ _ORDINARY_BILLING = _compile_all(
 
 
 def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
-    text = norm.folded
+    text = norm.security
     hits: list[RuleHit] = []
 
     def first(patterns):
@@ -977,7 +997,7 @@ _ORDINARY_DEADLINE = _compile_all(
 
 
 def _evaluate_urgency(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
-    text = norm.folded
+    text = norm.security
     pressure = None
     for pattern in _TIME_PRESSURE:
         pressure = pattern.search(text)
@@ -1020,7 +1040,7 @@ _IDENTITY_CLAIM = _compile_all(
 def _evaluate_identity(norm: NormalizedText, local: _LocalContext, has_asserted_trust: bool) -> list[RuleHit]:
     claim = None
     for pattern in _IDENTITY_CLAIM:
-        claim = pattern.search(norm.folded)
+        claim = pattern.search(norm.security)
         if claim is not None:
             break
     if claim is None:
@@ -1087,7 +1107,7 @@ def _registrable_label(host: str) -> str:
 
 
 def _evaluate_links(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
-    text = norm.folded
+    text = norm.security
     hits: list[RuleHit] = []
     seen_rules: set[str] = set()
     position = {"at": 0}
@@ -1367,8 +1387,10 @@ _UNSAFE_COMPILED = tuple(
 )
 
 
-def _clauses(text: str) -> tuple[str, ...]:
-    return tuple(part for part in (text[a:b].strip() for a, b in _segment(text)) if part)
+def _clauses(text: str, boundaries: tuple[int, ...] = ()) -> tuple[str, ...]:
+    return tuple(
+        part for part in (text[a:b].strip() for a, b in _segment(text, boundaries)) if part
+    )
 
 
 def _advice_is_warning(clause: str, start: int, harm_is_negation: bool) -> bool:
@@ -1403,7 +1425,7 @@ def _evaluate_unsafe_advice(norm: NormalizedText, local: _LocalContext) -> list[
     tone caps severity rather than exempting a clause outright.
     """
     hits: list[RuleHit] = []
-    for clause in _clauses(norm.folded):
+    for clause in _clauses(norm.security, norm.boundary_offsets):
         if (
             _any(_ADVICE_CRITICAL_CONTEXT, clause)
             or _any(_EDUCATIONAL_PATTERNS, clause)
@@ -1495,7 +1517,7 @@ def evaluate_propagation(norm: NormalizedText | None, forwarding_count: int | No
         )
     if norm is None:
         return hits
-    text = norm.folded
+    text = norm.security
     for patterns, rule_id, diagnostic in (
         (_CHAIN_LANGUAGE, "PROP_CHAIN_LANGUAGE", DiagnosticCode.CHAIN_MESSAGE_LANGUAGE),
         (_RESEND_PRESSURE, "PROP_RESEND_PRESSURE", DiagnosticCode.RESEND_PRESSURE),
@@ -1521,7 +1543,7 @@ def evaluate_propagation(norm: NormalizedText | None, forwarding_count: int | No
 
 def evaluate_content(norm: NormalizedText, has_asserted_trust: bool = False) -> list[RuleHit]:
     """Run every content rule family over one normalized piece of content."""
-    local = _LocalContext(norm.folded)
+    local = _LocalContext(norm.security, norm.boundary_offsets)
     hits: list[RuleHit] = []
     hits.extend(_evaluate_injection(norm, local))
     hits.extend(_evaluate_credentials(norm, local))
