@@ -132,19 +132,49 @@ _NP_PREFIX_DIRECTED = (
 # Context classification.
 # ---------------------------------------------------------------------------
 
+#: Every bounded action the credential layer treats as asking for a secret.
+#:
+#: One list, used to build both the request grammar and the warning grammar
+#: below, because two hand-maintained lists drift and the drift is silent in
+#: the worst possible direction: a verb present in the request list and
+#: missing from the warning list turns "never confirm your PIN over the
+#: phone" -- an anti-fraud warning -- into the demand it warns against.
+#: A test asserts the containment rather than trusting it.
+_DISCLOSURE_ACTIONS = (
+    "reply with", "read out", "hand over", "send", "share", "give", "tell",
+    "forward", "provide", "submit", "enter", "type", "confirm", "verify",
+    "text", "paste", "reveal", "disclose", "transmit",
+)
+
+#: Transmission actions. A request only inside the bounded
+#: message-to-recipient grammar, but a *warning* in any form: "never message
+#: support your PIN" prohibits exactly what that grammar detects.
+_TRANSMISSION_ACTIONS = ("message", "dm", "whatsapp")
+
+
+def _alternation(actions: tuple[str, ...]) -> str:
+    """An alternation with the longest phrases first, so they win the match."""
+    return "(?:" + "|".join(sorted(actions, key=len, reverse=True)) + ")"
+
+
+#: The protective form must cover every action the request form accepts.
+_WARNING_ACTION = _alternation(_DISCLOSURE_ACTIONS + _TRANSMISSION_ACTIONS)
+
 _WARNING_PATTERNS = _compile_all(
     # The object matters. "Never share your code" is a security warning;
     # "don't tell your doctor" and "don't tell anyone" are not, and treating
     # them as advisories would silence the unsafe-advice and secrecy rules
     # that exist precisely to catch them.
     r"\b(?:never|do ?n[o']?t|dont|don t)\b[^.]{0,40}"
-    # The transmission actions belong here for the same reason they are a
-    # request: "never message support your PIN" is the warning form of the
-    # very construction the credential layer treats as a disclosure.
-    r"\b(?:share|give|send|disclose|reveal|tell|enter|message|dm|text|whatsapp)\b[^.]{0,30}"
+    r"\b" + _WARNING_ACTION + r"\b[^.]{0,30}"
     r"\b(?:otp|pins?|personal identification numbers?|password|passcode|code|codes|"
     r"card|cvv|credentials|login|details|account details|security answer)\b",
     r"\bwe (?:will )?never (?:ask|request|call|email|text)\b",
+    # Protective framing without a negator. "Report anyone asking you to
+    # send your PIN" prohibits the request by telling the reader what to do
+    # about it, so requiring "never" would miss a standard bank warning.
+    r"\breport (?:anyone|anybody|any (?:caller|message|person|number)|it|them|this)\b"
+    r"[^.]{0,40}\b(?:asking|asks|who asks|that asks|requesting|demanding)\b",
     r"\bno ?one (?:from|at)\b[^.]{0,40}\bwill (?:ever )?ask\b",
     r"\b(?:scam|phishing|fraud) (?:alert|warning|attempt)\b",
     r"\bbeware of\b",
@@ -280,6 +310,12 @@ def _side_is_independent(side: str) -> bool:
     flags = _flags_for(stripped)
     if flags.warning or flags.notification or flags.educational or flags.quoted:
         return True
+    # A completed quotation is a bounded span with two ends, so it is
+    # independently evaluable whatever it contains. Without this a
+    # quotation-only side fails the gate, the boundary is refused, and the
+    # quote's span swallows the unquoted clause on the other side of it.
+    if _quoted_spans(stripped):
+        return True
     if _any(_ADVICE_CRITICAL_CONTEXT, stripped):
         return True
     for _rid, pattern, _diag, _neg in _UNSAFE_COMPILED:
@@ -329,12 +365,84 @@ def _segment(text: str, boundaries: tuple[int, ...] = ()) -> list[tuple[int, int
                 cursor = match.end()
         refined.append((cursor, span_end))
     return refined
-#: A clause that is itself a quotation, and the framing that introduces one.
+#: A clause that is itself a quotation.
 _QUOTE_ENCLOSED_RE = _c(r"^[\"'“‘(\[]|[\"'”’)\]]$")
-_QUOTE_INTRODUCER_RE = _c(
-    r"\b(?:said|says|saying|reads|wrote|writes|asked|asks|claims|claimed|"
-    r"message|text|sms|email|note|post)\b[^.]{0,20}$"
+
+# ---------------------------------------------------------------------------
+# Quotation attribution.
+#
+# Quotation marks are punctuation, not provenance. Anyone can type them, so
+# treating a balanced pair as protective framing hands out an exemption for
+# the price of two characters -- a demand wrapped in quotes is still a
+# demand. A quoted span is protected only when something structurally
+# attached to it says what the quote is *for*: a warning, a criticism, a
+# lesson, a document, a report of what someone said, or a hypothetical.
+#
+# Each family below is a bounded, enumerated construction. None of them
+# infers anything from the sender, their display name, or the relationship.
+# ---------------------------------------------------------------------------
+
+#: Warning or criticism about the quoted content.
+_ATTR_WARNING = (
+    r"do not (?:follow|obey|comply|act on|respond to|reply to)|never (?:follow|obey|comply)"
+    r"|this is (?:unsafe|dangerous|fraudulent|a scam|a phishing|phishing|fake|not genuine)"
+    r"|beware of|report (?:messages|anything|any message|it|this|them)"
+    r"|(?:warned|warns|warning) (?:that|about)|(?:a|the|this|common) (?:scam|phishing|fraud)"
+    r"|do not (?:fall|be fooled)"
 )
+#: Educational or documentary framing.
+_ATTR_EDUCATIONAL = (
+    r"(?:an|one|another|this) example of|(?:for|as an) example"
+    r"|documentation (?:states|says|shows)|training (?:explains|says|shows|quotes)"
+    r"|(?:the )?lesson (?:discusses|explains)|(?:the )?article (?:describes|explains|quotes)"
+    r"|quoted for awareness|the following is an example|awareness (?:example|training)"
+    r"|(?:module|course|guide|bulletin|leaflet) (?:covers|explains|quotes|says)"
+)
+#: Historical reporting or reported speech.
+_ATTR_REPORTED = (
+    r"(?:previously|earlier|once) (?:said|wrote|claimed)"
+    r"|(?:the |a )?(?:report|incident|bulletin|log|record) (?:recorded|noted|described|involved)"
+    r"|(?:said|says|saying|reads|read|wrote|writes|asked|asks|claims|claimed|replied|told)"
+    r"|(?:message|text|sms|email|note|post|caller|attacker|scammer|sender) "
+)
+#: Hypothetical framing.
+_ATTR_HYPOTHETICAL = (
+    r"suppose (?:someone|somebody|a message)|imagine (?:receiving|getting|a message)"
+    r"|a hypothetical|(?:if|when) (?:someone|somebody) (?:says|writes|asks|sends)"
+    r"|what if (?:someone|somebody)"
+)
+_ATTRIBUTION = (
+    r"(?:" + _ATTR_WARNING + r"|" + _ATTR_EDUCATIONAL
+    + r"|" + _ATTR_REPORTED + r"|" + _ATTR_HYPOTHETICAL + r")"
+)
+
+#: Attribution introducing the quote, within a bounded window immediately
+#: before the opening mark. "Greetings, then a demand in quotes" is not
+#: attribution, which is why the window is short and stops at a full stop.
+_ATTRIBUTION_BEFORE_RE = _c(_ATTRIBUTION + r"[^.!?]{0,40}$")
+
+#: Attribution following the quote -- "<demand>", do not follow it.
+_ATTRIBUTION_AFTER_RE = _c(r"^[^.!?]{0,40}" + _ATTRIBUTION)
+
+
+def _attributed_quoted_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Quoted spans that something structurally attached explains.
+
+    A completed quotation with no attribution on either side is left
+    unprotected: it is reported speech only if somebody reports it.
+    """
+    attributed: list[tuple[int, int]] = []
+    for start, end in _quoted_spans(text):
+        before = text[:start]
+        after = text[end + 1:]
+        if _ATTRIBUTION_BEFORE_RE.search(before) or _ATTRIBUTION_AFTER_RE.search(after):
+            attributed.append((start, end))
+    return tuple(attributed)
+
+
+def _has_attribution(clause: str) -> bool:
+    """True when this clause frames a quotation it contains or introduces."""
+    return bool(_c(_ATTRIBUTION).search(clause))
 
 
 class _LocalContext:
@@ -355,7 +463,8 @@ class _LocalContext:
             (start, end, text[start:end]) for start, end in _segment(text, boundaries)
         ]
         self._fallback = _flags_for(text)
-        self._quoted = _quoted_spans(text)
+        # Attributed spans only: quote marks on their own protect nothing.
+        self._quoted = _attributed_quoted_spans(text)
 
         raw = [_flags_for(clause) for _, _, clause in self._spans]
         enclosed = _enclosing_quotation(tuple(clause for _, _, clause in self._spans))
@@ -364,8 +473,10 @@ class _LocalContext:
             clause = self._spans[index][2].strip()
             # A quotation that runs past a line break is still one quotation.
             # While it stays open, the clauses inside it keep the framing of
-            # the clause that opened it.
-            if index and (enclosed[index] or _QUOTE_ENCLOSED_RE.search(clause)):
+            # the clause that opened it -- but only if that clause actually
+            # framed it. An unattributed quotation inherits nothing.
+            introduced = index and _has_attribution(self._spans[index - 1][2])
+            if index and introduced and (enclosed[index] or _QUOTE_ENCLOSED_RE.search(clause)):
                 previous = resolved[index - 1]
                 flags = ContextFlags(
                     warning=flags.warning or previous.warning,
@@ -584,10 +695,10 @@ def _evaluate_injection(norm: NormalizedText, local: _LocalContext) -> list[Rule
 # Credential solicitation.
 # ---------------------------------------------------------------------------
 
-_REQUEST_VERB = (
-    r"(?:send|share|give|tell|forward|reply with|provide|submit|enter|type|confirm|"
-    r"verify|read out|text|paste|hand over|reveal|disclose|transmit)"
-)
+#: Built from the shared action list, so the request grammar and the
+#: protective warning grammar cannot drift apart. Adding an action here adds
+#: its warning form in the same edit.
+_REQUEST_VERB = _alternation(_DISCLOSURE_ACTIONS)
 _RECIPIENT_POSSESSIVE = r"(?:your|the|me|us|it)"
 
 # A bare "pin" is a credential in one sense and a sewing supply, a map
@@ -1263,7 +1374,12 @@ _LIST_MARKER = r"(?:[-*•–—·]+|\(?\d{1,2}[.)])"
 
 #: A clause whose harmful verb sits at the front is an imperative.
 _IMPERATIVE_PREFIX_RE = _c(
-    r"^\s*(?:" + _LIST_MARKER + r"\s+)?"
+    # An opening quotation mark is punctuation, not framing. Refusing to look
+    # past it means "stop taking your medications tonight" in quotes reads as
+    # a mention rather than an instruction, which hands out an exemption for
+    # the price of two characters. Whether the quote is *protected* is a
+    # separate question, decided by attribution.
+    r"^\s*[\"'“‘(\[]?\s*(?:" + _LIST_MARKER + r"\s+)?"
     + r"(?:\s*(?:and|then|also|so|but|just|please|ok|okay|hey|,)\s*)*$"
 )
 
@@ -1403,9 +1519,30 @@ def _advice_is_warning(clause: str, start: int, harm_is_negation: bool) -> bool:
     return _any(_ADVICE_NEGATOR, prefix) or _any(_SEEK_GUIDANCE_FIRST, prefix)
 
 
+def _local_prefix(clause: str, start: int) -> str:
+    """The text since the last accepted separator: this clause's own offset 0.
+
+    Actionability is a property of the clause the instruction sits in, not of
+    the paragraph it arrived with. Measuring the imperative against the front
+    of the whole document means one unremarkable introductory clause --
+    "lunch is at one, but stop taking your medications tonight" -- moves the
+    verb away from position zero and quietly demotes a dangerous instruction.
+    Cutting at the last accepted separator restores the local offset without
+    re-segmenting anything or widening what counts as a boundary.
+    """
+    cut = 0
+    for match in _CLAUSE_BOUNDARY_RE.finditer(clause, 0, start):
+        cut = match.end()
+    for match in _WEAK_SEPARATOR_RE.finditer(clause, 0, start):
+        cut = max(cut, match.end())
+    return clause[cut:start]
+
+
 def _advice_is_directive(clause: str, start: int) -> bool:
     """True when the clause tells the reader to do it, not merely names it."""
-    return _any(_ADVICE_DIRECTIVE, clause) or bool(_IMPERATIVE_PREFIX_RE.match(clause[:start]))
+    return _any(_ADVICE_DIRECTIVE, clause) or bool(
+        _IMPERATIVE_PREFIX_RE.match(_local_prefix(clause, start))
+    )
 
 
 def _evaluate_unsafe_advice(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
@@ -1425,7 +1562,18 @@ def _evaluate_unsafe_advice(norm: NormalizedText, local: _LocalContext) -> list[
     tone caps severity rather than exempting a clause outright.
     """
     hits: list[RuleHit] = []
-    for clause in _clauses(norm.security, norm.boundary_offsets):
+    for span_start, span_end in _segment(norm.security, norm.boundary_offsets):
+        clause = norm.security[span_start:span_end].strip()
+        if not clause:
+            continue
+        # A clause that *is* an attributed quotation is reported speech, and
+        # the quotation marks alone no longer say so -- attribution does.
+        # Read where the clause actually sits, so "someone sent me a message
+        # saying: <danger>" stays protected while a bare quoted demand does
+        # not. The advisory flag is still not consulted, for the reason above.
+        quoted_here = local.at(span_start)
+        if quoted_here.quoted or quoted_here.educational:
+            continue
         if (
             _any(_ADVICE_CRITICAL_CONTEXT, clause)
             or _any(_EDUCATIONAL_PATTERNS, clause)
