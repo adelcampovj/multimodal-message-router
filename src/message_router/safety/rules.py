@@ -327,7 +327,23 @@ def _side_is_independent(side: str) -> bool:
     for _rid, request_pattern, _target, _diag in _CREDENTIAL_COMPILED:
         if request_pattern.search(stripped):
             return True
-    return bool(_MESSAGE_TRANSMISSION_RE.search(stripped))
+    if _MESSAGE_TRANSMISSION_RE.search(stripped):
+        return True
+    # The financial, identity and pressure families count too. Without them
+    # a side carrying nothing but a coercive demand was not "independently
+    # evaluable", the boundary in front of it was refused, and a warning or
+    # a receipt on the other side of a comma absorbed it.
+    return any(
+        _any(patterns, stripped)
+        for patterns in (
+            _PAYMENT_DEMAND, _THREAT, _OFF_CHANNEL, _SECRECY,
+            _ANTI_VERIFICATION, _ADVANCE_FEE, _IDENTITY_CLAIM, _TIME_PRESSURE,
+            # Routine billing is its own construction too: an invoice clause
+            # must be separable from whatever follows the comma, or it
+            # supplies "ordinary" cover for a demand that is not.
+            _ORDINARY_BILLING, _ORDINARY_DEADLINE,
+        )
+    )
 
 
 def _segment(text: str, boundaries: tuple[int, ...] = ()) -> list[tuple[int, int]]:
@@ -491,6 +507,13 @@ class _LocalContext:
     def bounds(self) -> tuple[tuple[int, int], ...]:
         """The resolved clause spans, for scanning one clause at a time."""
         return tuple((start, end) for start, end, _clause in self._spans)
+
+    def clause_at(self, position: int) -> str:
+        """The clause a match sits in, for suppressors that must be local."""
+        for start, end, clause in self._spans:
+            if start <= position <= end:
+                return clause
+        return ""
 
     def at(self, position: int) -> ContextFlags:
         """Framing in force where a rule actually matched."""
@@ -980,38 +1003,79 @@ _ORDINARY_BILLING = _compile_all(
 )
 
 
+@dataclass(frozen=True)
+class _Signal:
+    """Every occurrence of one indicator family, with where each one sits.
+
+    Collect-then-aggregate. Reading framing from a single anchor match made
+    the whole family answer to whichever occurrence happened to come first:
+    one advisory clause silenced every later demand, and one educational
+    clause capped the severity of the whole message. Each occurrence is now
+    judged where it sits, and the family is decided from all of them.
+    """
+
+    occurrences: tuple[tuple[str, ContextFlags], ...]
+    unframed: bool
+
+    def __bool__(self) -> bool:
+        # Truthy when at least one occurrence stands outside advisory framing.
+        return bool(self.occurrences)
+
+
+def _collect_signal(
+    patterns: tuple[re.Pattern[str], ...], text: str, local: _LocalContext
+) -> _Signal:
+    """Every non-advisory occurrence of ``patterns``, in deterministic order.
+
+    Order is pattern order then match position, both fixed, so the result
+    never depends on iteration accidents.
+    """
+    occurrences: list[tuple[str, ContextFlags]] = []
+    unframed = False
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            ctx = local.at(match.start())
+            if ctx.is_advisory:
+                # An advisory occurrence says nothing about the others.
+                continue
+            occurrences.append((local.clause_at(match.start()), ctx))
+            if not ctx.is_discussion:
+                unframed = True
+    return _Signal(tuple(occurrences), unframed)
+
+
+def _is_ordinary(signal: _Signal) -> bool:
+    """True when *every* occurrence of a family sits in routine billing.
+
+    Requiring all of them is the point: an invoice in one clause must not
+    make a coercive demand in another read as routine, and a receipt that
+    arrives after a threat must not erase it.
+    """
+    return bool(signal) and all(
+        _any(_ORDINARY_BILLING, clause) or ctx.notification
+        for clause, ctx in signal.occurrences
+    )
+
+
 def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
     text = norm.security
     hits: list[RuleHit] = []
 
-    def first(patterns):
-        for pattern in patterns:
-            match = pattern.search(text)
-            if match is not None:
-                return match
-        return None
+    demand = _collect_signal(_PAYMENT_DEMAND, text, local)
+    off_channel = _collect_signal(_OFF_CHANNEL, text, local)
+    threat = _collect_signal(_THREAT, text, local)
+    secrecy = _collect_signal(_SECRECY, text, local)
+    anti_verification = _collect_signal(_ANTI_VERIFICATION, text, local)
+    advance_fee = _collect_signal(_ADVANCE_FEE, text, local)
+    ordinary = _is_ordinary(demand)
 
-    demand_at = first(_PAYMENT_DEMAND)
-    anchor = demand_at or first(_THREAT) or first(_OFF_CHANNEL) or first(_ADVANCE_FEE)
-    ctx = local.at(anchor.start() if anchor else 0)
-    if ctx.is_advisory:
-        return hits
-
-    demand = _any(_PAYMENT_DEMAND, text)
-    off_channel = _any(_OFF_CHANNEL, text)
-    threat = _any(_THREAT, text)
-    secrecy = _any(_SECRECY, text)
-    anti_verification = _any(_ANTI_VERIFICATION, text)
-    advance_fee = _any(_ADVANCE_FEE, text)
-    ordinary = _any(_ORDINARY_BILLING, text) or ctx.notification
-    discussion = ctx.is_discussion
-
-    def severity_for(base: Severity) -> Severity:
-        if discussion:
-            return Severity.WEAK
-        return base
+    def severity_for(signal: _Signal, base: Severity) -> Severity:
+        # Framed *everywhere* it appears is discussion; framed somewhere and
+        # plain somewhere else is still a demand.
+        return base if signal.unframed else Severity.WEAK
 
     if demand:
+        discussion = not demand.unframed
         if ordinary and not (threat or off_channel or secrecy or anti_verification):
             # A bill that says "due now" is a bill.
             hits.append(
@@ -1027,7 +1091,7 @@ def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHi
             hits.append(
                 RuleHit(
                     FindingCategory.COERCIVE_PAYMENT,
-                    severity_for(Severity.SUSPICIOUS),
+                    severity_for(demand, Severity.SUSPICIOUS),
                     "PAY_URGENT_DEMAND",
                     DiagnosticCode.PAYMENT_DEMAND,
                     ambiguous=discussion,
@@ -1038,10 +1102,10 @@ def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHi
         hits.append(
             RuleHit(
                 FindingCategory.COERCIVE_PAYMENT,
-                severity_for(Severity.SUSPICIOUS),
+                severity_for(off_channel, Severity.SUSPICIOUS),
                 "PAY_OFF_CHANNEL",
                 DiagnosticCode.OFF_CHANNEL_PAYMENT,
-                ambiguous=discussion,
+                ambiguous=not off_channel.unframed,
             )
         )
 
@@ -1049,21 +1113,21 @@ def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHi
         hits.append(
             RuleHit(
                 FindingCategory.COERCIVE_PAYMENT,
-                severity_for(Severity.SUSPICIOUS),
+                severity_for(threat, Severity.SUSPICIOUS),
                 "PAY_THREAT_COMBINATION",
                 DiagnosticCode.CONSEQUENCE_THREAT,
-                ambiguous=discussion,
+                ambiguous=not threat.unframed,
             )
         )
 
-    if advance_fee and not ordinary:
+    if advance_fee and not _is_ordinary(advance_fee):
         hits.append(
             RuleHit(
                 FindingCategory.ADVANCE_FEE,
-                severity_for(Severity.SUSPICIOUS),
+                severity_for(advance_fee, Severity.SUSPICIOUS),
                 "PAY_ADVANCE_FEE",
                 DiagnosticCode.ADVANCE_FEE_OFFER,
-                ambiguous=discussion,
+                ambiguous=not advance_fee.unframed,
             )
         )
 
@@ -1071,10 +1135,11 @@ def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHi
         hits.append(
             RuleHit(
                 FindingCategory.MALICIOUS_URGENCY,
-                severity_for(Severity.SUSPICIOUS if demand or threat else Severity.WEAK),
+                severity_for(secrecy,
+                             Severity.SUSPICIOUS if demand or threat else Severity.WEAK),
                 "URG_SECRECY",
                 DiagnosticCode.SECRECY_PRESSURE,
-                ambiguous=discussion,
+                ambiguous=not secrecy.unframed,
             )
         )
 
@@ -1082,10 +1147,10 @@ def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHi
         hits.append(
             RuleHit(
                 FindingCategory.MALICIOUS_URGENCY,
-                severity_for(Severity.SUSPICIOUS),
+                severity_for(anti_verification, Severity.SUSPICIOUS),
                 "URG_ANTI_VERIFICATION",
                 DiagnosticCode.ANTI_VERIFICATION_PRESSURE,
-                ambiguous=discussion,
+                ambiguous=not anti_verification.unframed,
             )
         )
     return hits
@@ -1108,32 +1173,39 @@ _ORDINARY_DEADLINE = _compile_all(
 
 
 def _evaluate_urgency(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
+    """Manufactured time pressure, judged at every occurrence.
+
+    Both suppressors are clause-local on purpose. A booking notice stating
+    its own expiry, or an invoice carrying an ordinary due date, excuses the
+    clause it appears in -- not a countdown three sentences later. Taking
+    the first match and letting a due date anywhere in the message cancel it
+    is how "due on Friday. Act now or lose access forever" came out clean.
+    """
     text = norm.security
-    pressure = None
+    threatening = bool(_collect_signal(_THREAT, text, local))
+
     for pattern in _TIME_PRESSURE:
-        pressure = pattern.search(text)
-        if pressure is not None:
-            break
-    ctx = local.at(pressure.start() if pressure else 0)
-    if ctx.is_advisory or pressure is None:
-        return []
-    threatening = _any(_THREAT, text)
-    if ctx.notification and not threatening:
-        # A code-delivery or booking notice saying when it expires is
-        # stating a fact about itself, not applying pressure.
-        return []
-    if _any(_ORDINARY_DEADLINE, text) and not threatening:
-        return []
-    # Never severe on its own: real emergencies are urgent too.
-    return [
-        RuleHit(
-            FindingCategory.MALICIOUS_URGENCY,
-            Severity.WEAK if not _any(_THREAT, text) else Severity.SUSPICIOUS,
-            "URG_TIME_PRESSURE",
-            DiagnosticCode.ARTIFICIAL_TIME_PRESSURE,
-            ambiguous=True,
-        )
-    ]
+        for match in pattern.finditer(text):
+            ctx = local.at(match.start())
+            if ctx.is_advisory:
+                continue
+            if ctx.notification and not threatening:
+                # A code-delivery or booking notice saying when it expires is
+                # stating a fact about itself, not applying pressure.
+                continue
+            if not threatening and _any(_ORDINARY_DEADLINE, local.clause_at(match.start())):
+                continue
+            # Never severe on its own: real emergencies are urgent too.
+            return [
+                RuleHit(
+                    FindingCategory.MALICIOUS_URGENCY,
+                    Severity.SUSPICIOUS if threatening else Severity.WEAK,
+                    "URG_TIME_PRESSURE",
+                    DiagnosticCode.ARTIFICIAL_TIME_PRESSURE,
+                    ambiguous=True,
+                )
+            ]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -1149,29 +1221,32 @@ _IDENTITY_CLAIM = _compile_all(
 
 
 def _evaluate_identity(norm: NormalizedText, local: _LocalContext, has_asserted_trust: bool) -> list[RuleHit]:
-    claim = None
-    for pattern in _IDENTITY_CLAIM:
-        claim = pattern.search(norm.security)
-        if claim is not None:
-            break
-    if claim is None:
-        return []
-    ctx = local.at(claim.start())
-    if ctx.is_advisory or ctx.is_discussion:
-        return []
+    """An unsupported claim of official identity, sought at every occurrence.
+
+    Stopping at the first claim let a quoted or educational mention of one
+    stand in for a real assertion later in the same message. Repeated claims
+    are one conflict, so a single finding is still emitted -- the change is
+    which occurrences are allowed to decide.
+    """
     if has_asserted_trust:
         # A claim matching an independently recorded trust signal is not a
         # contradiction. It is still not *proof* -- the trust signal is,
         # and the claim adds nothing.
         return []
-    return [
-        RuleHit(
-            FindingCategory.IMPERSONATION,
-            Severity.SUSPICIOUS,
-            "ID_UNSUPPORTED_CLAIM",
-            DiagnosticCode.IDENTITY_CLAIM_UNSUPPORTED,
-        )
-    ]
+    for pattern in _IDENTITY_CLAIM:
+        for match in pattern.finditer(norm.security):
+            ctx = local.at(match.start())
+            if ctx.is_advisory or ctx.is_discussion:
+                continue
+            return [
+                RuleHit(
+                    FindingCategory.IMPERSONATION,
+                    Severity.SUSPICIOUS,
+                    "ID_UNSUPPORTED_CLAIM",
+                    DiagnosticCode.IDENTITY_CLAIM_UNSUPPORTED,
+                )
+            ]
+    return []
 
 
 # ---------------------------------------------------------------------------

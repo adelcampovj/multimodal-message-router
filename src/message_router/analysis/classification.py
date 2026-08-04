@@ -284,11 +284,52 @@ _DISRUPTION_EXCLUSIONS = tuple(
 )
 
 
+#: Sentence-ish boundaries, used only to keep the exclusions below local.
+#:
+#: The comma-transition and "but"/"and then" forms are included because an
+#: exclusion joined to a live outage by one of them was cancelling it --
+#: "the platform is currently down, but the report shipped yesterday" is two
+#: statements, and only the second one is retrospective. This is a small
+#: bounded list local to this rule rather than a shared import: the safety
+#: layer's separator grammar sits above this module and must not be pulled
+#: downwards. "while" and "although" are deliberately absent, because an
+#: outage sentence legitimately uses them ("the service is down while we
+#: investigate") and splitting there would cut the disruption in half.
+_DISRUPTION_CLAUSE_RE = _c(
+    r"[.!?;:\r\n]+"
+    r"|,\s+(?:but|however|yet|nevertheless|instead|then|therefore|still)\b"
+    r"|\s+(?:but|yet|and then)\b"
+)
+
+
+def _disruption_clauses(folded: str) -> tuple[str, ...]:
+    """Sentence-ish spans, so a disruption and its exclusions are judged together."""
+    clauses: list[str] = []
+    start = 0
+    for boundary in _DISRUPTION_CLAUSE_RE.finditer(folded):
+        clauses.append(folded[start:boundary.start()])
+        start = boundary.end()
+    clauses.append(folded[start:])
+    return tuple(clause for clause in clauses if clause.strip())
+
+
 def _is_active_disruption(raw: str) -> bool:
+    """Whether this content reports a disruption happening *now*.
+
+    Both halves of the decision are read in the same sentence. Scanning the
+    whole message meant one unrelated clause -- a "yesterday", a maintenance
+    window next month, a mention of a report -- silently cancelled a genuine
+    live outage announced later in the same message. Matching per clause
+    also keeps the two halves symmetric: a disruption phrase that only forms
+    by running across a sentence boundary is not a disruption either.
+    """
     folded = raw.casefold()
-    if not _ACTIVE_DISRUPTION_RE.search(folded):
-        return False
-    return not any(pattern.search(folded) for pattern in _DISRUPTION_EXCLUSIONS)
+    for clause in _disruption_clauses(folded):
+        if not _ACTIVE_DISRUPTION_RE.search(clause):
+            continue
+        if not any(pattern.search(clause) for pattern in _DISRUPTION_EXCLUSIONS):
+            return True
+    return False
 
 
 def classify(

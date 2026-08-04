@@ -1691,5 +1691,221 @@ class CrossFamilyIsolationRoutingTests(unittest.TestCase):
             self.assertNotIn(fragment, rendered, fragment)
 
 
+# ---------------------------------------------------------------------------
+# P2C3L3 -- D-023: collect-then-aggregate across every clause and source.
+# ---------------------------------------------------------------------------
+
+
+D023_SEPARATORS = (". ", "; ", ": ", "\n", "\r\n", "\r", "\n- ", ", but ", " and then ")
+
+#: Each stands alone and produces a specific justified result.
+D023_PAYLOADS = {
+    "coercive": "your account will be suspended unless you pay now",
+    "advance_fee": "you have won a cash prize, pay the release fee immediately to claim your reward",
+    "off_channel": "buy gift cards and send the codes to us right away",
+    "identity": "this is an official notice from your bank",
+    "pressure": "act now or lose access forever, do not call the bank to verify",
+    "urgency": "service alert: the platform is currently down and engineers are responding",
+}
+#: Earlier or later content that used to hide the payloads above.
+D023_NEIGHBOURS = {
+    "weak_payment": "the invoice is due on friday",
+    "ordinary_invoice": "invoice 8841 for your subscription is attached",
+    "receipt": "payment received, here is your receipt",
+    "refund_ok": "your refund has been processed and confirmed",
+    "safe_warning": "our bank will never ask you to share your code",
+    "education": "this article explains how payment scams work",
+    "ordinary_update": "the team finished the quarterly report yesterday",
+    "nonurgent": "the platform maintenance window is scheduled for next month",
+}
+
+
+class FindingAggregationTests(unittest.TestCase):
+    """Regression D-023: each of these evaluators read framing from a single
+    first match, so one advisory, educational, ordinary or weak occurrence
+    decided the whole message. Every occurrence is now collected and judged
+    where it sits."""
+
+    def baseline(self, payload):
+        _a, _c, _f, result = run_pipeline(payload.capitalize() + ".")
+        return result.action, result.policy_id
+
+    def test_no_neighbouring_clause_changes_the_justified_route(self):
+        for key, payload in D023_PAYLOADS.items():
+            want = self.baseline(payload)
+            for label, neighbour in D023_NEIGHBOURS.items():
+                for separator in D023_SEPARATORS:
+                    before = neighbour + separator + payload + "."
+                    _a, _c, _f, first = run_pipeline(before)
+                    self.assertEqual((first.action, first.policy_id), want,
+                                     f"{key}|{label}|before|{separator!r}")
+                    after = payload.capitalize() + separator + neighbour + "."
+                    _a, _c, _f, second = run_pipeline(after)
+                    self.assertEqual((second.action, second.policy_id), want,
+                                     f"{key}|{label}|after|{separator!r}")
+
+    def test_provenance_order_never_changes_the_route(self):
+        for key, payload in D023_PAYLOADS.items():
+            for label, neighbour in list(D023_NEIGHBOURS.items())[:4]:
+                for ref, provenance in ((IMAGE, Provenance.OCR_TEXT),
+                                        (AUDIO, Provenance.ASR_TRANSCRIPT)):
+                    carried = MediaAnalysis(ref, ExtractionStatus.SUCCEEDED,
+                                            content=TextContent(payload + ".", provenance))
+                    plain = MediaAnalysis(ref, ExtractionStatus.SUCCEEDED,
+                                          content=TextContent(neighbour + ".", provenance))
+                    _a, _c, _f, extracted = run_pipeline(neighbour + ".", attachment=ref,
+                                                         media=(carried,))
+                    _a, _c, _f, authored = run_pipeline(payload + ".", attachment=ref,
+                                                        media=(plain,))
+                    self.assertEqual((extracted.action, extracted.policy_id),
+                                     (authored.action, authored.policy_id),
+                                     f"{key}|{label}|{provenance.value}")
+
+    SCAM = "you have won a cash prize, pay the release fee immediately to claim your reward"
+
+    def keys(self, features):
+        return {(rc.family, rc.rule_id, rc.diagnostic) for rc in features.risk_root_causes}
+
+    def test_repetition_never_inflates_corroboration(self):
+        _a, _c, single, _r = run_pipeline(self.SCAM + ".")
+        for label, text in (("same clause", self.SCAM + " " + self.SCAM + "."),
+                            ("two clauses", self.SCAM + ". " + self.SCAM + "."),
+                            ("capitalised", self.SCAM + ". " + self.SCAM.upper() + "."),
+                            ("punctuation", self.SCAM + ". " + self.SCAM.replace(",", " !") + ".")):
+            _a, _c, repeated, _r = run_pipeline(text)
+            self.assertEqual(self.keys(repeated), self.keys(single), label)
+
+    def test_the_same_root_across_sources_counts_once(self):
+        _a, _c, single, _r = run_pipeline(self.SCAM + ".")
+        for label, media in (
+            ("ocr", (MediaAnalysis(IMAGE, ExtractionStatus.SUCCEEDED,
+                                   content=TextContent(self.SCAM + ".", Provenance.OCR_TEXT)),)),
+            ("asr", (MediaAnalysis(AUDIO, ExtractionStatus.SUCCEEDED,
+                                   content=TextContent(self.SCAM + ".", Provenance.ASR_TRANSCRIPT)),)),
+        ):
+            _a, _c, both, _r = run_pipeline(self.SCAM + ".", attachment=media[0].media, media=media)
+            self.assertEqual(self.keys(both), self.keys(single), label)
+
+    def test_distinct_families_stay_visible(self):
+        identity = "this is an official notice from your bank"
+        fee = "you have won a refund; a clearance fee applies to release it"
+        gift = "buy gift cards and send the codes to us right away"
+        for label, text, minimum in (("two clauses", identity + ". " + fee + ".", 2),
+                                     ("three families", identity + ". " + fee + ". " + gift + ".", 3)):
+            _a, _c, features, _r = run_pipeline(text)
+            families = {family for family, _rule, _diag in self.keys(features)}
+            self.assertGreaterEqual(len(families), minimum, label)
+
+    def test_ordinary_financial_content_stays_safe(self):
+        for text in ("Invoice 8841 for your subscription. Due date is Friday.",
+                     "Payment received, here is your receipt for order 5512.",
+                     "Your refund has been processed and confirmed.",
+                     "Rent is due on the first, as usual.",
+                     "Cash on delivery, please have the exact amount ready.",
+                     "You can pay through the official billing portal in your account settings."):
+            for padded in (text, "The team finished the report yesterday. " + text,
+                           text + " Let me know if you have any questions."):
+                _a, _c, _f, result = run_pipeline(padded)
+                self.assertIsNot(result.action, RoutingAction.SUPPRESS, padded)
+
+    def test_ordinary_urgency_language_never_interrupts(self):
+        for text in ("Your appointment is confirmed for Tuesday at ten.",
+                     "Scheduled maintenance will run next Sunday between two and four.",
+                     "The outage has been resolved and service is restored.",
+                     "Last month's outage affected the reporting dashboard.",
+                     "There might be an outage later, I am not sure yet.",
+                     "URGENT: half price on the spring range, shop now!"):
+            for padded in (text, "The team finished the report yesterday. " + text):
+                _a, _c, _f, result = run_pipeline(padded)
+                self.assertIsNot(result.action, RoutingAction.INTERRUPT, padded)
+
+    INTEGRATED = (
+        ("early invoice then coercive demand",
+         "Invoice 8841 for your subscription. Your account will be suspended unless you pay now.",
+         RoutingAction.SUPPRESS),
+        ("coercive demand then receipt",
+         "Your account will be suspended unless you pay now. Payment received, here is your receipt.",
+         RoutingAction.SUPPRESS),
+        ("legitimate refund then advance fee",
+         "Your refund has been processed and confirmed. You have won a cash prize, pay the "
+         "release fee immediately to claim your reward.", RoutingAction.SUPPRESS),
+        ("ordinary deadline then malicious pressure",
+         "The invoice is due on Friday. Act now or lose access forever, do not call the bank "
+         "to verify.", RoutingAction.DEFER),
+        ("ordinary update then active outage",
+         "The team finished the quarterly report yesterday. Service alert: the platform is "
+         "currently down and engineers are responding.", RoutingAction.INTERRUPT),
+        ("active outage then unrelated clause",
+         "Service alert: the platform is currently down and engineers are responding. "
+         "Let me know if you have any questions.", RoutingAction.INTERRUPT),
+        ("educational clause then scam",
+         "This article explains how payment scams work. Your account will be suspended "
+         "unless you pay now.", RoutingAction.SUPPRESS),
+    )
+
+    def test_integrated_routes(self):
+        for label, text, want in self.INTEGRATED:
+            _a, _c, _f, result = run_pipeline(text)
+            self.assertIs(result.action, want, label)
+
+    def test_severe_content_still_takes_precedence_over_urgency(self):
+        a, _c, _f, result = run_pipeline(
+            "Send me your OTP right now. Service alert: the platform is currently down.")
+        self.assertIs(a.highest_severity, Severity.SEVERE)
+        self.assertIs(result.action, RoutingAction.SUPPRESS)
+        self.assertEqual(result.policy_id, "route.safety.hard_veto")
+
+    def test_malicious_pressure_never_supports_an_interrupt(self):
+        for text in ("Act now or lose access forever!!! Final warning!",
+                     "The invoice is due on Friday. Act now or lose access forever."):
+            _a, _c, _f, result = run_pipeline(text)
+            self.assertIsNot(result.action, RoutingAction.INTERRUPT, text)
+
+    def test_no_content_reaches_an_output(self):
+        text = ("Invoice 8841 is attached. Pay the release fee now or your account is closed, "
+                "user zqxuser, card 4111111111111111.")
+        a, c, f, result = run_pipeline(text)
+        rendered = " ".join((repr(a), repr(c), repr(f), repr(result),
+                             repr(result.serialize()), repr(result.contributors)))
+        for fragment in ("zqxuser", "4111111111111111", "Invoice 8841", "release fee", text):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
+class AggregationDeterminismTests(unittest.TestCase):
+    """Collecting more findings must not make the result depend on order."""
+
+    CASES = (
+        "Invoice 8841 is attached. Your account will be suspended unless you pay now.",
+        "Your account will be suspended unless you pay now. Invoice 8841 is attached.",
+        "Thanks for banking with us. This is an official notice from your bank. "
+        "You have won a refund; a clearance fee applies to release it.",
+        "The team finished the report yesterday. Service alert: the platform is currently down.",
+    )
+
+    def signature(self, text):
+        a, c, f, result = run_pipeline(text)
+        return (
+            tuple(finding.rule_id for finding in a.findings),
+            tuple(finding.provenance for finding in a.findings),
+            a.highest_severity, a.hard_veto_required,
+            tuple(str(x) for x in f.features),
+            tuple(sorted(repr(rc) for rc in f.risk_root_causes)),
+            result.action, result.policy_id,
+            tuple(str(x) for x in result.contributors),
+            result.serialize(),
+        )
+
+    def test_repeated_evaluation_is_identical(self):
+        for text in self.CASES:
+            signatures = {self.signature(text) for _ in range(30)}
+            self.assertEqual(len(signatures), 1, text)
+
+    def test_finding_order_is_stable(self):
+        for text in self.CASES:
+            first = self.signature(text)[0]
+            for _ in range(5):
+                self.assertEqual(self.signature(text)[0], first, text)
+
+
 if __name__ == "__main__":
     unittest.main()
