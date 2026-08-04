@@ -1907,5 +1907,186 @@ class AggregationDeterminismTests(unittest.TestCase):
                 self.assertEqual(self.signature(text)[0], first, text)
 
 
+# ---------------------------------------------------------------------------
+# P2C3N -- coercive signals must name the payment they are about.
+# ---------------------------------------------------------------------------
+
+
+class PaymentAnchorBindingTests(unittest.TestCase):
+    """Regression for the audit finding that a threat in one clause and a
+    gift-card mention in another satisfied the coercion rules between them.
+    Neither clause said the other was about a payment, and nothing in the
+    message connected them."""
+
+    THREAT_FRAGMENT = "the vendor threatened legal action in 2019"
+    CHANNEL_FRAGMENT = "gift cards are on the shelf"
+    SEPARATORS = (". ", "; ", ": ", "\n", "\r\n", "\n- ", ", but ", " and then ")
+
+    def combined(self, text, **kwargs):
+        """The two rules the finding could fabricate."""
+        a, _c, _f, _r = run_pipeline(text, **kwargs)
+        return sorted({f.rule_id for f in a.findings}
+                      & {"PAY_OFF_CHANNEL", "PAY_THREAT_COMBINATION"})
+
+    def test_each_fragment_alone_produces_no_combination(self):
+        for fragment in (self.THREAT_FRAGMENT, self.CHANNEL_FRAGMENT):
+            self.assertEqual(self.combined(fragment.capitalize() + "."), [], fragment)
+
+    def test_unrelated_fragments_never_combine(self):
+        for separator in self.SEPARATORS:
+            forward = self.THREAT_FRAGMENT + separator + self.CHANNEL_FRAGMENT + "."
+            reverse = self.CHANNEL_FRAGMENT.capitalize() + separator + self.THREAT_FRAGMENT + "."
+            self.assertEqual(self.combined(forward), [], repr(separator))
+            self.assertEqual(self.combined(reverse), [], repr(separator))
+            for text in (forward, reverse):
+                _a, _c, _f, result = run_pipeline(text)
+                self.assertIsNot(result.action, RoutingAction.SUPPRESS, repr(separator))
+
+    def test_partial_fragments_are_never_joined_across_sources(self):
+        cases = (
+            ("authored threat + OCR channel", self.THREAT_FRAGMENT + ".",
+             (IMAGE, Provenance.OCR_TEXT), self.CHANNEL_FRAGMENT + "."),
+            ("authored channel + ASR threat", self.CHANNEL_FRAGMENT + ".",
+             (AUDIO, Provenance.ASR_TRANSCRIPT), self.THREAT_FRAGMENT + "."),
+            ("authored threat + QR channel", self.THREAT_FRAGMENT + ".",
+             (IMAGE, Provenance.QR_DERIVED), self.CHANNEL_FRAGMENT + "."),
+        )
+        for label, authored, (ref, provenance), extracted in cases:
+            analysis = MediaAnalysis(ref, ExtractionStatus.SUCCEEDED,
+                                     content=TextContent(extracted, provenance))
+            self.assertEqual(self.combined(authored, attachment=ref, media=(analysis,)),
+                             [], label)
+
+    SAME_CLAUSE = (
+        "Pay now or your account will be suspended.",
+        "Pay now and keep this confidential, do not tell anyone.",
+        "Pay immediately, do not call the bank to verify.",
+        "Buy gift cards and send the codes to us right away.",
+        "Pay now by sending bitcoin to this wallet.",
+    )
+    EXPLICIT_REFERENCE = (
+        "Pay the outstanding balance now. Use gift cards for this payment.",
+        "Pay the outstanding balance now. Send it using bitcoin.",
+        "Transfer the amount now. Do so immediately or the account is closed.",
+    )
+    CONTINUATION = (
+        "Pay the outstanding balance now. Otherwise your account is closed permanently.",
+        "Pay the outstanding balance now. Or else your account is suspended.",
+        "Pay the outstanding balance now, using gift cards only.",
+        "Pay the outstanding balance now, via a bitcoin wallet.",
+    )
+    ANCHORED_LIST = (
+        "Pay the required fee now:\n- use gift cards\n- keep the receipt",
+        "Pay the required fee now:\n- keep this confidential\n- reply when done",
+        "Pay the required fee now:\n- otherwise the account is closed",
+    )
+    SHARED_ROOT = (
+        "Pay the fee today. The office moved last year. Use gift cards to pay the fee.",
+        "Pay the payment today. The office moved last year. Complete the payment using bitcoin.",
+    )
+
+    def assert_suppressed(self, text):
+        _a, _c, _f, result = run_pipeline(text)
+        self.assertIs(result.action, RoutingAction.SUPPRESS, text)
+
+    def test_same_clause_relationship(self):
+        for text in self.SAME_CLAUSE:
+            self.assert_suppressed(text)
+
+    def test_explicit_reference_relationship(self):
+        for text in self.EXPLICIT_REFERENCE:
+            self.assert_suppressed(text)
+
+    def test_bounded_continuation_relationship(self):
+        for text in self.CONTINUATION:
+            self.assert_suppressed(text)
+
+    def test_anchored_list_relationship(self):
+        for text in self.ANCHORED_LIST:
+            self.assert_suppressed(text)
+
+    def test_a_bullet_outside_the_group_inherits_nothing(self):
+        self.assertEqual(
+            self.combined("Pay the required fee now:\n- keep the receipt\n"
+                          "The office moved last year.\n- gift cards are on the shelf."),
+            [])
+
+    def test_shared_payment_root_binds_across_an_unrelated_clause(self):
+        for text in self.SHARED_ROOT:
+            self.assert_suppressed(text)
+
+    def test_generic_financial_vocabulary_is_not_a_shared_root(self):
+        self.assertEqual(
+            self.combined("Payments are processed weekly. Gift cards are on the shelf."), [])
+
+    UNRELATED = (
+        "Your account will be closed for inactivity next year. I picked up gift cards for "
+        "the leaving present.",
+        "The vendor threatened legal action in 2019. We discussed bitcoin at the meeting.",
+        "Please keep this between us, it is personal. Invoice 8841 for your subscription "
+        "is attached.",
+        "The documentation advises against contacting support directly. Payment received, "
+        "here is your receipt.",
+        "Your refund has been processed and confirmed. The annual service fee is charged "
+        "in March.",
+        "This is an official notice from your bank. The invoice is due on Friday.",
+        "Urgent, mum is in hospital, please call me. The electricity bill is due on Friday.",
+        "Service alert: the platform is currently down. I picked up gift cards for the raffle.",
+    )
+
+    def test_unrelated_signals_never_synthesise_a_combination(self):
+        for text in self.UNRELATED:
+            self.assertEqual(self.combined(text), [], text)
+
+    def test_an_unrelated_clause_before_or_after_changes_nothing(self):
+        for text in self.UNRELATED:
+            self.assertEqual(self.combined("The team met on Tuesday. " + text), [], text)
+            self.assertEqual(self.combined(text + " Let me know if you have questions."), [], text)
+        for text in self.CONTINUATION:
+            self.assert_suppressed("The team met on Tuesday. " + text)
+            self.assert_suppressed(text + " Let me know if you have questions.")
+
+    def test_genuine_multi_clause_scams_are_retained(self):
+        for text in ("Invoice 8841 is attached. Your account will be suspended unless you "
+                     "pay now.",
+                     "Your account will be suspended unless you pay now. Payment received, "
+                     "here is your receipt.",
+                     "Pay the 250 clearance fee within one hour or your account is closed "
+                     "permanently."):
+            self.assert_suppressed(text)
+
+    def test_ordinary_financial_content_stays_safe(self):
+        for text in ("Invoice 8841 for your subscription. Due date is Friday.",
+                     "Payment received, here is your receipt for order 5512.",
+                     "Rent is due on the first, as usual."):
+            _a, _c, _f, result = run_pipeline(text)
+            self.assertIsNot(result.action, RoutingAction.SUPPRESS, text)
+
+    def test_duplication_and_order_do_not_change_the_result(self):
+        genuine = "Pay the outstanding balance now. Otherwise your account is closed permanently."
+        analysis = MediaAnalysis(IMAGE, ExtractionStatus.SUCCEEDED,
+                                 content=TextContent(genuine, Provenance.OCR_TEXT))
+        self.assert_suppressed(genuine)
+
+        def keys(features):
+            return {(rc.family, rc.rule_id, rc.diagnostic) for rc in features.risk_root_causes}
+
+        _a, _c, once, _r = run_pipeline(genuine)
+        _a, _c, twice, _r = run_pipeline(genuine + " " + genuine)
+        self.assertEqual(keys(once), keys(twice))
+        _a, _c, duplicated, _r = run_pipeline(genuine, attachment=IMAGE,
+                                              media=(analysis, analysis))
+        self.assertEqual(keys(once), keys(duplicated))
+
+    def test_no_content_reaches_an_output(self):
+        text = ("Pay the outstanding balance of 4417 now. Otherwise your account is closed, "
+                "user zqxuser.")
+        a, c, f, result = run_pipeline(text)
+        rendered = " ".join((repr(a), repr(c), repr(f), repr(result),
+                             repr(result.serialize()), repr(result.contributors)))
+        for fragment in ("4417", "zqxuser", "outstanding balance", text):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
 if __name__ == "__main__":
     unittest.main()

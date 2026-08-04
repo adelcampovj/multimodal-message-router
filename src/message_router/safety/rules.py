@@ -508,6 +508,23 @@ class _LocalContext:
         """The resolved clause spans, for scanning one clause at a time."""
         return tuple((start, end) for start, end, _clause in self._spans)
 
+    def index_at(self, position: int) -> int:
+        """Which clause a match sits in. ``-1`` when it sits outside them all."""
+        for index, (start, end, _clause) in enumerate(self._spans):
+            if start <= position <= end:
+                return index
+        return -1
+
+    def clause(self, index: int) -> str:
+        return self._spans[index][2] if 0 <= index < len(self._spans) else ""
+
+    def introduces_list(self, index: int, text: str) -> bool:
+        """True when this clause ended on a colon, i.e. it announces a list."""
+        if not 0 <= index < len(self._spans):
+            return False
+        end = self._spans[index][1]
+        return end < len(text) and text[end] == ":"
+
     def clause_at(self, position: int) -> str:
         """The clause a match sits in, for suppressors that must be local."""
         for start, end, clause in self._spans:
@@ -1004,6 +1021,17 @@ _ORDINARY_BILLING = _compile_all(
 
 
 @dataclass(frozen=True)
+class _Occurrence:
+    """Where one indicator matched: the clause it sits in and that clause's
+    framing. ``clause`` never leaves this layer -- it exists so the bounded
+    relationship grammar below can read the words that link two clauses."""
+
+    index: int
+    clause: str
+    flags: ContextFlags
+
+
+@dataclass(frozen=True)
 class _Signal:
     """Every occurrence of one indicator family, with where each one sits.
 
@@ -1014,7 +1042,7 @@ class _Signal:
     judged where it sits, and the family is decided from all of them.
     """
 
-    occurrences: tuple[tuple[str, ContextFlags], ...]
+    occurrences: tuple[_Occurrence, ...]
     unframed: bool
 
     def __bool__(self) -> bool:
@@ -1023,24 +1051,42 @@ class _Signal:
 
 
 def _collect_signal(
-    patterns: tuple[re.Pattern[str], ...], text: str, local: _LocalContext
+    patterns: tuple[re.Pattern[str], ...], text: str, local: _LocalContext,
+    confined: bool = True,
 ) -> _Signal:
     """Every non-advisory occurrence of ``patterns``, in deterministic order.
 
-    Order is pattern order then match position, both fixed, so the result
-    never depends on iteration accidents.
+    Order is pattern order, then clause, then match position -- all fixed,
+    so the result never depends on iteration accidents.
+
+    ``confined`` bounds each scan to one clause, which is what makes an
+    occurrence's clause index mean anything. Scanning the whole string lets a
+    pattern *start* in one clause and run into the next: the match is then
+    filed under the clause it began in, and because ``finditer`` yields
+    non-overlapping matches it also swallows the real occurrence further on.
+    "Invoice 8841 is attached; your account will be suspended" filed the
+    threat under the invoice and lost it in the demand's own clause.
+
+    It is switched off only for a rule whose approved form is already a
+    cross-clause relationship -- a prize named in one clause and its release
+    fee in the next.
     """
-    occurrences: list[tuple[str, ContextFlags]] = []
+    occurrences: list[_Occurrence] = []
     unframed = False
     for pattern in patterns:
-        for match in pattern.finditer(text):
-            ctx = local.at(match.start())
-            if ctx.is_advisory:
-                # An advisory occurrence says nothing about the others.
-                continue
-            occurrences.append((local.clause_at(match.start()), ctx))
-            if not ctx.is_discussion:
-                unframed = True
+        spans = local.bounds if confined else ((0, len(text)),)
+        for start, end in spans:
+            for match in pattern.finditer(text, start, end):
+                ctx = local.at(match.start())
+                if ctx.is_advisory:
+                    # An advisory occurrence says nothing about the others.
+                    continue
+                occurrences.append(
+                    _Occurrence(local.index_at(match.start()),
+                                local.clause_at(match.start()), ctx)
+                )
+                if not ctx.is_discussion:
+                    unframed = True
     return _Signal(tuple(occurrences), unframed)
 
 
@@ -1052,8 +1098,112 @@ def _is_ordinary(signal: _Signal) -> bool:
     arrives after a threat must not erase it.
     """
     return bool(signal) and all(
-        _any(_ORDINARY_BILLING, clause) or ctx.notification
-        for clause, ctx in signal.occurrences
+        _any(_ORDINARY_BILLING, occurrence.clause) or occurrence.flags.notification
+        for occurrence in signal.occurrences
+    )
+
+
+# ---------------------------------------------------------------------------
+# Binding coercive signals to a payment.
+#
+# A threat and a gift-card mention in two unrelated clauses used to satisfy
+# the coercion rules between them, because the rules asked only whether both
+# families appeared *somewhere*. "The vendor threatened legal action in 2019.
+# Gift cards are on the shelf." is not a scam, and nothing in the message
+# said it was -- the two halves were never connected to each other.
+#
+# A combined finding now has to name the payment it is about. The anchor is
+# an independently supported payment demand, and the coercive signal has to
+# reach it through one of five bounded, enumerated relationships. Proximity
+# is not one of them: adjacency alone, shared topic, shared paragraph and
+# document co-presence all fail. Where the grammar cannot prove a link, both
+# findings survive independently and nothing is combined -- interpreting the
+# link is left to semantic analysis this layer deliberately does not attempt.
+# ---------------------------------------------------------------------------
+
+#: An adjacent clause pointing back at the anchored payment.
+_PAYMENT_REFERENCE_RE = _c(
+    r"\b(?:this|that|the) (?:payment|fee|amount|transfer|charge|invoice|balance|sum)\b"
+    r"|\b(?:send|pay|transfer|complete|settle) it\b"
+    r"|\bdo so\b"
+    r"|\b(?:to|for) (?:pay|the payment|the fee|the transfer|the amount|the charge)\b"
+)
+
+#: An adjacent clause continuing the anchored payment instruction.
+_COERCIVE_CONTINUATION_RE = _c(
+    r"\botherwise\b|\bor else\b|\bfailing that\b"
+    r"|\b(?:using|via|through)\b|\bpay (?:with|using|via)\b|\bsend (?:through|via)\b"
+    r"|\bto (?:avoid|prevent|stop)\b[^.]{0,30}\b(?:penalty|closure|suspension|charge|fee|action)\b"
+    r"|\bbefore the (?:deadline|cut ?off|due date)\b"
+)
+
+#: The bounded payment objects two clauses may share. Definite on purpose:
+#: two clauses both saying "payment" in the abstract share a topic, not a
+#: transaction, and topic is exactly what must not be enough.
+_PAYMENT_OBJECT_RE = _c(
+    r"\b(?:the|this|that) (payment|fee|transfer|invoice|charge|balance)\b"
+)
+
+#: A bounded list item, used only to keep an anchored group together.
+_LIST_ITEM_RE = _c(r"^\s*(?:[-*•–—·]+|\(?\d{1,2}[.)])\s+")
+
+
+def _shared_payment_object(left: str, right: str) -> bool:
+    """True when both clauses name the *same* definite payment object."""
+    return bool(
+        {m.group(1) for m in _PAYMENT_OBJECT_RE.finditer(left)}
+        & {m.group(1) for m in _PAYMENT_OBJECT_RE.finditer(right)}
+    )
+
+
+def _in_anchored_list(anchor: int, other: int, local: _LocalContext, text: str) -> bool:
+    """True when ``other`` is a list item in the group ``anchor`` introduces.
+
+    The group is the unbroken run of list items immediately following a
+    clause that ends on a colon. The first non-item clause closes it, so a
+    later unrelated bullet inherits nothing.
+    """
+    if other <= anchor or not local.introduces_list(anchor, text):
+        return False
+    for index in range(anchor + 1, other + 1):
+        clause = local.clause(index)
+        if not clause.strip():
+            # The colon and the line break leave an empty clause between the
+            # anchor and its first item; it is punctuation, not a member.
+            continue
+        if not _LIST_ITEM_RE.match(clause):
+            return False
+    return True
+
+
+def _relationship(
+    anchor: _Occurrence, other: _Occurrence, local: _LocalContext, text: str
+) -> str | None:
+    """The bounded relationship binding ``other`` to a payment anchor, if any."""
+    if anchor.index < 0 or other.index < 0:
+        return None
+    if anchor.index == other.index:
+        return "REL_SAME_CLAUSE"
+    if _in_anchored_list(anchor.index, other.index, local, text):
+        return "REL_ANCHORED_LIST"
+    if abs(anchor.index - other.index) == 1:
+        if _PAYMENT_REFERENCE_RE.search(other.clause):
+            return "REL_EXPLICIT_REFERENCE"
+        if _COERCIVE_CONTINUATION_RE.search(other.clause):
+            return "REL_CONTINUATION"
+    if _shared_payment_object(anchor.clause, other.clause):
+        return "REL_SHARED_PAYMENT_ROOT"
+    return None
+
+
+def _bound_to_payment(
+    anchor: _Signal, other: _Signal, local: _LocalContext, text: str
+) -> bool:
+    """True when some occurrence of ``other`` binds to some payment anchor."""
+    return any(
+        _relationship(anchor_occurrence, other_occurrence, local, text) is not None
+        for anchor_occurrence in anchor.occurrences
+        for other_occurrence in other.occurrences
     )
 
 
@@ -1066,7 +1216,11 @@ def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHi
     threat = _collect_signal(_THREAT, text, local)
     secrecy = _collect_signal(_SECRECY, text, local)
     anti_verification = _collect_signal(_ANTI_VERIFICATION, text, local)
-    advance_fee = _collect_signal(_ADVANCE_FEE, text, local)
+    # The advance-fee rule is itself a cross-clause relationship the design
+    # already approves -- "you have won a refund; a clearance fee applies to
+    # release it" is one construction spread over two clauses -- so it keeps
+    # its whole-text scan.
+    advance_fee = _collect_signal(_ADVANCE_FEE, text, local, confined=False)
     ordinary = _is_ordinary(demand)
 
     def severity_for(signal: _Signal, base: Severity) -> Severity:
@@ -1098,7 +1252,10 @@ def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHi
                 )
             )
 
-    if off_channel and (demand or threat):
+    # Both combinations name a payment, so both must reach one. Without a
+    # bound anchor the two families stay separate observations rather than
+    # becoming one coercion finding.
+    if off_channel and _bound_to_payment(demand, off_channel, local, text):
         hits.append(
             RuleHit(
                 FindingCategory.COERCIVE_PAYMENT,
@@ -1109,7 +1266,7 @@ def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHi
             )
         )
 
-    if threat and (demand or off_channel):
+    if threat and _bound_to_payment(demand, threat, local, text):
         hits.append(
             RuleHit(
                 FindingCategory.COERCIVE_PAYMENT,
@@ -1135,8 +1292,13 @@ def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHi
         hits.append(
             RuleHit(
                 FindingCategory.MALICIOUS_URGENCY,
+                # Secrecy is only *coercive* when it is secrecy about this
+                # payment. An unrelated confidential remark beside an
+                # ordinary invoice stays weak.
                 severity_for(secrecy,
-                             Severity.SUSPICIOUS if demand or threat else Severity.WEAK),
+                             Severity.SUSPICIOUS
+                             if _bound_to_payment(demand, secrecy, local, text)
+                             else Severity.WEAK),
                 "URG_SECRECY",
                 DiagnosticCode.SECRECY_PRESSURE,
                 ambiguous=not secrecy.unframed,
