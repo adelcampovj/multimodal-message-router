@@ -2215,5 +2215,79 @@ class CredentialWarningSymmetryTests(unittest.TestCase):
             self.assertNotIn("4417", repr(finding))
 
 
+# ---------------------------------------------------------------------------
+# P2C3P1 -- payment episodes, bare connectors, numbered list markers.
+# ---------------------------------------------------------------------------
+
+
+class PaymentEpisodeGrammarTests(unittest.TestCase):
+    """Focused half of the P2C3P1 corrections: which combined findings the
+    rules produce, before any routing is involved."""
+
+    COMBINED = {"PAY_OFF_CHANNEL", "PAY_THREAT_COMBINATION"}
+
+    def combined(self, text):
+        return rule_ids(analyze(text)) & self.COMBINED
+
+    def test_an_explicit_qualifier_separates_two_transactions(self):
+        for text in ("Send the payment for March now. The payment for April goes by gift cards.",
+                     "Pay the fee for the licence now. The fee we refunded in June went by "
+                     "gift cards.",
+                     "Deposit the balance today. The balance withdrawn last week went by "
+                     "gift cards.",
+                     "Pay the charge today. The charge levied by the council last year went "
+                     "by gift cards."):
+            self.assertEqual(self.combined(text), set(), text)
+
+    def test_one_transaction_named_twice_still_binds(self):
+        self.assertIn("PAY_OFF_CHANNEL",
+                      self.combined("Pay the fee now. The fee goes by western union."))
+
+    def test_a_generic_root_needs_the_adjacent_clause_or_a_payment_action(self):
+        far = ". ".join(f"unrelated remark {index}" for index in range(1, 11))
+        self.assertEqual(
+            self.combined(f"Pay the fee now. {far}. The fee must go by gift cards."), set())
+        self.assertIn(
+            "PAY_OFF_CHANNEL",
+            self.combined(f"Pay the fee now. {far}. Use gift cards to pay the fee."))
+
+    def test_a_bare_preposition_is_not_a_continuation(self):
+        for clause in ("The parcel went through the depot and gift cards are stocked here.",
+                       "We fixed the leak using a spanner and gift cards are on the shelf.",
+                       "The deed arrived via courier and gift cards are sold downstairs."):
+            self.assertEqual(self.combined(f"Remit the balance today. {clause}"), set(), clause)
+
+    def test_a_named_payment_action_is_still_a_continuation(self):
+        for clause in ("Pay using gift cards.", "Send the payment via bitcoin.",
+                       "Complete it using gift cards."):
+            self.assertIn("PAY_OFF_CHANNEL",
+                          self.combined(f"Remit the balance today. {clause}"), clause)
+
+    def test_a_numbered_marker_keeps_its_item_in_the_group(self):
+        for newline in ("\n", "\r\n", "\r", "\n\n"):
+            text = f"Pay the required fee now:{newline}1. use gift cards"
+            self.assertIn("PAY_OFF_CHANNEL", self.combined(text), repr(newline))
+
+    def test_a_numbered_marker_is_only_recognised_at_a_trusted_line_start(self):
+        for text in ("Pay the required fee now: item 1. use gift cards",
+                     "Pay the required fee now:\n1.5 million was the total, use gift cards",
+                     "Pay the required fee now:\n2024. that year we moved, use gift cards"):
+            self.assertEqual(self.combined(text), set(), text)
+
+    def test_structural_boundaries_are_still_typed(self):
+        # A raw control character cannot manufacture the line start a marker
+        # needs -- it is deleted before anything reads structure.
+        self.assertEqual(
+            self.combined("Pay the required fee now:\x011. use gift cards is unrelated here"),
+            set())
+
+    def test_no_transaction_detail_reaches_a_finding(self):
+        a = analyze("Send the payment for March of 4417 now. The payment for April goes "
+                    "by gift cards.")
+        rendered = repr(a) + repr(a.findings)
+        for fragment in ("4417", "March", "April", "past-period"):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
 if __name__ == "__main__":
     unittest.main()

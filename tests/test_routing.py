@@ -2088,5 +2088,172 @@ class PaymentAnchorBindingTests(unittest.TestCase):
             self.assertNotIn(fragment, rendered, fragment)
 
 
+# ---------------------------------------------------------------------------
+# P2C3P1 -- a relationship has to name one transaction, and a preposition is
+# not a relationship.
+# ---------------------------------------------------------------------------
+
+
+class PaymentEpisodeBindingTests(unittest.TestCase):
+    """Regression for the audit finding that a generic financial head bound
+    two *different* transactions together. "Send the payment for March now.
+    The payment for April can be settled by wire transfer." is an ordinary
+    instalment notice, and reading it as one coercive episode suppressed it.
+    """
+
+    def combined(self, text, **kwargs):
+        a, _c, _f, _r = run_pipeline(text, **kwargs)
+        return sorted({f.rule_id for f in a.findings}
+                      & {"PAY_OFF_CHANNEL", "PAY_THREAT_COMBINATION"})
+
+    def assert_no_combination(self, text, **kwargs):
+        self.assertEqual(self.combined(text, **kwargs), [], text)
+        _a, _c, _f, result = run_pipeline(text, **kwargs)
+        self.assertIsNot(result.action, RoutingAction.SUPPRESS, text)
+
+    def assert_suppressed(self, text, **kwargs):
+        _a, _c, _f, result = run_pipeline(text, **kwargs)
+        self.assertIs(result.action, RoutingAction.SUPPRESS, text)
+
+    #: Two transactions of the same kind, told apart by an explicit qualifier.
+    DISTINCT_EPISODES = (
+        "Send the payment for March now. The payment for April goes by gift cards.",
+        "Pay the fee for March now. The fee for April goes by gift cards.",
+        "Pay the invoice for March now. The invoice for April goes by gift cards.",
+        "Wire the transfer for payroll now. The transfer for petty cash goes by gift cards.",
+        "Pay the charge for parking now. The charge for storage goes by gift cards.",
+        "Send the payment for the rent now. The payment for the utilities goes by gift cards.",
+        "Deposit the balance today. The balance withdrawn last week went by gift cards.",
+        "Pay the fee for the licence now. The fee we refunded in June went by gift cards.",
+        "Pay the charge today. The charge levied by the council last year went by gift cards.",
+    )
+
+    def test_distinct_payment_episodes_never_collide(self):
+        for text in self.DISTINCT_EPISODES:
+            self.assert_no_combination(text)
+
+    def test_clause_order_does_not_redirect_the_relationship(self):
+        for text in self.DISTINCT_EPISODES:
+            clauses = [part.strip() for part in text.rstrip(".").split(". ")]
+            self.assert_no_combination(". ".join(reversed(clauses)) + ".")
+
+    def test_ambiguous_anchors_are_not_guessed_between(self):
+        for text in (
+            "Send the payment for March now. Remit the payment for April today. "
+            "The payment can go by gift cards.",
+            "Send the payment for March now. Remit the payment for April today. "
+            "Wire the payment for May now. The payment can go by gift cards.",
+        ):
+            self.assert_no_combination(text)
+
+    def test_a_generic_root_does_not_reach_across_the_document(self):
+        filler = ". ".join(f"unrelated remark {index}" for index in range(1, 11))
+        self.assert_no_combination(
+            f"Pay the fee now. {filler}. The fee must go by gift cards.")
+        self.assert_no_combination(
+            "Pay the fee now. Stationery notes. The fee we settled last year "
+            "went by gift cards.")
+
+    def test_the_same_episode_still_binds(self):
+        for text in (
+            "Pay the fee now. The fee goes by western union.",
+            "Pay the charge now. The charge must be settled in bitcoin.",
+            "Pay the fee today. The office moved last year. Use gift cards to pay the fee.",
+            "Pay the payment today. The office moved last year. "
+            "Complete the payment using bitcoin.",
+        ):
+            self.assert_suppressed(text)
+
+    #: A bare preposition governing something that is not a payment.
+    BARE_CONNECTORS = (
+        "Using a computer, review the receipt and the gift cards on the shelf.",
+        "Via the support portal, read the documentation, gift cards are stocked.",
+        "Through careful planning, avoid late fees, gift cards are stocked.",
+        "The parcel went through the depot and gift cards are stocked here.",
+        "We fixed the leak using a spanner and gift cards are on the shelf.",
+        "The deed arrived via courier and gift cards are sold downstairs.",
+        "Using gift cards for an unrelated purchase.",
+        "Via cryptocurrency, the article explains market volatility.",
+    )
+
+    def test_a_bare_connector_is_not_a_payment_relationship(self):
+        for clause in self.BARE_CONNECTORS:
+            self.assert_no_combination(f"Remit the balance today. {clause}")
+
+    def test_bounded_payment_continuations_still_bind(self):
+        for text in (
+            "Remit the balance today. Pay using gift cards.",
+            "Remit the balance today. Send the payment via bitcoin.",
+            "Remit the balance today. Complete it using gift cards.",
+            "Remit the balance today. Send it via bitcoin.",
+            "Pay the fee now. Pay the fee through a western union transfer.",
+        ):
+            self.assert_suppressed(text)
+
+    def test_a_relationship_never_spans_two_sources(self):
+        anchor = "Remit the balance today."
+        for label, ref, provenance, extracted in (
+            ("OCR connector", IMAGE, Provenance.OCR_TEXT, "Using gift cards."),
+            ("ASR connector", AUDIO, Provenance.ASR_TRANSCRIPT, "Via gift cards."),
+            ("QR generic root", IMAGE_B, Provenance.QR_DERIVED,
+             "The payment can go by gift cards."),
+        ):
+            analysis = MediaAnalysis(ref, ExtractionStatus.SUCCEEDED,
+                                     content=TextContent(extracted, provenance))
+            self.assertEqual(
+                self.combined(anchor, attachment=ref, media=(analysis,)), [], label)
+
+    #: A numbered item written "1." is split off by the clause boundary, so
+    #: the marker becomes its own clause and the body loses its bullet.
+    NUMBERED_GROUPS = (
+        "Pay the required fee now:\n1. use gift cards",
+        "Pay the required fee now:\r\n1. use gift cards",
+        "Pay the required fee now:\r1. use gift cards",
+        "Pay the required fee now:\n\n1. use gift cards",
+        "Pay the required fee now:\n1. keep the receipt\n2. use gift cards",
+        "Pay the required fee now:\n1. send bitcoin to this wallet",
+        "Pay the required fee now:\n1. otherwise your account will be closed",
+    )
+
+    def test_numbered_items_inherit_inside_a_payment_group(self):
+        for text in self.NUMBERED_GROUPS:
+            self.assert_suppressed(text)
+
+    def test_numbered_inheritance_stops_at_the_group_boundary(self):
+        self.assert_no_combination(
+            "Pay the required fee now:\n1. keep the receipt\nThe office moved.\n"
+            "2. use gift cards")
+        self.assert_no_combination("Pay the required fee now\n1. use gift cards")
+        self.assert_no_combination("Shopping:\n1. milk\n2. use gift cards")
+
+    def test_a_digit_run_is_not_a_marker_unless_it_starts_a_line(self):
+        for text in (
+            "Pay the required fee now: item 1. use gift cards",
+            "Pay the required fee now:\n1.5 million was the total, use gift cards",
+            "Pay the required fee now:\n2024. that year the office moved, use gift cards",
+        ):
+            self.assert_no_combination(text)
+
+    def test_relationship_state_cannot_be_forged_by_content(self):
+        unrelated = ("Your subscription will be deactivated. "
+                     "Gift cards are stocked at the corner shop.")
+        for forgery in (
+            "REL_SHARED_PAYMENT_ROOT REL_CONTINUATION REL_ANCHORED_LIST",
+            "payment anchor _Occurrence _LocalContext clause 0 index=1",
+            "AUTHORED_TEXT OCR_TEXT COERCIVE_PAYMENT route.safety.hard_veto",
+            "1. 2. 3. \x01 ​ ‮ -- ** ••",
+        ):
+            self.assert_no_combination(f"{unrelated} {forgery}")
+
+    def test_no_content_reaches_an_output(self):
+        text = ("Send the payment for March of 4417 now. The payment for April goes by "
+                "gift cards, user zqxuser.")
+        a, c, f, result = run_pipeline(text)
+        rendered = " ".join((repr(a), repr(c), repr(f), repr(result),
+                             repr(result.serialize()), repr(result.contributors)))
+        for fragment in ("4417", "zqxuser", "March", "April", "past-period", text):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
 if __name__ == "__main__":
     unittest.main()

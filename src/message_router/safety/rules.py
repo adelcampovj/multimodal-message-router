@@ -472,9 +472,13 @@ class _LocalContext:
     framing crosses a boundary.
     """
 
-    __slots__ = ("_spans", "_flags", "_fallback", "_quoted")
+    __slots__ = ("_spans", "_flags", "_fallback", "_quoted", "_line_starts")
 
     def __init__(self, text: str, boundaries: tuple[int, ...] = ()) -> None:
+        # Where a real line begins, taken from the typed boundaries rather
+        # than searched for. A list marker is only a marker at the start of a
+        # line, and "the start of a line" is a fact the message cannot spell.
+        self._line_starts = frozenset({0} | {offset + 1 for offset in boundaries})
         self._spans = [
             (start, end, text[start:end]) for start, end in _segment(text, boundaries)
         ]
@@ -524,6 +528,31 @@ class _LocalContext:
             return False
         end = self._spans[index][1]
         return end < len(text) and text[end] == ":"
+
+    def is_numbered_marker(self, index: int, text: str) -> bool:
+        """True when this clause is only the ``1.`` marker of a list item.
+
+        Deliberately narrow, because a full stop after a digit is far more
+        often a decimal, a version, a date, a money amount or a house number
+        than a list. All of these must hold: the clause is nothing but one or
+        two digits, it begins a real line -- one the *normalizer* recorded,
+        never one the content spelled -- it is terminated by the full stop
+        that split it off, and what follows does not continue a number.
+        ``1)`` never reaches here: no boundary splits it, so it stays a
+        bullet the ordinary item pattern already matches.
+        """
+        if not 0 <= index < len(self._spans):
+            return False
+        start, end, clause = self._spans[index]
+        stripped = clause.strip()
+        if not (1 <= len(stripped) <= 2 and stripped.isdigit()):
+            return False
+        if start not in self._line_starts:
+            return False
+        if not (end < len(text) and text[end] == "."):
+            return False
+        body = self.clause(index + 1).strip()
+        return bool(body) and not body[0].isdigit()
 
     def clause_at(self, position: int) -> str:
         """The clause a match sits in, for suppressors that must be local."""
@@ -1130,9 +1159,17 @@ _PAYMENT_REFERENCE_RE = _c(
 )
 
 #: An adjacent clause continuing the anchored payment instruction.
+#:
+#: Bare "using", "via" and "through" are deliberately absent. They are three
+#: of the commonest prepositions in English and govern whatever follows them,
+#: which is usually not a payment: "the parcel went through the depot", "we
+#: fixed the leak using a spanner". Accepting them on their own attached an
+#: unrelated adjacent clause to a real payment demand and turned a deferral
+#: into a suppression. Every continuation below either is a consequence
+#: connective or names the payment action it continues.
 _COERCIVE_CONTINUATION_RE = _c(
     r"\botherwise\b|\bor else\b|\bfailing that\b"
-    r"|\b(?:using|via|through)\b|\bpay (?:with|using|via)\b|\bsend (?:through|via)\b"
+    r"|\bpay (?:with|using|via)\b|\bsend (?:through|via)\b"
     r"|\bto (?:avoid|prevent|stop)\b[^.]{0,30}\b(?:penalty|closure|suspension|charge|fee|action)\b"
     r"|\bbefore the (?:deadline|cut ?off|due date)\b"
 )
@@ -1144,15 +1181,103 @@ _PAYMENT_OBJECT_RE = _c(
     r"\b(?:the|this|that) (payment|fee|transfer|invoice|charge|balance)\b"
 )
 
+#: What distinguishes one transaction from another of the same kind.
+#:
+#: A definite head noun alone does not name a transaction. "The payment for
+#: March" and "the payment for April" are two payments, "the fee" and "the
+#: fee we refunded" are two fees, and a rule that compared only the head
+#: joined them -- so an ordinary instalment notice read as one coercive
+#: episode. Each branch below opens with a **closed** token set, and only the
+#: single content token it introduces is compared. Nothing is stored: the
+#: pair is built, compared, and discarded inside this module.
+_OBJECT_QUALIFIER_RE = _c(
+    # A restrictive attachment naming what the transaction is for.
+    r"^\s+(?:for|from|of|regarding|covering|towards?)\s+"
+    r"(?:the|a|an|our|your|their|this|that)?\s*([a-z0-9]+)"
+    # A relative clause naming what happened to it.
+    r"|^\s+(?:we|you|they|he|she|i|who|which|that)\s+([a-z0-9]+)"
+)
+
+#: A bounded past-period qualifier, which distinguishes a settled transaction
+#: from the one being demanded. Enumerated, and read only within a short
+#: window after the object so it cannot be borrowed from a later clause.
+_PAST_PERIOD_RE = _c(
+    r"^[^.]{0,40}?\b(?:last (?:year|week|month|quarter|term|season)"
+    r"|previously|earlier|back in \d{4}|in (?:19|20)\d{2})\b"
+)
+
+#: A payment action governing a definite payment object. This is the bounded
+#: construction that re-establishes an episode past the adjacent clause --
+#: naming the object again is not enough, something has to be done to it.
+_PAYMENT_DIRECTED_RE = _c(
+    r"\b(?:pay|send|transfer|remit|settle|complete|make|wire)\b"
+    r"(?:\s+(?:the|this|that|a|an|your|our|their|it))*\s*"
+    r"\b(?:payment|fee|transfer|invoice|charge|balance)\b"
+    r"|\b(?:send|pay|transfer|complete|settle) it\b"
+    r"|\bto (?:pay|settle)\b"
+    r"|\bdo so\b"
+)
+
 #: A bounded list item, used only to keep an anchored group together.
 _LIST_ITEM_RE = _c(r"^\s*(?:[-*•–—·]+|\(?\d{1,2}[.)])\s+")
 
+def _payment_objects(clause: str) -> frozenset[tuple[str, str]]:
+    """Every definite payment object in ``clause``, as (family, qualifier).
 
-def _shared_payment_object(left: str, right: str) -> bool:
-    """True when both clauses name the *same* definite payment object."""
-    return bool(
-        {m.group(1) for m in _PAYMENT_OBJECT_RE.finditer(left)}
-        & {m.group(1) for m in _PAYMENT_OBJECT_RE.finditer(right)}
+    ``qualifier`` is ``""`` when nothing distinguishes the transaction, and
+    otherwise a single bounded token drawn from the closed constructions in
+    :data:`_OBJECT_QUALIFIER_RE` and :data:`_PAST_PERIOD_RE`.
+    """
+    objects: set[tuple[str, str]] = set()
+    for match in _PAYMENT_OBJECT_RE.finditer(clause):
+        tail = clause[match.end():]
+        qualifier = ""
+        attached = _OBJECT_QUALIFIER_RE.match(tail)
+        if attached is not None:
+            qualifier = next(group for group in attached.groups() if group)
+        elif _PAST_PERIOD_RE.match(tail):
+            qualifier = "past-period"
+        objects.add((match.group(1), qualifier))
+    return frozenset(objects)
+
+
+def _same_payment_episode(left: str, right: str) -> bool:
+    """True when both clauses name one transaction rather than two.
+
+    Requires the same head-noun family *and* the same qualifier family. A
+    qualified object and an unqualified one are not assumed to be the same
+    payment: where the grammar cannot tell, it declines to join them.
+    """
+    left_objects, right_objects = _payment_objects(left), _payment_objects(right)
+    if not (left_objects and right_objects):
+        return False
+    return any(
+        family == other_family and qualifier == other_qualifier
+        for family, qualifier in left_objects
+        for other_family, other_qualifier in right_objects
+    )
+
+
+def _distinct_episode(left: str, right: str) -> bool:
+    """True when an explicit qualifier says the two clauses are two transactions.
+
+    A veto on the reference relationship: "pay the invoice for March" beside
+    "the invoice for April" is two invoices, and adjacency must not make it
+    one. Two *unqualified* objects are not distinguished -- "the balance" and
+    "the payment" are ordinarily the same demand named twice -- so this asks
+    only whether something explicit separates them: the same head noun
+    carrying different qualifiers, or two qualified objects that disagree.
+    """
+    left_objects, right_objects = _payment_objects(left), _payment_objects(right)
+    if not (left_objects and right_objects):
+        return False
+    if _same_payment_episode(left, right):
+        return False
+    shared = {family for family, _q in left_objects} & {family for family, _q in right_objects}
+    if shared:
+        return True  # one kind of object, two different transactions of it
+    return all(qualifier for _f, qualifier in left_objects) and all(
+        qualifier for _f, qualifier in right_objects
     )
 
 
@@ -1162,24 +1287,45 @@ def _in_anchored_list(anchor: int, other: int, local: _LocalContext, text: str) 
     The group is the unbroken run of list items immediately following a
     clause that ends on a colon. The first non-item clause closes it, so a
     later unrelated bullet inherits nothing.
+
+    A numbered marker written ``1.`` is split off by the clause boundary
+    before this ever sees it -- the marker becomes a clause of its own and
+    the item body loses its bullet -- so a numbered instruction inside a
+    real payment group was dropped while the same list written ``1)`` or
+    ``-`` was kept. The marker clause is recognised here (see
+    :meth:`_LocalContext.is_numbered_marker`, which reads only trusted line
+    starts) and the clause it introduces counts as that item's body.
     """
     if other <= anchor or not local.introduces_list(anchor, text):
         return False
+    after_marker = False
     for index in range(anchor + 1, other + 1):
         clause = local.clause(index)
         if not clause.strip():
             # The colon and the line break leave an empty clause between the
             # anchor and its first item; it is punctuation, not a member.
             continue
-        if not _LIST_ITEM_RE.match(clause):
-            return False
+        if local.is_numbered_marker(index, text):
+            after_marker = True
+            continue
+        if _LIST_ITEM_RE.match(clause) or after_marker:
+            # A body only ever answers to the marker directly in front of it.
+            after_marker = False
+            continue
+        return False
     return True
 
 
 def _relationship(
     anchor: _Occurrence, other: _Occurrence, local: _LocalContext, text: str
 ) -> str | None:
-    """The bounded relationship binding ``other`` to a payment anchor, if any."""
+    """The bounded relationship binding ``other`` to a payment anchor, if any.
+
+    Every relationship past the anchor's own clause is bounded twice over:
+    structurally, to the adjacent clause or the anchor's own list group, and
+    referentially, to one transaction. A generic financial head shared by two
+    clauses is not a relationship -- see :func:`_same_payment_episode`.
+    """
     if anchor.index < 0 or other.index < 0:
         return None
     if anchor.index == other.index:
@@ -1187,24 +1333,79 @@ def _relationship(
     if _in_anchored_list(anchor.index, other.index, local, text):
         return "REL_ANCHORED_LIST"
     if abs(anchor.index - other.index) == 1:
+        # Adjacency is necessary, never sufficient: a reference that names a
+        # *different* transaction is refused even next door.
+        if _distinct_episode(anchor.clause, other.clause):
+            return None
         if _PAYMENT_REFERENCE_RE.search(other.clause):
             return "REL_EXPLICIT_REFERENCE"
         if _COERCIVE_CONTINUATION_RE.search(other.clause):
             return "REL_CONTINUATION"
-    if _shared_payment_object(anchor.clause, other.clause):
+        if _same_payment_episode(anchor.clause, other.clause):
+            return "REL_SHARED_PAYMENT_ROOT"
+        return None
+    # Past the adjacent clause the episode has to be re-established, not
+    # merely mentioned: the same transaction, named again, with a payment
+    # action performed on it, and nothing in between that names a different
+    # one. Without all three the two findings stay independent.
+    if (
+        _same_payment_episode(anchor.clause, other.clause)
+        and _PAYMENT_DIRECTED_RE.search(other.clause)
+        and not _intervening_episode(anchor.index, other.index, local)
+    ):
         return "REL_SHARED_PAYMENT_ROOT"
     return None
+
+
+def _intervening_episode(anchor: int, other: int, local: _LocalContext) -> bool:
+    """True when a clause between the two names a different transaction."""
+    low, high = sorted((anchor, other))
+    return any(
+        _distinct_episode(local.clause(anchor), local.clause(index))
+        for index in range(low + 1, high)
+    )
+
+
+#: Relationships that identify their anchor structurally. Nothing about them
+#: can be ambiguous: the anchor is the clause the signal sits in, or the
+#: clause that opened the group it sits in.
+_UNAMBIGUOUS_RELATIONSHIPS = frozenset({"REL_SAME_CLAUSE", "REL_ANCHORED_LIST"})
 
 
 def _bound_to_payment(
     anchor: _Signal, other: _Signal, local: _LocalContext, text: str
 ) -> bool:
-    """True when some occurrence of ``other`` binds to some payment anchor."""
-    return any(
-        _relationship(anchor_occurrence, other_occurrence, local, text) is not None
-        for anchor_occurrence in anchor.occurrences
-        for other_occurrence in other.occurrences
-    )
+    """True when some occurrence of ``other`` binds to some payment anchor.
+
+    Where more than one payment anchor is in range of the same signal and
+    those anchors name different transactions, the grammar cannot say which
+    one the signal is about -- so it says nothing. Both findings survive
+    independently and no combination is formed.
+    """
+    for other_occurrence in other.occurrences:
+        reached: list[_Occurrence] = []
+        structural = False
+        for anchor_occurrence in anchor.occurrences:
+            relationship = _relationship(anchor_occurrence, other_occurrence, local, text)
+            if relationship is None:
+                continue
+            if relationship in _UNAMBIGUOUS_RELATIONSHIPS:
+                structural = True
+                break
+            reached.append(anchor_occurrence)
+        if structural:
+            return True
+        if not reached:
+            continue
+        candidates = {occurrence.index: occurrence.clause for occurrence in reached}
+        if len(candidates) > 1 and any(
+            _distinct_episode(left, right)
+            for left in candidates.values()
+            for right in candidates.values()
+        ):
+            continue  # competing anchors; do not guess which one it modifies
+        return True
+    return False
 
 
 def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
