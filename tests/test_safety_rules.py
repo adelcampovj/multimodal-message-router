@@ -2289,5 +2289,80 @@ class PaymentEpisodeGrammarTests(unittest.TestCase):
             self.assertNotIn(fragment, rendered, fragment)
 
 
+class PaymentIntentReferenceTests(unittest.TestCase):
+    """Focused half of P2C3P1R: naming a payment is not referring to one.
+
+    "Parse the invoice" and "archive the charge" name a payment and do
+    nothing to it. Accepting them as explicit references let an unrelated
+    document-handling clause beside a real demand pull in a gift-card
+    mention and manufacture an off-channel finding.
+    """
+
+    COMBINED = {"PAY_OFF_CHANNEL", "PAY_THREAT_COMBINATION"}
+    ANCHOR = "Remit the balance today."
+
+    def combined(self, candidate):
+        return rule_ids(analyze(f"{self.ANCHOR} {candidate}")) & self.COMBINED
+
+    #: An unrelated action whose object happens to be a financial noun.
+    UNRELATED_ACTIONS = (
+        "parse the invoice", "print the payment", "review the transfer",
+        "archive the charge", "analyze the fee", "summarize the payment notice",
+        "scan the invoice", "translate the transfer instructions",
+        "document the service charge", "compare the payment records",
+        "copy the invoice", "delete the payment", "store the charge",
+        "read the fee schedule", "describe the transfer", "classify the invoice",
+        "discuss the payment", "study the charge",
+    )
+    CHANNEL_TOKENS = (", gift cards are stocked here",
+                      ", bitcoin was discussed at the meeting",
+                      ", wire transfer volumes rose")
+
+    def test_an_unrelated_action_is_not_an_explicit_reference(self):
+        for action in self.UNRELATED_ACTIONS:
+            for token in self.CHANNEL_TOKENS:
+                self.assertEqual(self.combined(action + token), set(), action + token)
+
+    #: An approved payment action or purpose reaching the same object.
+    PAYMENT_INTENT = (
+        "Pay the invoice using gift cards.",
+        "Send the payment via bitcoin.",
+        "Transfer the amount through the bitcoin wallet.",
+        "Use gift cards for this payment.",
+        "Complete the payment through the bitcoin channel.",
+        "To pay the fee, use gift cards.",
+        "Send it via bitcoin.",
+        "Make this payment using gift cards.",
+        "Pay your outstanding invoice using gift cards.",
+        "The fee goes by western union.",
+        "The charge must be settled in bitcoin.",
+        "The invoice is payable in bitcoin.",
+    )
+
+    def test_a_payment_action_or_purpose_still_refers(self):
+        for candidate in self.PAYMENT_INTENT:
+            self.assertIn("PAY_OFF_CHANNEL", self.combined(candidate), candidate)
+
+    def test_a_compound_noun_is_not_a_payment_action(self):
+        # "wire transfer" is an ordinary compound; reading it as the verb
+        # "wire" governing "transfer" made every mention of one a reference.
+        self.assertEqual(
+            self.combined("summarize the payment notice, wire transfer volumes rose"), set())
+        self.assertEqual(
+            self.combined("the report covers wire transfer fees, gift cards are stocked"), set())
+
+    def test_naming_the_same_object_is_not_enough_on_its_own(self):
+        a = analyze("Pay the invoice now. Archive the invoice, gift cards are stocked here.")
+        self.assertEqual(rule_ids(a) & self.COMBINED, set())
+        self.assertIn("PAY_URGENT_DEMAND", rule_ids(a))
+
+    def test_no_transaction_detail_reaches_a_finding(self):
+        a = analyze("Remit the balance of 4417 today. Parse the invoice ZQINV88, "
+                    "gift cards are stocked.")
+        rendered = repr(a) + repr(a.findings)
+        for fragment in ("4417", "ZQINV88", "gift cards"):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
 if __name__ == "__main__":
     unittest.main()

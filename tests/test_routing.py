@@ -2255,5 +2255,92 @@ class PaymentEpisodeBindingTests(unittest.TestCase):
             self.assertNotIn(fragment, rendered, fragment)
 
 
+# ---------------------------------------------------------------------------
+# P2C3P1R -- a reference has to do something to the payment it names.
+# ---------------------------------------------------------------------------
+
+
+class PaymentIntentRoutingTests(unittest.TestCase):
+    """Integrated half of P2C3P1R. An unrelated action whose object happens
+    to be a financial noun used to reach the payment anchor next door, add a
+    substantive unusual-channel family, and turn a deferral into a
+    suppression."""
+
+    ANCHOR = "Remit the balance today."
+
+    def route_of(self, text, **kwargs):
+        a, _c, f, result = run_pipeline(text, **kwargs)
+        return (result.action, result.policy_id,
+                sorted({fi.rule_id for fi in a.findings}
+                       & {"PAY_OFF_CHANNEL", "PAY_THREAT_COMBINATION"}),
+                sorted(family.name for family in f.risk_families))
+
+    SEPARATORS = (". ", "; ", ": ", "\n", "\r\n", "\r", "\n- ", ", however ", " but ")
+
+    def test_an_unrelated_action_does_not_change_the_route(self):
+        anchor_only = self.route_of("Remit the balance today.")
+        self.assertIs(anchor_only[0], RoutingAction.DEFER)
+        for candidate in ("parse the invoice, gift cards are stocked here",
+                          "archive the charge, bitcoin was discussed",
+                          "summarize the payment notice, wire transfer volumes rose",
+                          "compare the payment records, itunes card sales fell"):
+            for separator in self.SEPARATORS:
+                for text in (f"Remit the balance today{separator}{candidate}",
+                             f"{candidate.capitalize()}{separator}Remit the balance today"):
+                    action, policy, combined, families = self.route_of(text)
+                    self.assertEqual(combined, [], text)
+                    self.assertNotIn("UNUSUAL_PAYMENT_CHANNEL", families, text)
+                    self.assertIs(action, RoutingAction.DEFER, text)
+                    self.assertEqual(policy, anchor_only[1], text)
+
+    def test_a_genuine_payment_reference_still_suppresses(self):
+        for candidate in ("Pay the invoice using gift cards.",
+                          "Send the payment via bitcoin.",
+                          "Use gift cards for this payment.",
+                          "Complete the payment through the bitcoin channel.",
+                          "Send it via bitcoin.",
+                          "The fee goes by western union."):
+            for text in (f"{self.ANCHOR} {candidate}", f"{candidate} {self.ANCHOR}"):
+                action, _policy, combined, _families = self.route_of(text)
+                self.assertNotEqual(combined, [], text)
+                self.assertIs(action, RoutingAction.SUPPRESS, text)
+
+    def test_an_unrelated_action_never_binds_however_many_anchors(self):
+        for prefix in ("Pay the invoice now.",
+                       "Pay the invoice now. Pay the invoice now.",
+                       "Pay the invoice now. Pay the invoice now. Pay the invoice now."):
+            _a, _p, combined, _f = self.route_of(
+                f"{prefix} Parse the invoice, gift cards are stocked here.")
+            self.assertEqual(combined, [], prefix)
+
+    def test_a_payment_reference_still_refuses_ambiguous_anchors(self):
+        for text in ("Pay the invoice for March now. Pay the invoice for April now. "
+                     "The invoice goes by gift cards.",
+                     "Send the payment for March now. Remit the payment for April today. "
+                     "The payment goes by gift cards."):
+            _a, _p, combined, _f = self.route_of(text)
+            self.assertEqual(combined, [], text)
+
+    def test_a_reference_never_spans_two_sources(self):
+        for label, ref, provenance, extracted in (
+            ("OCR payment action", IMAGE, Provenance.OCR_TEXT, "Pay the invoice using gift cards."),
+            ("ASR payment action", AUDIO, Provenance.ASR_TRANSCRIPT, "Send the payment via bitcoin."),
+            ("QR payment action", IMAGE_B, Provenance.QR_DERIVED, "Use gift cards for this payment."),
+        ):
+            analysis = MediaAnalysis(ref, ExtractionStatus.SUCCEEDED,
+                                     content=TextContent(extracted, provenance))
+            _a, _p, combined, _f = self.route_of(self.ANCHOR, attachment=ref, media=(analysis,))
+            self.assertEqual(combined, [], label)
+
+    def test_no_content_reaches_an_output(self):
+        text = ("Remit the balance of 4417 today. Parse the invoice ZQINV88, gift cards "
+                "are stocked, user zqxuser.")
+        a, c, f, result = run_pipeline(text)
+        rendered = " ".join((repr(a), repr(c), repr(f), repr(result),
+                             repr(result.serialize()), repr(result.contributors)))
+        for fragment in ("4417", "ZQINV88", "zqxuser", "gift cards", text):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
 if __name__ == "__main__":
     unittest.main()

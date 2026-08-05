@@ -1150,12 +1150,62 @@ def _is_ordinary(signal: _Signal) -> bool:
 # link is left to semantic analysis this layer deliberately does not attempt.
 # ---------------------------------------------------------------------------
 
+#: The financial nouns a reference can be about.
+_REFERENCE_OBJECT = r"(?:payment|fee|amount|transfer|charge|invoice|balance|sum)"
+
+#: The determiner an action's object must carry, and the bounded run of
+#: qualifiers that may sit between them. The determiner is required, not
+#: optional: without it "wire transfer" -- an ordinary compound noun -- reads
+#: as the verb "wire" governing "transfer", and every mention of a wire
+#: transfer becomes a payment instruction. Every member is closed-class, so
+#: the run can never carry the match into an unrelated noun phrase.
+_REFERENCE_DET = r"(?:the|this|that|a|an|your|our|their|my|its)"
+_REFERENCE_QUAL = (
+    r"(?:\s+(?:required|outstanding|full|remaining|same|above|attached|"
+    r"following|first|final|total|agreed|monthly|annual))*"
+)
+
+#: The payment actions a reference may perform. Enumerated, and deliberately
+#: not extended: this is the vocabulary that says money is being moved.
+_PAYMENT_ACTION = (
+    r"(?:pay|paying|send|sending|transfer|transferring|remit|remitting|settle|settling|"
+    r"submit|submitting|complete|completing|make|making|wire|wiring|clear|clearing)"
+)
+
+#: A bounded predicate saying that the named payment is to be made. Reached
+#: only across a closed run of auxiliaries, so it cannot be borrowed from a
+#: different subject later in the clause.
+_PAYMENT_PREDICATE = (
+    r"(?:goes? by|goes? through|paid|payable|settled|remitted|cleared|sent|transferred|due)"
+)
+_REFERENCE_AUX = (
+    r"(?:\s+(?:must|should|shall|will|would|can|could|may|is|are|was|were|be|being|been|"
+    r"to|now|then|only|also|still|already))*"
+)
+
 #: An adjacent clause pointing back at the anchored payment.
+#:
+#: A definite financial noun on its own is *not* a reference. "Parse the
+#: invoice", "archive the charge" and "summarize the payment notice" all name
+#: a payment and do nothing to it, and accepting them let an unrelated
+#: document-handling clause next to a real demand pull in a gift-card mention
+#: and suppress the message. Eligibility is therefore a positive grammar --
+#: an approved payment action governing the object, a bounded predicate
+#: saying the object is to be paid, a pronoun standing in for one, or an
+#: explicit payment purpose -- rather than a list of verbs to exclude.
 _PAYMENT_REFERENCE_RE = _c(
-    r"\b(?:this|that|the) (?:payment|fee|amount|transfer|charge|invoice|balance|sum)\b"
+    # An approved payment action governing a payment object.
+    r"\b" + _PAYMENT_ACTION + r"\b\s+" + _REFERENCE_DET + _REFERENCE_QUAL
+    + r"\s+" + _REFERENCE_OBJECT + r"\b"
+    # A named payment the clause says is to be paid.
+    r"|\b(?:this|that|the|your|our|my) " + _REFERENCE_OBJECT + r"\b"
+    + _REFERENCE_AUX + r"\s+" + _PAYMENT_PREDICATE + r"\b"
+    # A pronoun standing in for the payment.
     r"|\b(?:send|pay|transfer|complete|settle) it\b"
     r"|\bdo so\b"
-    r"|\b(?:to|for) (?:pay|the payment|the fee|the transfer|the amount|the charge)\b"
+    # An explicit payment purpose.
+    r"|\b(?:to|for) (?:pay|settle|complete|send|transfer|remit)\b"
+    r"|\b(?:to|for) (?:this|that|the|your|our|my) " + _REFERENCE_OBJECT + r"\b"
 )
 
 #: An adjacent clause continuing the anchored payment instruction.
@@ -1341,8 +1391,11 @@ def _relationship(
             return "REL_EXPLICIT_REFERENCE"
         if _COERCIVE_CONTINUATION_RE.search(other.clause):
             return "REL_CONTINUATION"
-        if _same_payment_episode(anchor.clause, other.clause):
-            return "REL_SHARED_PAYMENT_ROOT"
+        # Naming the same payment object in the next clause is not, by
+        # itself, a relationship either -- "pay the invoice now. archive the
+        # invoice" says nothing about how the invoice is paid. Both bounded
+        # forms above already require payment intent, so a same-episode
+        # candidate that shows none is left as an independent finding.
         return None
     # Past the adjacent clause the episode has to be re-established, not
     # merely mentioned: the same transaction, named again, with a payment
