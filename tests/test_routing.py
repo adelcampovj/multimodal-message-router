@@ -2342,5 +2342,80 @@ class PaymentIntentRoutingTests(unittest.TestCase):
             self.assertNotIn(fragment, rendered, fragment)
 
 
+# ---------------------------------------------------------------------------
+# P2C3P2 -- an advance fee has to be the price of a specific benefit.
+# ---------------------------------------------------------------------------
+
+
+class AdvanceFeeRoutingTests(unittest.TestCase):
+    """Integrated half of P2C3P2. A completed refund beside an unrelated bill
+    used to project an ``ADVANCE_FEE`` risk family, which is substantive and
+    therefore completes a two-family suppression with any real corroborator."""
+
+    def families_of(self, text, **kwargs):
+        a, _c, f, result = run_pipeline(text, **kwargs)
+        return ({fi.rule_id for fi in a.findings},
+                sorted(family.name for family in f.risk_families),
+                result.action, result.policy_id)
+
+    def test_unrelated_fragments_project_no_advance_fee_family(self):
+        for text in ("Your refund was processed; the subscription fee renews in March.",
+                     "Your reimbursement was approved\nInvoice 5512 is attached.",
+                     "The funds were returned to your account, however the bank fee changed."):
+            rules, families, _action, _policy = self.families_of(text)
+            self.assertNotIn("PAY_ADVANCE_FEE", rules, text)
+            self.assertNotIn("ADVANCE_FEE", families, text)
+
+    def test_an_unrelated_fragment_cannot_complete_a_suppression(self):
+        # Each half alone defers; the pair must still defer.
+        for corroborator in ("Do not verify with the bank.",
+                             "This is an official notice from your bank.",
+                             "Claim it at http://203.0.113.9/x"):
+            text = f"Your refund was processed; the subscription fee renews in March. {corroborator}"
+            _rules, families, action, _policy = self.families_of(text)
+            self.assertNotIn("ADVANCE_FEE", families, text)
+            self.assertIsNot(action, RoutingAction.SUPPRESS, text)
+
+    def test_a_genuine_advance_fee_scam_still_suppresses(self):
+        for text in ("Your refund is awaiting release. Pay a clearance fee to receive the "
+                     "refund. Do not verify with the bank.",
+                     "You have won a cash prize. Pay the release fee immediately to claim "
+                     "your reward. This is an official notice from your bank.",
+                     "To receive the refund:\n1. pay the processing charge\n"
+                     "2. provide your card details"):
+            _rules, families, action, _policy = self.families_of(text)
+            self.assertIn("ADVANCE_FEE", families, text)
+            self.assertIs(action, RoutingAction.SUPPRESS, text)
+
+    def test_ordinary_padding_does_not_hide_a_complete_episode(self):
+        core = "Your refund is awaiting release. Pay a clearance fee to receive the refund."
+        for text in (f"The rehearsal moved to seven. {core}",
+                     f"{core} Thanks and see you soon.",
+                     f"The rehearsal moved to seven. {core} Thanks and see you soon."):
+            rules, _families, _action, _policy = self.families_of(text)
+            self.assertIn("PAY_ADVANCE_FEE", rules, text)
+
+    def test_a_relationship_never_spans_two_sources(self):
+        for label, ref, provenance, extracted in (
+            ("OCR condition", IMAGE, Provenance.OCR_TEXT, "First, pay the clearance charge."),
+            ("ASR condition", AUDIO, Provenance.ASR_TRANSCRIPT, "Pay the clearance fee to receive it."),
+            ("QR condition", IMAGE_B, Provenance.QR_DERIVED, "Provide your card details."),
+        ):
+            analysis = MediaAnalysis(ref, ExtractionStatus.SUCCEEDED,
+                                     content=TextContent(extracted, provenance))
+            rules, _f, _a, _p = self.families_of("Your refund is awaiting release.",
+                                                 attachment=ref, media=(analysis,))
+            self.assertNotIn("PAY_ADVANCE_FEE", rules, label)
+
+    def test_no_content_reaches_an_output(self):
+        text = ("Your refund ZQTXN44 of 9912 is awaiting release. Pay a clearance fee of "
+                "250 to receive the refund, user zqxuser.")
+        a, c, f, result = run_pipeline(text)
+        rendered = " ".join((repr(a), repr(c), repr(f), repr(result),
+                             repr(result.serialize()), repr(result.contributors)))
+        for fragment in ("ZQTXN44", "9912", "250", "zqxuser", text):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
 if __name__ == "__main__":
     unittest.main()

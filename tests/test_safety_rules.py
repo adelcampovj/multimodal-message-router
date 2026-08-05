@@ -2364,5 +2364,105 @@ class PaymentIntentReferenceTests(unittest.TestCase):
             self.assertNotIn(fragment, rendered, fragment)
 
 
+class AdvanceFeeEpisodeTests(unittest.TestCase):
+    """Focused half of P2C3P2: an advance-fee episode is a benefit being
+    withheld until something is handed over.
+
+    The rule used to scan the whole message for a benefit noun and a fee noun
+    within forty characters of each other. That window crosses every
+    separator except a full stop, so "your refund was processed; the
+    subscription fee renews in March" -- a completed refund beside an
+    unrelated bill -- read as an advance-fee scam.
+    """
+
+    def fired(self, text):
+        return "PAY_ADVANCE_FEE" in rule_ids(analyze(text))
+
+    SEPARATORS = (". ", "; ", ": ", "\n", "\r\n", "\r", "\n\n", "\n- ", "\n* ",
+                  "\n• ", "\n1. ", "\n1) ", ", however ", " but ")
+
+    #: A benefit and a prerequisite that have nothing to do with each other.
+    UNRELATED = (
+        ("your refund was processed", "the subscription fee renews in march"),
+        ("your refund has been confirmed", "please pay the window cleaner"),
+        ("your reimbursement was approved", "invoice 5512 is attached for your records"),
+        ("the loyalty reward scheme opens in may", "the gym membership fee renews in march"),
+        ("the funds were returned to your account", "never share your passcode with anyone"),
+        ("your reimbursement was completed", "gift cards are stocked at the corner shop"),
+    )
+
+    def test_unrelated_benefit_and_condition_never_combine(self):
+        for benefit, condition in self.UNRELATED:
+            for separator in self.SEPARATORS:
+                self.assertFalse(self.fired(benefit + separator + condition),
+                                 f"{benefit!r}{separator!r}{condition!r}")
+                self.assertFalse(self.fired(condition + separator + benefit),
+                                 f"{condition!r}{separator!r}{benefit!r}")
+
+    def test_a_bare_fee_noun_is_not_a_prerequisite(self):
+        for text in ("your refund is pending; the fee",
+                     "your prize is waiting; a charge",
+                     "your payout is pending; payment"):
+            self.assertFalse(self.fired(text), text)
+
+    #: One bounded benefit-release episode, in each approved relationship.
+    RELATED = {
+        "same clause": "pay a processing fee to receive the refund",
+        "same clause, condition first": "a clearance fee applies before we release your payout",
+        "adjacent reference": "your refund is awaiting release. pay a clearance fee to "
+                              "receive the refund",
+        "adjacent pronoun": "your prize is ready. pay the delivery fee to claim it",
+        "continuation": "your refund is awaiting release. first, pay the clearance charge",
+        "shared benefit root": "your prize is waiting. pay the delivery charge for the prize",
+        "anchored list": "to receive the refund:\n- pay the processing charge",
+        "anchored numbered list": "to receive the refund:\n1. pay the processing charge",
+    }
+
+    def test_each_bounded_relationship_still_fires(self):
+        for label, text in self.RELATED.items():
+            self.assertTrue(self.fired(text), label)
+
+    def test_the_unsolicited_award_opener_is_self_contained(self):
+        for text in ("you have won a cash prize",
+                     "you are the winner of a lottery award",
+                     "you have been selected for a cash reward"):
+            self.assertTrue(self.fired(text), text)
+
+    def test_a_completed_benefit_cannot_anchor_a_condition(self):
+        for text in ("your refund was completed. first, pay the clearance charge",
+                     "your refund was completed. pay the clearance fee to receive it",
+                     "your reimbursement was already delivered. first, pay the clearance charge"):
+            self.assertFalse(self.fired(text), text)
+        # A later clause that is itself a complete episode still stands on its
+        # own account -- an earlier confirmation does not hide it (D-023).
+        self.assertTrue(
+            self.fired("your refund was completed. pay a clearance fee to receive the refund"))
+
+    def test_a_generic_reference_needs_exactly_one_live_benefit(self):
+        for text in ("your prize for march is waiting. your refund for april is pending. "
+                     "pay the clearance fee to receive it",
+                     "your payout for march is pending. your rebate for april is pending. "
+                     "first, pay the clearance fee"):
+            self.assertFalse(self.fired(text), text)
+        self.assertTrue(self.fired("your refund is pending. pay the clearance fee to receive it"))
+
+    def test_a_relationship_never_spans_two_sources(self):
+        benefit = TextContent("Your refund is awaiting release.", Provenance.AUTHORED_TEXT)
+        condition = MediaAnalysis(
+            IMAGE, ExtractionStatus.SUCCEEDED,
+            content=TextContent("First, pay the clearance charge.", Provenance.OCR_TEXT))
+        message = IncomingMessage("note-7712", READER, THREAD, WHEN,
+                                  body=benefit, attachment=IMAGE)
+        a = analyze_message(message, media_analyses=(condition,))
+        self.assertNotIn("PAY_ADVANCE_FEE", {f.rule_id for f in a.findings})
+
+    def test_no_benefit_detail_reaches_a_finding(self):
+        a = analyze("Your refund ZQTXN44 of 9912 is awaiting release. Pay a clearance fee "
+                    "of 250 to receive the refund.")
+        rendered = repr(a) + repr(a.findings)
+        for fragment in ("ZQTXN44", "9912", "250", "clearance"):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -337,7 +337,8 @@ def _side_is_independent(side: str) -> bool:
         _any(patterns, stripped)
         for patterns in (
             _PAYMENT_DEMAND, _THREAT, _OFF_CHANNEL, _SECRECY,
-            _ANTI_VERIFICATION, _ADVANCE_FEE, _IDENTITY_CLAIM, _TIME_PRESSURE,
+            _ANTI_VERIFICATION, _UNSOLICITED_WINNINGS, _BENEFIT_CLAIM,
+            _BENEFIT_CONDITION, _IDENTITY_CLAIM, _TIME_PRESSURE,
             # Routine billing is its own construction too: an invoice clause
             # must be separable from whatever follows the comma, or it
             # supplies "ordinary" cover for a demand that is not.
@@ -1035,12 +1036,54 @@ _ANTI_VERIFICATION = _compile_all(
     r"\b(?:do ?n[o']?t|dont)\b[^.]{0,20}\b(?:verify|confirm|double ?check)\b",
     r"\bthere is no need to (?:verify|confirm|check)\b",
 )
-_ADVANCE_FEE = _compile_all(
-    r"\b(?:you have )?(?:won|win|winner of|selected for)\b[^.]{0,40}"
+#: An unsolicited award. Self-contained: the whole construction sits in one
+#: clause, so it is a finding on its own account and never a synthesis of two
+#: fragments. "You have won a prize" is the opener of the scam, not half of it.
+_UNSOLICITED_WINNINGS = _compile_all(
+    r"\b(?:you have |you've )?(?:won|win|winner of|selected for)\b[^.]{0,40}"
     r"\b(?:prize|lottery|reward|gift|cash|award)\b",
-    r"\b(?:refund|rebate|compensation|claim)\b[^.]{0,40}"
-    r"\b(?:pay|fee|charge|processing|handling|release|clearance)\b",
-    r"\b(?:pay|send)\b[^.]{0,25}\b(?:processing|handling|clearance|release|delivery) fee\b",
+)
+
+#: An independently supported claim that something is owed to the reader.
+#: This is the *anchor* half of an advance-fee episode; on its own it says
+#: only that a benefit was mentioned, and produces no finding.
+_BENEFIT_CLAIM = _compile_all(
+    r"\b(?:your|a|an|the|this|that)\s+"
+    r"(?:refund|rebate|reimbursement|payout|compensation|prize|reward|winnings|settlement)\b",
+    r"\b(?:refund|rebate|reimbursement|payout|compensation|prize|reward|winnings)\b"
+    r"[^,;:]{0,25}\b(?:is|are|has been|have been|awaits|awaiting|pending|ready|available|owed)\b",
+    r"\b(?:funds|money|balance)\b[^,;:]{0,25}"
+    r"\b(?:returned|released|awaiting release|owed to you|to be released)\b",
+    r"\b(?:claim|claimable) (?:balance|amount|funds|sum)\b",
+)
+
+#: An independently supported prerequisite. A fee noun, a payment noun, a
+#: credential noun or a channel token on its own is *not* one: the clause has
+#: to say that something must be handed over. Each bound stops at a
+#: sub-clause separator so a prerequisite cannot be assembled across one.
+_BENEFIT_CONDITION = _compile_all(
+    r"\b(?:pay|paying|send|sending|submit|submitting|remit|remitting|transfer|"
+    r"transferring|deposit)\b[^,;:]{0,30}\b(?:fee|charge|deposit|payment|amount|transfer)\b",
+    r"\b(?:fee|charge|deposit|payment|transfer)\b[^,;:]{0,25}"
+    r"\b(?:applies|is required|are required|must be paid|is paid|has been paid|"
+    r"is payable|is outstanding)\b",
+    r"\b(?:processing|handling|clearance|release|delivery|administration|customs)\s+"
+    r"(?:fee|charge|payment)\b",
+    r"\b(?:gift ?cards?|bitcoin|btc|ethereum|crypto|usdt|wallet address|western union|"
+    r"moneygram)\b",
+    r"\b(?:provide|submit|confirm|send)\b[^,;:]{0,25}"
+    r"\b(?:card (?:number|details)|bank details|account details|passcode|password|pin|otp|"
+    r"credentials)\b",
+)
+
+#: A benefit that has already arrived cannot be held hostage. Read only from
+#: the benefit's own clause, and used only here -- this is advance-fee
+#: eligibility, not a general statement about completed or historical text.
+_BENEFIT_COMPLETED_RE = _c(
+    r"\b(?:was|were|has been|have been|is|are)\s+(?:already\s+)?"
+    r"(?:processed|issued|completed|confirmed|deposited|delivered|applied|refunded|"
+    r"paid|settled|returned|credited|received)\b"
+    r"|\balready (?:delivered|received|paid|credited|refunded)\b"
 )
 _ORDINARY_BILLING = _compile_all(
     r"\binvoice\b", r"\breceipt\b", r"\bstatement\b", r"\bdue date\b",
@@ -1422,24 +1465,29 @@ def _intervening_episode(anchor: int, other: int, local: _LocalContext) -> bool:
 #: Relationships that identify their anchor structurally. Nothing about them
 #: can be ambiguous: the anchor is the clause the signal sits in, or the
 #: clause that opened the group it sits in.
-_UNAMBIGUOUS_RELATIONSHIPS = frozenset({"REL_SAME_CLAUSE", "REL_ANCHORED_LIST"})
+_UNAMBIGUOUS_RELATIONSHIPS = frozenset(
+    {"REL_SAME_CLAUSE", "REL_ANCHORED_LIST",
+     "REL_BENEFIT_SAME_CLAUSE", "REL_BENEFIT_ANCHORED_LIST"}
+)
 
 
-def _bound_to_payment(
-    anchor: _Signal, other: _Signal, local: _LocalContext, text: str
-) -> bool:
-    """True when some occurrence of ``other`` binds to some payment anchor.
+def _bound_occurrences(
+    anchor: _Signal, other: _Signal, local: _LocalContext, text: str,
+    relate, distinct,
+) -> tuple[_Occurrence, ...]:
+    """Every occurrence of ``other`` that some anchor binds, in order.
 
-    Where more than one payment anchor is in range of the same signal and
-    those anchors name different transactions, the grammar cannot say which
-    one the signal is about -- so it says nothing. Both findings survive
-    independently and no combination is formed.
+    Where more than one anchor is in range of the same signal and those
+    anchors name different episodes, the grammar cannot say which one the
+    signal is about -- so it says nothing about that occurrence. Both
+    findings survive independently and no combination is formed.
     """
+    bound: list[_Occurrence] = []
     for other_occurrence in other.occurrences:
         reached: list[_Occurrence] = []
         structural = False
         for anchor_occurrence in anchor.occurrences:
-            relationship = _relationship(anchor_occurrence, other_occurrence, local, text)
+            relationship = relate(anchor_occurrence, other_occurrence, local, text)
             if relationship is None:
                 continue
             if relationship in _UNAMBIGUOUS_RELATIONSHIPS:
@@ -1447,18 +1495,183 @@ def _bound_to_payment(
                 break
             reached.append(anchor_occurrence)
         if structural:
-            return True
+            bound.append(other_occurrence)
+            continue
         if not reached:
             continue
         candidates = {occurrence.index: occurrence.clause for occurrence in reached}
         if len(candidates) > 1 and any(
-            _distinct_episode(left, right)
+            distinct(left, right)
             for left in candidates.values()
             for right in candidates.values()
         ):
             continue  # competing anchors; do not guess which one it modifies
+        bound.append(other_occurrence)
+    return tuple(bound)
+
+
+def _bound_to_payment(
+    anchor: _Signal, other: _Signal, local: _LocalContext, text: str
+) -> bool:
+    """True when some occurrence of ``other`` binds to some payment anchor."""
+    return bool(
+        _bound_occurrences(anchor, other, local, text, _relationship, _distinct_episode)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Binding an advance-fee condition to the benefit it gates.
+#
+# "You have won a refund; a clearance fee applies to release it" is one
+# construction spread over two clauses, and the rule that found it used to
+# scan the whole message for a benefit noun and a fee noun within forty
+# characters of each other. That window crosses every separator except a full
+# stop, so "your refund was processed; the subscription fee renews in March"
+# -- a completed refund and an unrelated bill -- read as an advance-fee scam.
+#
+# The condition now has to name the benefit it gates, through the same five
+# bounded relationships the payment rules use. Where the grammar cannot prove
+# the link, both halves stay independent observations.
+# ---------------------------------------------------------------------------
+
+#: An adjacent clause naming, by family, the benefit the condition gates.
+#: Naming it is what makes the reference unambiguous.
+_BENEFIT_REFERENCE_RE = _c(
+    r"\bto (?:receive|claim|release|obtain|unlock|collect|access|get)\s+"
+    r"(?:the|this|that|your|a|an)?\s*(?:refund|rebate|reimbursement|payout|compensation|"
+    r"prize|reward|winnings|funds|money)\b"
+    r"|\b(?:to|for) (?:this|that|the|your) (?:refund|rebate|reimbursement|payout|"
+    r"compensation|prize|reward|winnings|funds)\b"
+)
+
+#: The same relationship, expressed without saying which benefit. A pronoun
+#: or a bare release verb points at *a* benefit, and where the message names
+#: more than one there is no structural way to say which -- so these forms
+#: are admitted only when exactly one live benefit episode exists.
+_GENERIC_BENEFIT_REFERENCE_RE = _c(
+    r"\bto (?:receive|claim|release|obtain|unlock|collect|access|get) it\b"
+    r"|\bbefore (?:we |you )?(?:can )?(?:receive|release|send|transfer|issue|pay)\b"
+    r"|\bto (?:receive|claim|release|obtain|unlock|collect)\b"
+    r"|\b(?:to|for) (?:this|that|the) claim\b"
+)
+
+#: An adjacent clause stating a prerequisite or a release ordering.
+_BENEFIT_CONTINUATION_RE = _c(
+    r"\bfirst\b"
+    r"|\bbefore (?:receiving|release|releasing|delivery|we can|you can)\b"
+    r"|\bafter (?:payment|the fee is paid|the charge is paid)\b"
+    r"|\bonce the (?:processing |handling |clearance |release |delivery )?"
+    r"(?:fee|charge|payment|deposit) (?:is |has been )?(?:paid|cleared|received)\b"
+    r"|\brequired to (?:claim|receive|release|unlock|process|collect)\b"
+    r"|\bto process (?:the|your) claim\b|\bto unlock (?:the|your) funds\b"
+    r"|\bin order to (?:receive|claim|release|obtain|collect)\b"
+)
+
+#: The bounded benefit objects two clauses may share.
+_BENEFIT_OBJECT_RE = _c(
+    r"\b(?:the|this|that|your) (refund|rebate|reimbursement|payout|compensation|"
+    r"prize|reward|winnings|claim|funds)\b"
+)
+
+
+def _benefit_objects(clause: str) -> frozenset[tuple[str, str]]:
+    """Every definite benefit object in ``clause``, as (family, qualifier).
+
+    Same shape and the same closed qualifier vocabulary as the payment
+    objects: a bounded family identifier and a bounded qualifier, compared
+    and discarded. No clause, amount or identifier is retained.
+    """
+    objects: set[tuple[str, str]] = set()
+    for match in _BENEFIT_OBJECT_RE.finditer(clause):
+        tail = clause[match.end():]
+        qualifier = ""
+        attached = _OBJECT_QUALIFIER_RE.match(tail)
+        if attached is not None:
+            qualifier = next(group for group in attached.groups() if group)
+        elif _PAST_PERIOD_RE.match(tail):
+            qualifier = "past-period"
+        objects.add((match.group(1), qualifier))
+    return frozenset(objects)
+
+
+def _same_benefit_episode(left: str, right: str) -> bool:
+    """True when both clauses name one benefit rather than two."""
+    left_objects, right_objects = _benefit_objects(left), _benefit_objects(right)
+    if not (left_objects and right_objects):
+        return False
+    return any(
+        family == other_family and qualifier == other_qualifier
+        for family, qualifier in left_objects
+        for other_family, other_qualifier in right_objects
+    )
+
+
+def _distinct_benefit_episode(left: str, right: str) -> bool:
+    """True when an explicit qualifier says the two clauses name two benefits."""
+    left_objects, right_objects = _benefit_objects(left), _benefit_objects(right)
+    if not (left_objects and right_objects):
+        return False
+    if _same_benefit_episode(left, right):
+        return False
+    shared = {family for family, _q in left_objects} & {family for family, _q in right_objects}
+    if shared:
         return True
-    return False
+    return all(qualifier for _f, qualifier in left_objects) and all(
+        qualifier for _f, qualifier in right_objects
+    )
+
+
+def _benefit_relationship(
+    anchor: _Occurrence, other: _Occurrence, local: _LocalContext, text: str
+) -> str | None:
+    """The bounded relationship gating ``other`` on a benefit anchor, if any."""
+    if anchor.index < 0 or other.index < 0:
+        return None
+    if _BENEFIT_COMPLETED_RE.search(anchor.clause):
+        # A refund that has already arrived is not being withheld pending a
+        # fee, so it cannot anchor a release condition.
+        return None
+    if anchor.index == other.index:
+        return "REL_BENEFIT_SAME_CLAUSE"
+    if _in_anchored_list(anchor.index, other.index, local, text):
+        return "REL_BENEFIT_ANCHORED_LIST"
+    if abs(anchor.index - other.index) == 1:
+        if _distinct_benefit_episode(anchor.clause, other.clause):
+            return None
+        if _BENEFIT_REFERENCE_RE.search(other.clause):
+            return "REL_BENEFIT_REFERENCE"
+        if _same_benefit_episode(anchor.clause, other.clause):
+            return "REL_BENEFIT_SHARED_ROOT"
+        if _GENERIC_BENEFIT_REFERENCE_RE.search(other.clause):
+            return "REL_BENEFIT_REFERENCE_GENERIC"
+        if _BENEFIT_CONTINUATION_RE.search(other.clause):
+            return "REL_BENEFIT_CONTINUATION"
+    return None
+
+
+#: Relationships that do not say which benefit they are about.
+_GENERIC_BENEFIT_RELATIONSHIPS = frozenset(
+    {"REL_BENEFIT_REFERENCE_GENERIC", "REL_BENEFIT_CONTINUATION"}
+)
+
+
+def _benefit_anchor_ambiguity(signal: _Signal) -> bool:
+    """True when a generic reference could not say which benefit it means.
+
+    Only *live* anchors count: a benefit the message says has already
+    arrived is not being withheld, so it is not a candidate. One anchor
+    clause is never ambiguous; two that nothing tells apart always are.
+    """
+    live = [
+        occurrence for occurrence in signal.occurrences
+        if not _BENEFIT_COMPLETED_RE.search(occurrence.clause)
+    ]
+    if len({occurrence.index for occurrence in live}) <= 1:
+        return False
+    episodes: set[tuple[str, str]] = set()
+    for occurrence in live:
+        episodes |= _benefit_objects(occurrence.clause)
+    return len(episodes) != 1
 
 
 def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
@@ -1470,11 +1683,32 @@ def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHi
     threat = _collect_signal(_THREAT, text, local)
     secrecy = _collect_signal(_SECRECY, text, local)
     anti_verification = _collect_signal(_ANTI_VERIFICATION, text, local)
-    # The advance-fee rule is itself a cross-clause relationship the design
-    # already approves -- "you have won a refund; a clearance fee applies to
-    # release it" is one construction spread over two clauses -- so it keeps
-    # its whole-text scan.
-    advance_fee = _collect_signal(_ADVANCE_FEE, text, local, confined=False)
+    # An advance-fee episode is a benefit being withheld until something is
+    # handed over. Both halves are collected where they sit, and the
+    # condition has to reach the benefit through one of the five bounded
+    # relationships -- a benefit noun somewhere and a fee noun somewhere else
+    # is not an episode. The unsolicited-award opener is separate: it is one
+    # self-contained clause, not two fragments joined.
+    winnings = _collect_signal(_UNSOLICITED_WINNINGS, text, local)
+    benefit = _collect_signal(_BENEFIT_CLAIM, text, local)
+    condition = _collect_signal(_BENEFIT_CONDITION, text, local)
+    ambiguous_benefit = _benefit_anchor_ambiguity(benefit)
+
+    def relate_benefit(anchor, other, local_context, source):
+        relationship = _benefit_relationship(anchor, other, local_context, source)
+        if ambiguous_benefit and relationship in _GENERIC_BENEFIT_RELATIONSHIPS:
+            # More than one benefit is in play and the clause does not say
+            # which; guessing would join two unrelated episodes.
+            return None
+        return relationship
+
+    gated = _bound_occurrences(
+        benefit, condition, local, text, relate_benefit, _distinct_benefit_episode
+    )
+    advance_fee = _Signal(
+        winnings.occurrences + gated,
+        winnings.unframed or any(not o.flags.is_discussion for o in gated),
+    )
     ordinary = _is_ordinary(demand)
 
     def severity_for(signal: _Signal, base: Severity) -> Severity:
