@@ -297,13 +297,19 @@ _WEAK_SEPARATOR_RE = _c(
 )
 
 
-def _side_is_independent(side: str) -> bool:
+def _side_is_independent(side: str, lookahead: str = "") -> bool:
     """True when a side carries framing or an independently matchable rule.
 
     Structural only: it asks whether an existing pattern fires, never what
     the words mean. Requiring this on *both* sides is what keeps a noun
     phrase like "doctors and nurses" or a coordinated object like "the PIN
     and account number" from being torn in half.
+
+    ``lookahead`` extends **only** the destination test, and only as far as
+    the end of the same line. A dotted address is cut in half by its own
+    full stops before this ever sees it, so a side whose whole content is a
+    destination would otherwise arrive here as the bare word before the
+    dots -- carrying nothing, and taking its boundary down with it.
     """
     stripped = side.strip()
     if len(stripped) < 3:
@@ -329,6 +335,14 @@ def _side_is_independent(side: str) -> bool:
         if request_pattern.search(stripped):
             return True
     if _MESSAGE_TRANSMISSION_RE.search(stripped):
+        return True
+    # A deceptive destination is a finding in its own right, so a side that
+    # is nothing but one is evaluable on its own. Leaving it out meant the
+    # boundary in front of it was refused: "pay now, however <unrelated
+    # deceptive address>" stayed one clause, and two unrelated episodes were
+    # read as one instruction -- which a full stop in the same place did not
+    # do. An ordinary address is still not a finding and still does not split.
+    if _has_deceptive_link(stripped) or (lookahead and _has_deceptive_link(lookahead)):
         return True
     # The financial, identity and pressure families count too. Without them
     # a side carrying nothing but a coercive demand was not "independently
@@ -373,12 +387,18 @@ def _segment(text: str, boundaries: tuple[int, ...] = ()) -> list[tuple[int, int
         start = cut_end
     spans.append((start, len(text)))
 
+    # Where each line ends, for the bounded destination lookahead below. These
+    # are the typed boundaries the normalizer produced -- never a character
+    # the message chose, and never an arbitrary window.
+    line_ends = sorted(boundaries) + [len(text)]
+
     refined: list[tuple[int, int]] = []
     for span_start, span_end in spans:
         cursor = span_start
         for match in _WEAK_SEPARATOR_RE.finditer(text, span_start, span_end):
             left, right = text[cursor:match.start()], text[match.end():span_end]
-            if _side_is_independent(left) and _side_is_independent(right):
+            ahead = text[match.end():next(e for e in line_ends if e >= match.end())]
+            if _side_is_independent(left) and _side_is_independent(right, ahead):
                 refined.append((cursor, match.start()))
                 cursor = match.end()
         refined.append((cursor, span_end))
@@ -2180,33 +2200,20 @@ def _competing_episode(local: _LocalContext, text: str) -> bool:
     return len(claim_clauses) > 1
 
 
-def _evaluate_links(
-    norm: NormalizedText, local: _LocalContext, demand: _Signal
-) -> list[RuleHit]:
-    text = norm.security
-    hits: list[RuleHit] = []
-    seen_rules: set[str] = set()
-    position = {"at": 0}
+def _deceptive_link_hits(text: str):
+    """Every substantive deceptive-destination observation in ``text``.
 
-    def add(rule_id: str, severity: Severity, diagnostic: DiagnosticCode) -> None:
-        if rule_id in seen_rules:
-            return
-        seen_rules.add(rule_id)
-        ctx = local.at(position["at"])
-        hits.append(
-            RuleHit(
-                FindingCategory.DECEPTIVE_LINK,
-                Severity.WEAK if ctx.is_discussion else severity,
-                rule_id,
-                diagnostic,
-                ambiguous=ctx.is_discussion,
-                indicators=_payment_episode_marker(local.index_at(position["at"]), demand,
-                                                  local, text),
-            )
-        )
+    One source of truth for what counts as a deceptive destination. The link
+    rules read it to build findings, and the clause segmenter reads it to
+    decide whether a side carrying nothing but a destination is
+    independently evaluable -- which it plainly is, and which it was not
+    counted as before: a comma-and-transition in front of such a side had its
+    boundary refused, leaving an unrelated demand and an unrelated
+    destination sharing one clause.
 
+    Yields ``(position, rule_id, severity, diagnostic)`` in a fixed order.
+    """
     for match in _URL_RE.finditer(text):
-        position["at"] = match.start()
         raw = match.group(0).rstrip(".,;:!?")
         host = _host_of(raw)
         if not host:
@@ -2216,22 +2223,26 @@ def _evaluate_links(
         if "@" in netloc:
             # Everything before "@" is userinfo, not the destination -- a
             # classic way to make a link read as one site and go to another.
-            add("LNK_USERINFO", Severity.SUSPICIOUS, DiagnosticCode.EMBEDDED_CREDENTIALS_IN_URL)
+            yield (match.start(), "LNK_USERINFO", Severity.SUSPICIOUS,
+                   DiagnosticCode.EMBEDDED_CREDENTIALS_IN_URL)
         if _is_raw_ip(host):
-            add("LNK_RAW_IP", Severity.SUSPICIOUS, DiagnosticCode.RAW_IP_HOST)
+            yield (match.start(), "LNK_RAW_IP", Severity.SUSPICIOUS,
+                   DiagnosticCode.RAW_IP_HOST)
         if "xn--" in host:
-            add("LNK_PUNYCODE", Severity.SUSPICIOUS, DiagnosticCode.PUNYCODE_HOST)
+            yield (match.start(), "LNK_PUNYCODE", Severity.SUSPICIOUS,
+                   DiagnosticCode.PUNYCODE_HOST)
 
         label = _registrable_label(host)
         if label.count("-") >= 2 and _DECEPTIVE_LABEL_RE.search(label):
-            add("LNK_DECEPTIVE_LABEL", Severity.SUSPICIOUS, DiagnosticCode.LOOKALIKE_HOST)
+            yield (match.start(), "LNK_DECEPTIVE_LABEL", Severity.SUSPICIOUS,
+                   DiagnosticCode.LOOKALIKE_HOST)
         elif host.count(".") >= 3 and _DECEPTIVE_LABEL_RE.search(host.split(".")[0]):
             # A service-sounding word buried in a subdomain while the real
             # registrable domain is something else entirely.
-            add("LNK_SUBDOMAIN_DISGUISE", Severity.SUSPICIOUS, DiagnosticCode.LOOKALIKE_HOST)
+            yield (match.start(), "LNK_SUBDOMAIN_DISGUISE", Severity.SUSPICIOUS,
+                   DiagnosticCode.LOOKALIKE_HOST)
 
     for label_match in _MARKDOWN_LINK_RE.finditer(text):
-        position["at"] = label_match.start()
         label_text, target = label_match.group(1), label_match.group(2)
         target_host = _host_of(target)
         if not target_host:
@@ -2240,12 +2251,42 @@ def _evaluate_links(
             candidate_host = candidate.lower()
             if "." in candidate_host and candidate_host != target_host:
                 if not target_host.endswith("." + candidate_host):
-                    add(
-                        "LNK_DISPLAY_MISMATCH",
-                        Severity.SUSPICIOUS,
-                        DiagnosticCode.DISPLAY_TARGET_MISMATCH,
-                    )
+                    yield (label_match.start(), "LNK_DISPLAY_MISMATCH", Severity.SUSPICIOUS,
+                           DiagnosticCode.DISPLAY_TARGET_MISMATCH)
                 break
+
+
+def _has_deceptive_link(text: str) -> bool:
+    """True when ``text`` carries a substantive deceptive destination.
+
+    An ordinary address is not one: this asks the same question the link
+    rules ask, so nothing here is a second opinion about what a link is.
+    """
+    return next(_deceptive_link_hits(text), None) is not None
+
+
+def _evaluate_links(
+    norm: NormalizedText, local: _LocalContext, demand: _Signal
+) -> list[RuleHit]:
+    text = norm.security
+    hits: list[RuleHit] = []
+    seen_rules: set[str] = set()
+    for position, rule_id, severity, diagnostic in _deceptive_link_hits(text):
+        if rule_id in seen_rules:
+            continue
+        seen_rules.add(rule_id)
+        ctx = local.at(position)
+        hits.append(
+            RuleHit(
+                FindingCategory.DECEPTIVE_LINK,
+                Severity.WEAK if ctx.is_discussion else severity,
+                rule_id,
+                diagnostic,
+                ambiguous=ctx.is_discussion,
+                indicators=_payment_episode_marker(local.index_at(position), demand,
+                                                   local, text),
+            )
+        )
     return hits
 
 

@@ -2621,5 +2621,54 @@ class NarrativeContextTests(unittest.TestCase):
             self.assertNotIn(fragment, rendered, fragment)
 
 
+class AdversativeBoundaryTests(unittest.TestCase):
+    """A side carrying nothing but a deceptive destination is evaluable on
+    its own, so the adversative in front of it takes its boundary.
+
+    It did not, because the link family was missing from the independence
+    test -- and a dotted address is cut in half by its own full stops before
+    that test ever sees it, so the side arrived as the bare word before the
+    dots. Two unrelated episodes then shared one clause.
+    """
+
+    TRANSITIONS = (", however ", ", but ", ", yet ", ", nevertheless ", ", instead ",
+                   ", then ", ", therefore ", ", still ", " but ", " yet ",
+                   " and then ", " while ", " although ")
+
+    def test_a_deceptive_destination_makes_its_side_evaluable(self):
+        for transition in self.TRANSITIONS:
+            text = (f"remit the balance today{transition}"
+                    "the staff rota is at http://203.0.113.9/rota")
+            spans = _segment(text)
+            self.assertEqual(text[spans[0][0]:spans[0][1]].strip(),
+                             "remit the balance today", transition)
+
+    def test_the_demand_and_the_destination_land_in_different_clauses(self):
+        text = ("remit the balance today, however the staff rota is at "
+                "http://203.0.113.9/rota")
+        spans = _segment(text)
+        first = text[spans[0][0]:spans[0][1]]
+        self.assertEqual(first.strip(), "remit the balance today")
+
+    def test_an_ordinary_address_does_not_make_a_side_evaluable(self):
+        self.assertFalse(_side_is_independent("the menu is at http://example.org/menu"))
+        self.assertTrue(_side_is_independent("the rota is at http://203.0.113.9/rota"))
+
+    def test_the_lookahead_reaches_only_to_the_end_of_the_line(self):
+        # The destination sits on the next line, so it cannot rescue this side.
+        text = "remit the balance today, however see below"
+        self.assertEqual(len(_segment(text)), 1)
+
+    def test_a_coordinated_noun_phrase_is_still_not_split(self):
+        self.assertEqual(len(_segment("the pin and account number are on the card")), 1)
+
+    def test_no_destination_text_reaches_a_finding(self):
+        a = analyze("remit the balance today, however the rota ZQROTA9 is at "
+                    "http://203.0.113.9/zqpath")
+        rendered = repr(a) + repr(a.findings)
+        for fragment in ("ZQROTA9", "zqpath", "203.0.113.9"):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
 if __name__ == "__main__":
     unittest.main()

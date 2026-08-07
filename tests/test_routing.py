@@ -2735,6 +2735,79 @@ class BoundedEscalationTests(unittest.TestCase):
             self.assertIsNot(severity, Severity.SEVERE, provenance.name)
             self.assertFalse(veto, provenance.name)
 
+    #: Every transition the weak-separator grammar already reviews.
+    TRANSITIONS = (", however ", ", but ", ", yet ", ", nevertheless ", ", instead ",
+                   ", then ", ", therefore ", ", still ", " but ", " yet ",
+                   " and then ", " while ", " although ")
+    #: Independently substantive, and about something else entirely.
+    UNRELATED_AFTER_TRANSITION = (
+        ("raw-IP destination", "the staff rota is at http://203.0.113.9/rota"),
+        ("lookalike domain", "the canteen menu is at http://secure-verify-account.example/menu"),
+        ("another account's destination", "your mailbox settings are at http://203.0.113.9/mailbox"),
+        ("unrelated organisation", "this is an official notice from the transport authority"),
+        ("another account's identity", "this is an official notice from your library account"),
+    )
+
+    def test_a_transition_does_not_join_unrelated_episodes(self):
+        # A full stop in the same place has always kept these apart; an
+        # adversative must not do less, or two unrelated episodes share one
+        # clause and a merely suspicious pair becomes a hard veto.
+        for label, neighbour in self.UNRELATED_AFTER_TRANSITION:
+            for transition in self.TRANSITIONS:
+                for text in (f"Remit the balance today{transition}{neighbour}",
+                             f"{neighbour.capitalize()}{transition}remit the balance today"):
+                    severity, veto, _action, policy, _roots = self.probe(text)
+                    self.assertIsNot(severity, Severity.SEVERE, f"{label}: {text!r}")
+                    self.assertFalse(veto, f"{label}: {text!r}")
+                    self.assertNotEqual(policy, "route.safety.hard_veto", f"{label}: {text!r}")
+
+    def test_a_transition_matches_the_full_stop_it_replaces(self):
+        neighbour = "the staff rota is at http://203.0.113.9/rota"
+        baseline = self.probe(f"Remit the balance today. {neighbour}")
+        for transition in self.TRANSITIONS:
+            result = self.probe(f"Remit the balance today{transition}{neighbour}")
+            self.assertEqual(result[0], baseline[0], transition)
+            self.assertEqual(result[1], baseline[1], transition)
+            self.assertEqual(result[3], baseline[3], transition)
+
+    def test_both_findings_survive_a_transition(self):
+        _severity, _veto, action, _policy, roots = self.probe(
+            "Remit the balance today, however the staff rota is at http://203.0.113.9/rota")
+        self.assertIn("COERCIVE_PAYMENT", roots)
+        self.assertIn("DECEPTIVE_LINK", roots)
+        self.assertIs(action, RoutingAction.SUPPRESS)
+
+    def test_an_explicit_reference_survives_a_transition(self):
+        # The reference, not the transition word, is what joins the episode.
+        for text in (
+            "Pay the fee now, but use this link to complete the payment http://203.0.113.9/pay",
+            "Send the transfer now, then use this payment destination http://203.0.113.9/pay",
+            "Pay the fee now, however the link for this payment is http://203.0.113.9/pay",
+            "Pay the fee now, while the account requesting this payment says this is an "
+            "official notice from your bank.",
+        ):
+            severity, veto, _a, policy, _r = self.probe(text)
+            self.assertIs(severity, Severity.SEVERE, text)
+            self.assertTrue(veto, text)
+            self.assertEqual(policy, "route.safety.hard_veto", text)
+
+    def test_a_unified_same_clause_episode_is_untouched(self):
+        for text in ("Remit the balance today at http://203.0.113.9/pay",
+                     "Pay the fee now at http://secure-verify-account.example/pay",
+                     "This is an official notice from your bank, pay immediately or face "
+                     "penalty."):
+            severity, veto, _a, policy, _r = self.probe(text)
+            self.assertIs(severity, Severity.SEVERE, text)
+            self.assertTrue(veto, text)
+            self.assertEqual(policy, "route.safety.hard_veto", text)
+
+    def test_an_ordinary_address_still_does_not_split_a_phrase(self):
+        # Only a *deceptive* destination makes a side evaluable on its own.
+        severity, veto, _a, _p, _r = self.probe(
+            "Remit the balance today, however the menu is at http://example.org/menu")
+        self.assertIsNot(severity, Severity.SEVERE)
+        self.assertFalse(veto)
+
 
 if __name__ == "__main__":
     unittest.main()
