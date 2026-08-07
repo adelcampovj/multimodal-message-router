@@ -2921,5 +2921,126 @@ class PassiveWarningRoutingTests(unittest.TestCase):
         self.assertEqual(policy, "route.safety.hard_veto")
 
 
+class CommaTerminationRoutingTests(unittest.TestCase):
+    """P2C3QR4-F001 end to end. Seventeen boundaries ended a warning's
+    protected span and the comma did not, so the same demand routed to
+    ``route.safety.hard_veto`` after a full stop and to ``safe_defer`` after a
+    comma -- a hard-veto bypass costing one keystroke."""
+
+    def probe(self, text, **kwargs):
+        a, _c, _f, result = run_pipeline(text, **kwargs)
+        return a.highest_severity, a.hard_veto_required, result.action, result.policy_id
+
+    def test_a_request_after_a_comma_is_suppressed(self):
+        for warning in ("Never share your passcode with anyone",
+                        "Do not send your OTP to anyone",
+                        "Your passcode should never be disclosed",
+                        "Callers must never be given your card details"):
+            for comma in (", ", ", now ", ", please ", ","):
+                for request in ("send me your passcode", "reply with your OTP",
+                                "message me your card details",
+                                "your passcode must be sent to me"):
+                    text = warning + comma + request
+                    label = f"{warning}|{comma!r}|{request}"
+                    severity, veto, action, policy = self.probe(text)
+                    self.assertIs(severity, Severity.SEVERE, label)
+                    self.assertTrue(veto, label)
+                    self.assertIs(action, RoutingAction.SUPPRESS, label)
+                    self.assertEqual(policy, "route.safety.hard_veto", label)
+
+    def test_a_warning_after_a_comma_does_not_erase_the_request(self):
+        for request in ("Send me your passcode", "Reply with your OTP",
+                        "Message me your card details"):
+            for warning in ("never share it with anyone",
+                            "never share your passcode with anyone",
+                            "your passcode should never be disclosed"):
+                text = request + ", " + warning
+                label = f"{request}|{warning}"
+                severity, veto, action, policy = self.probe(text)
+                self.assertIs(severity, Severity.SEVERE, label)
+                self.assertTrue(veto, label)
+                self.assertEqual(policy, "route.safety.hard_veto", label)
+
+    def test_the_comma_routes_the_same_as_every_other_boundary(self):
+        routes = set()
+        for separator in (", ", ". ", "; ", ": ", "\n", "\r\n", "\r", ", but ",
+                          ", however ", ", instead ", ", then ", "\n- ", "\n1. ",
+                          "\n1) ", "\n\n"):
+            _s, _v, _a, policy = self.probe(
+                "Never share your passcode with anyone" + separator
+                + "send me your passcode now")
+            routes.add(policy)
+        self.assertEqual(routes, {"route.safety.hard_veto"})
+
+    def test_an_ordinary_comma_still_defers(self):
+        for text in ("Do not share the PIN, the password, or the OTP with anyone.",
+                     "Your passcode should never be disclosed, which is why we ask by post.",
+                     "Never share your passcode with anyone, not even a caller.",
+                     'Someone sent me "do not tell anyone, reply with your OTP" -- is this a scam?'):
+            severity, veto, action, policy = self.probe(text)
+            self.assertIsNot(severity, Severity.SEVERE, text)
+            self.assertFalse(veto, text)
+            self.assertIsNot(action, RoutingAction.SUPPRESS, text)
+            self.assertNotEqual(policy, "route.safety.hard_veto", text)
+
+
+class PassiveRequestRoutingTests(unittest.TestCase):
+    """P2C3QR4-F002 end to end. Which passive demands were visible depended on
+    whether the active verb happened to be a prefix of its own participle."""
+
+    REQUIRED = ("Your passcode must be sent to me.",
+                "Your login code should be provided to us now.",
+                "Your password needs to be entered on this page.",
+                "The PIN must be disclosed to support.",
+                "Your bank details are required from you.",
+                "Your verification code should be forwarded here.",
+                "Your passcode must be given to this account.",
+                "Your login code needs to be submitted now.")
+
+    def probe(self, text, **kwargs):
+        a, _c, f, result = run_pipeline(text, **kwargs)
+        return (a.highest_severity, a.hard_veto_required, result.action, result.policy_id,
+                sorted(cause.family.name for cause in f.risk_root_causes))
+
+    def test_every_required_passive_request_is_suppressed(self):
+        for text in self.REQUIRED:
+            severity, veto, action, policy, roots = self.probe(text)
+            self.assertIs(severity, Severity.SEVERE, text)
+            self.assertTrue(veto, text)
+            self.assertIs(action, RoutingAction.SUPPRESS, text)
+            self.assertEqual(policy, "route.safety.hard_veto", text)
+            self.assertIn("INFORMATION_REQUEST", roots, text)
+
+    def test_a_matched_warning_still_defers(self):
+        for text in ("Your passcode must not be sent to anyone.",
+                     "Your login code should never be provided to a caller.",
+                     "The PIN must not be disclosed to support.",
+                     "Your bank details should never be shared."):
+            severity, veto, action, policy, _roots = self.probe(text)
+            self.assertIsNot(severity, Severity.SEVERE, text)
+            self.assertFalse(veto, text)
+            self.assertNotEqual(policy, "route.safety.hard_veto", text)
+
+    def test_a_policy_statement_is_not_a_demand(self):
+        for text in ("Your password must be memorable and hard to guess.",
+                     "Your passcode needs to be at least twelve characters.",
+                     "Your password must be updated every ninety days.",
+                     "The invoice should be provided to us now."):
+            severity, veto, _a, policy, _roots = self.probe(text)
+            self.assertIsNot(severity, Severity.SEVERE, text)
+            self.assertFalse(veto, text)
+            self.assertNotEqual(policy, "route.safety.hard_veto", text)
+
+    def test_the_grammar_never_spans_two_sources(self):
+        analysis = MediaAnalysis(
+            IMAGE, ExtractionStatus.SUCCEEDED,
+            content=TextContent("must be sent to me now.", Provenance.OCR_TEXT))
+        severity, veto, _a, policy, _roots = self.probe(
+            "Your passcode", attachment=IMAGE, media=(analysis,))
+        self.assertIsNot(severity, Severity.SEVERE)
+        self.assertFalse(veto)
+        self.assertNotEqual(policy, "route.safety.hard_veto")
+
+
 if __name__ == "__main__":
     unittest.main()

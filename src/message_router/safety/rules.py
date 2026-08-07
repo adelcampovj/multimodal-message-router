@@ -90,9 +90,14 @@ _FUNCTION_WORD = (
     r"in|with|for|of|by|as|if|even|though|entirely|completely|altogether|permanently|"
     r"temporarily|forever|again|anyway|soon|please|thanks|thank|ok|okay|here|back|"
     r"over|via|through|that|this|it|i|we|you|they|he|she|my|your|our|their|"
-    # A numeral does not change which word is the head -- "your PIN 4417" and
-    # "your medication #2" are still about the credential and the medication --
-    # and adverbs are closed enough to admit by shape.
+    # An auxiliary or modal is the strongest head signal English has: whatever
+    # follows "your PIN must" is the predicate, so the noun before it is the
+    # head of its phrase. Leaving these out meant "the PIN must be disclosed
+    # to support" was not a credential phrase at all -- the request went
+    # undetected, and so did the matching warning, because both grammars read
+    # the same target list.
+    r"must|shall|should|can|could|will|would|may|might|ought|need|needs|"
+    r"is|are|was|were|be|been|being|has|have|had|do|does|did|"
     r"#?\d[\d,.-]*|\w+ly)"
 )
 #: The governed token is the head of its phrase: end of input, punctuation,
@@ -297,6 +302,19 @@ _WEAK_SEPARATOR_RE = _c(
     r"|\s+(?:but|yet|and then|while|although)\b"
 )
 
+#: A bare comma. **Not** a separator: it is a candidate for exactly one
+#: acceptance test, in :func:`_terminates_protection`, and is refused
+#: everywhere else. A comma joins list items, apposition, subordinate
+#: clauses and coordinated objects far more often than it starts a new
+#: instruction, so splitting on it generally would tear ordinary sentences in
+#: half. The one case it must handle is the reverse failure: every other
+#: boundary in this file ends a warning's protected span, and a comma did
+#: not, so "never share your passcode with anyone, send me your passcode"
+#: read as one advisory clause and the demand inside it produced no finding
+#: at all -- while the same two halves either side of a full stop, a
+#: semicolon, a line break, a bullet or any reviewed adversative were severe.
+_BARE_COMMA_RE = _c(r",\s*")
+
 
 def _side_is_independent(side: str, lookahead: str = "") -> bool:
     """True when a side carries framing or an independently matchable rule.
@@ -370,6 +388,60 @@ def _side_is_independent(side: str, lookahead: str = "") -> bool:
     )
 
 
+def _terminates_protection(right: str) -> bool:
+    """True when ``right`` is an independently supported current credential request.
+
+    This is the *whole* acceptance test for a bare comma, and it is
+    deliberately the strongest one in this file: the side has to carry a
+    complete request under the existing bounded grammar -- the secret and the
+    ask, in one of the reviewed forms -- judged on its own with nothing
+    borrowed from the other side of the comma. A credential merely being
+    *named* is not enough, which is what keeps "the PIN, the password, or the
+    OTP" from being torn into three, and a side that is itself a warning,
+    a quotation or a training example is refused outright, because that is
+    the opposite of a live request.
+    """
+    stripped = right.strip()
+    if len(stripped) < 3:
+        return False
+    flags = _flags_for(stripped)
+    if flags.warning or flags.quoted or flags.educational:
+        return False
+    if _is_passive_credential_warning(stripped) or _is_narrated(stripped):
+        return False
+    for _rid, request_pattern, _target, _diag in _CREDENTIAL_COMPILED:
+        if request_pattern.search(stripped):
+            return True
+    if _MESSAGE_TRANSMISSION_RE.search(stripped):
+        return True
+    for _rid, pattern, _diag in _CREDENTIAL_PASSIVE:
+        match = pattern.search(stripped)
+        if match is None:
+            continue
+        gap = (match.groupdict().get("gap") or "") + (match.groupdict().get("gap2") or "")
+        if not _GAP_NEGATOR_RE.search(gap) and not _INVERSION_RE.search(gap):
+            return True
+    return False
+
+
+def _inside_shown_quotation(text: str, position: int) -> bool:
+    """True when ``position`` sits inside a quotation the message is *showing*.
+
+    Quote marks on their own are not enough -- that would hand out an
+    exemption for the price of two characters, which is the reason
+    :func:`_attributed_quoted_spans` exists. The material in front of the
+    quotation has to attribute it, or frame it as something received, quoted
+    or taught. A quotation opened *after* the comma is not one this comma is
+    inside, so wrapping a demand in quotes buys nothing.
+    """
+    for start, end in _quoted_spans(text):
+        if start <= position <= end:
+            prefix = text[:start]
+            if _has_attribution(prefix) or _flags_for(prefix).is_discussion:
+                return True
+    return False
+
+
 def _segment(text: str, boundaries: tuple[int, ...] = ()) -> list[tuple[int, int]]:
     """Clause spans as ``(start, end)``, strong boundaries then weak ones.
 
@@ -410,7 +482,34 @@ def _segment(text: str, boundaries: tuple[int, ...] = ()) -> list[tuple[int, int
                 refined.append((cursor, match.start()))
                 cursor = match.end()
         refined.append((cursor, span_end))
-    return refined
+
+    # Second pass, and a separate one on purpose: the reviewed separators
+    # above keep their exact behaviour, and the bare comma gets the single
+    # narrow test it is allowed. A comma inside a quotation the message is
+    # showing the reader is never a candidate -- that quotation is one span
+    # with two ends, and cutting it would turn something being reported into
+    # something being said.
+    final: list[tuple[int, int]] = []
+    for span_start, span_end in refined:
+        cursor = span_start
+        for match in _BARE_COMMA_RE.finditer(text, span_start, span_end):
+            if _inside_shown_quotation(text, match.start()):
+                continue
+            # Reported speech governs what follows it, so a comma inside a
+            # narrated span is part of what is being reported.
+            if _is_narrated(text[cursor:match.start()]):
+                continue
+            # Either side. Protection must not reach forwards over the comma
+            # into a demand, and a warning written *after* one must not reach
+            # backwards and erase it -- "send me your passcode, never share
+            # your passcode with anyone" is the same bypass spelled in the
+            # other order, and the request is what has to survive both.
+            if (_terminates_protection(text[match.end():span_end])
+                    or _terminates_protection(text[cursor:match.start()])):
+                final.append((cursor, match.start()))
+                cursor = match.end()
+        final.append((cursor, span_end))
+    return final
 #: A clause that is itself a quotation.
 _QUOTE_ENCLOSED_RE = _c(r"^[\"'“‘(\[]|[\"'”’)\]]$")
 
@@ -958,6 +1057,10 @@ _SECRET_TARGET = (
 _CARD_TARGET = r"(?:cvv|cvc|card number|card details|security code on the back|expiry date|full card)"
 _BANK_TARGET = (
     r"(?:net ?banking|online banking|internet banking|account login|banking (?:login|password|credentials)|"
+    # "Card details" was already a target; the banking equivalent was not, so
+    # the one phrase a person is most likely to be asked for by name was the
+    # one this layer could not see.
+    r"bank(?:ing)? details|bank account details|"
     r"account credentials|bank credentials|upi pin|atm pin)"
 )
 
@@ -1015,12 +1118,21 @@ _TRANSMISSION_DESTINATION = (
     r"(?:me|us|him|her|them|(?:the|our|your|their)\s+" + _TRANSMISSION_ROLE
     + r"|" + _TRANSMISSION_ROLE + r")"
 )
-#: The spelled-out credential may carry a determiner or possessive; the
-#: short forms already carry their own.
-_FULL_FORM_CREDENTIAL = (
-    r"(?:(?:the|your|my|our|their|a)\s+)?personal identification numbers?"
+#: The spelled-out credential may carry a determiner or possessive. So may
+#: every other form: only the spelled-out one was allowed to, so "message me
+#: the personal identification number" was a request and "message me your
+#: passcode" -- the same demand, in the words people actually use -- was not
+#: matched at all. The determiner set is closed and cannot reach past the
+#: credential it introduces.
+_CREDENTIAL_DETERMINER = r"(?:(?:the|your|my|our|their|a|an)\s+)?"
+_FULL_FORM_CREDENTIAL = _CREDENTIAL_DETERMINER + r"personal identification numbers?"
+#: All three families, for the same reason the determiner is allowed: the
+#: construction is about *transmitting a secret to a recipient*, and which
+#: kind of secret it is was never part of that.
+_TRANSMITTED_CREDENTIAL = (
+    r"(?:" + _FULL_FORM_CREDENTIAL + r"|" + _CREDENTIAL_DETERMINER
+    + r"(?:" + _SECRET_TARGET + r"|" + _CARD_TARGET + r"|" + _BANK_TARGET + r"))"
 )
-_TRANSMITTED_CREDENTIAL = r"(?:" + _FULL_FORM_CREDENTIAL + r"|" + _SECRET_TARGET + r")"
 
 _MESSAGE_TRANSMISSION_RE = _c(
     # message me your PIN  /  direct-message the service desk your PIN
@@ -1153,6 +1265,89 @@ _NEW_DIRECTIVE_RE = _c(
 )
 
 
+# ---------------------------------------------------------------------------
+# A bounded credential request, written in the passive or as a requirement.
+# ---------------------------------------------------------------------------
+#
+# The active grammar reaches some passive wording by accident: "disclose" is
+# a prefix of "disclosed", so "must be disclosed to support" matched while
+# "must be sent to me" did not -- "send" is not a prefix of "sent". The
+# coverage that existed was therefore an artefact of English spelling rather
+# than a rule, and it carried no requirement that anything be *asked* of the
+# reader at all: "the passcode was disclosed yesterday" matched too.
+#
+# This is the same request written deliberately. All four parts must be
+# present, in order, inside one clause: the secret, an obligation, the act,
+# and somewhere for the secret to go. Passive voice alone is not enough, a
+# modal alone is not enough, and a negated obligation is a warning -- which
+# is why the gap between the obligation and the act may contain neither a
+# negator nor an inversion verb.
+
+#: Obligation and current-requirement forms. Closed: each one states that
+#: something *has to* happen, which is what separates a demand from a
+#: description ("has been changed") or a policy ("should be memorable").
+_OBLIGATION = (
+    r"(?:must|should|shall|ought to|is to|are to|has to|have to|had to|"
+    r"needs? to|need to|will need to|is required to|are required to)"
+)
+#: The act, in the passive. Same closed vocabulary as the active request and
+#: the warning form, so all three grammars move together.
+_PASSIVE_REQUEST_ACTION = _alternation((
+    "sent", "provided", "shared", "entered", "disclosed", "forwarded",
+    "submitted", "given", "typed", "messaged", "supplied", "texted",
+    "transmitted", "revealed", "pasted", "handed over", "read out",
+))
+#: Where the secret is being asked to go. Every member names a destination
+#: that is *current* -- the sender, this page, this account, this reply. A
+#: generic noun is deliberately absent: "sent to the archive" is not a
+#: request aimed at anyone.
+_REQUEST_DESTINATION = (
+    r"(?:to me|to us|to support|to the (?:support|service|help) ?(?:team|desk|agent|line)?|"
+    r"to this (?:account|number|address|page|link|form|chat)|"
+    r"on this (?:page|site|link|form|number|screen)|"
+    r"in this (?:form|chat|page|reply)|through this (?:chat|page|link|form)|"
+    r"by reply|by return|back to (?:me|us)|here|from you|from me|of you)"
+)
+#: A requirement with no destination still has to be *current*. "Needs to be
+#: submitted now" asks for something; "should be updated every ninety days"
+#: does not, and neither reaches this list.
+_IMMEDIACY = r"(?:now|immediately|right away|straight away|at once|today|urgently|without delay)"
+#: A negator or an inversion between the obligation and the act means the
+#: sentence prohibits the disclosure rather than demanding it. "Must not be
+#: sent to me" is a warning that happens to name a destination.
+_GAP_NEGATOR_RE = _c(r"\b(?:not|never|no|n't|nor|neither)\b")
+
+
+def _passive_request_source(target: str) -> str:
+    """The bounded passive-request grammar for one credential family."""
+    return (
+        # secret -> obligation -> act -> destination or immediacy
+        r"\b" + target + r"\b[^.]{0,20}\b" + _OBLIGATION + r"\b(?P<gap>[^.]{0,15}?)"
+        r"(?:\b(?:be|been|get|got)\s+)?\b" + _PASSIVE_REQUEST_ACTION + r"\b"
+        r"[^.]{0,25}?\b(?:" + _REQUEST_DESTINATION + r"|" + _IMMEDIACY + r")\b"
+        # secret -> current requirement aimed at a person
+        r"|\b" + target + r"\b[^.]{0,20}\b(?:is|are|was|were) required\b"
+        r"(?P<gap2>[^.]{0,15}?)\b(?:from|of|by)\s+(?:you|me|us)\b"
+    )
+
+
+_CREDENTIAL_PASSIVE = tuple(
+    (rule_id, _c(_passive_request_source(target)), diagnostic)
+    for rule_id, target, diagnostic in _CREDENTIAL_FAMILIES
+)
+
+
+def _passive_request_matches(pattern: re.Pattern[str], text: str, local: "_LocalContext"):
+    """Clause-bounded matches whose obligation actually governs the act."""
+    kept = []
+    for match in _clause_scan(pattern, text, local):
+        gap = (match.groupdict().get("gap") or "") + (match.groupdict().get("gap2") or "")
+        if _GAP_NEGATOR_RE.search(gap) or _INVERSION_RE.search(gap):
+            continue
+        kept.append(match)
+    return kept
+
+
 def _is_passive_credential_warning(clause: str) -> bool:
     """A bounded negative credential warning in passive or reordered order.
 
@@ -1179,9 +1374,21 @@ def _evaluate_credentials(norm: NormalizedText, local: _LocalContext) -> list[Ru
     text = norm.security
     hits: list[RuleHit] = []
 
+    passive_by_rule = {
+        rule_id: _passive_request_matches(pattern, text, local)
+        for rule_id, pattern, _diag in _CREDENTIAL_PASSIVE
+    }
+
     for rule_id, request_pattern, target_pattern, diagnostic in _CREDENTIAL_COMPILED:
         target_contexts = [local.at(m.start()) for m in _clause_scan(target_pattern, text, local)]
-        request_contexts = [local.at(m.start()) for m in _clause_scan(request_pattern, text, local)]
+        # The passive form is the same ask in the other voice, so it joins the
+        # request occurrences rather than forming a rule of its own: framing,
+        # ambiguity, deduplication and severity are then decided in exactly
+        # one place, by the code below, for both voices.
+        request_contexts = [
+            local.at(m.start())
+            for m in _clause_scan(request_pattern, text, local) + passive_by_rule[rule_id]
+        ]
         target_present = bool(target_contexts)
 
         if not target_present:

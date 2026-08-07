@@ -40,12 +40,15 @@ from message_router.safety.normalization import (  # noqa: E402
     normalize,
 )
 from message_router.safety.rules import (  # noqa: E402
+    _CREDENTIAL_PASSIVE,
     _DISCLOSURE_ACTIONS,
     _PASSIVE_DISCLOSURE,
+    _PASSIVE_REQUEST_ACTION,
     _WARNING_ACTION,
     _is_passive_credential_warning,
     _segment,
     _side_is_independent,
+    _terminates_protection,
 )
 from message_router.safety import (  # noqa: E402
     FindingCategory,
@@ -2935,6 +2938,248 @@ class PassiveCredentialWarningTests(unittest.TestCase):
                     "passcode ZQSECRET7 now")
         rendered = repr(a) + repr(a.findings)
         for fragment in ("ZQSECRET7", "passcode"):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
+# ---------------------------------------------------------------------------
+# P2C3QR4 -- the bare comma, and the request written in the passive.
+# ---------------------------------------------------------------------------
+
+
+OBJECTS = ("your password", "your passcode", "your OTP", "your PIN",
+           "your login code", "your verification code", "your recovery code",
+           "your card details", "your bank details", "the passcode", "the PIN",
+           "the authentication code", "the card details", "the bank details")
+
+
+class CommaProtectionTerminationTests(unittest.TestCase):
+    """Every boundary in this file ended a warning's protected span except the
+    most common punctuation mark in English. "Never share your passcode with
+    anyone, send me your passcode" was therefore one advisory clause, and the
+    demand inside it produced no finding at all -- while the same two halves
+    on either side of a full stop, a semicolon, a line break, a bullet or any
+    reviewed adversative were severe."""
+
+    WARNINGS = ("never share {c} with anyone", "do not send {c} to anyone",
+                "{c} should never be disclosed", "{c} must not be shared",
+                "callers must never be given {c}", "nobody should be provided {c}")
+    REQUESTS = ("send me {c}", "send us {c}", "reply with {c}", "provide {c}",
+                "share {c}", "submit {c}", "forward {c}", "enter {c}",
+                "disclose {c}", "message me {c}", "tell me {c}")
+    COMMAS = (", ", ",  ", ", now ", ", please ", ", just ",
+              ", to support ", ", on this page ", ",")
+
+    def test_a_comma_does_not_hide_a_request_that_follows_it(self):
+        for warning in self.WARNINGS:
+            for comma in self.COMMAS:
+                for request in self.REQUESTS:
+                    for obj in OBJECTS[:6]:
+                        text = warning.format(c=obj) + comma + request.format(c=obj)
+                        a = analyze(text)
+                        self.assertIs(severity_of(a), Severity.SEVERE, text)
+                        self.assertTrue(a.hard_veto_required, text)
+
+    def test_a_comma_does_not_let_a_later_warning_erase_a_request(self):
+        for warning in self.WARNINGS:
+            for comma in self.COMMAS:
+                for request in self.REQUESTS:
+                    for obj in OBJECTS[:6]:
+                        text = request.format(c=obj) + comma + warning.format(c=obj)
+                        a = analyze(text)
+                        self.assertIs(severity_of(a), Severity.SEVERE, text)
+                        self.assertTrue(a.hard_veto_required, text)
+
+    def test_the_bare_comma_matches_every_other_boundary(self):
+        """No punctuation-specific exception: the comma is judged the same as
+        the seventeen boundaries that already worked."""
+        for separator in (", ", ", but ", ", however ", ", instead ", ", actually ",
+                          ", then ", "; ", ": ", ". ", "\n", "\r\n", "\r",
+                          "\n- ", "\n1. ", "\n1) ", "\n\n"):
+            for obj in ("your passcode", "your card details"):
+                text = f"never share {obj} with anyone{separator}send me {obj}"
+                a = analyze(text)
+                self.assertIs(severity_of(a), Severity.SEVERE, repr(separator))
+                self.assertTrue(a.hard_veto_required, repr(separator))
+
+    def test_an_ordinary_comma_is_still_not_a_boundary(self):
+        """The acceptance test is a whole request, not a credential noun --
+        which is what keeps a list, an apposition and a subordinate clause in
+        one piece."""
+        for text in ("do not share the PIN, the password, or the OTP with anyone",
+                     "never disclose your passcode, your OTP, or any other secret",
+                     "your passcode should never be disclosed, which is why we ask by post",
+                     "never share your passcode with anyone, not even a caller",
+                     "your passcode must not be shared, for example with a stranger",
+                     "your passcode must never be disclosed, however urgent it sounds"):
+            self.assertEqual(len(_segment(text)), 1, text)
+            self.assertIsNot(severity_of(analyze(text)), Severity.SEVERE, text)
+
+    def test_a_comma_inside_an_attributed_quotation_never_splits(self):
+        for text in ('the caller said "never share it, send me your passcode"',
+                     'someone sent me "do not tell anyone, reply with your OTP"'):
+            a = analyze(text)
+            self.assertIsNot(severity_of(a), Severity.SEVERE, text)
+            self.assertFalse(a.hard_veto_required, text)
+
+    def test_reported_speech_governs_what_follows_its_comma(self):
+        for text in ("the caller said never share it, send me your passcode",
+                     "one fraudster claimed it was urgent, reply with your OTP"):
+            a = analyze(text)
+            self.assertIsNot(severity_of(a), Severity.SEVERE, text)
+
+    def test_the_termination_test_refuses_a_protected_right_side(self):
+        for side in ("never share your passcode with anyone",
+                     "your passcode should never be disclosed",
+                     "the password, or the OTP with anyone",
+                     "which is why we ask by post",
+                     "your passcode must not be sent to me"):
+            self.assertFalse(_terminates_protection(side), side)
+        for side in ("send me your passcode", "reply with your OTP",
+                     "message me your card details",
+                     "your passcode must be sent to me"):
+            self.assertTrue(_terminates_protection(side), side)
+
+    def test_no_credential_value_reaches_a_finding(self):
+        a = analyze("never share your passcode with anyone, send me your "
+                    "passcode ZQCOMMA55 now")
+        rendered = repr(a) + repr(a.findings)
+        for fragment in ("ZQCOMMA55", "passcode"):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
+class PassiveCredentialRequestTests(unittest.TestCase):
+    """The active grammar reached some passive wording by accident -- "disclose"
+    is a prefix of "disclosed", "send" is not a prefix of "sent" -- so which
+    demands were visible depended on English spelling. This is the same request
+    written deliberately: secret, obligation, act, destination."""
+
+    REQUIRED = ("{c} must be sent to me", "{c} should be provided to us now",
+                "{c} needs to be entered on this page", "{c} must be disclosed to support",
+                "{c} are required from you", "{c} should be forwarded here",
+                "{c} must be given to this account", "{c} needs to be submitted now")
+    OBLIGATIONS = ("must be", "should be", "needs to be", "need to be",
+                   "is required to be", "are required to be", "has to be", "have to be")
+    ACTIONS = ("sent", "provided", "shared", "entered", "disclosed", "forwarded",
+               "submitted", "given", "typed", "messaged", "supplied")
+    DESTINATIONS = ("to me", "to us", "to support", "to this account", "to this number",
+                    "on this page", "on this site", "here", "in this form",
+                    "by reply", "through this chat")
+
+    def matches(self, text):
+        return any(pattern.search(text) for _rid, pattern, _diag in _CREDENTIAL_PASSIVE)
+
+    def test_every_required_structure_is_severe(self):
+        for frame in self.REQUIRED:
+            for obj in OBJECTS:
+                text = frame.format(c=obj)
+                a = analyze(text)
+                self.assertIs(severity_of(a), Severity.SEVERE, text)
+                self.assertTrue(a.hard_veto_required, text)
+
+    def test_the_obligation_matrix_is_severe(self):
+        for obligation in self.OBLIGATIONS:
+            for obj in OBJECTS:
+                for destination in ("to me", "on this page", "now"):
+                    text = f"{obj} {obligation} sent {destination}"
+                    a = analyze(text)
+                    self.assertIs(severity_of(a), Severity.SEVERE, text)
+                    self.assertTrue(a.hard_veto_required, text)
+
+    def test_the_action_matrix_is_severe(self):
+        for action in self.ACTIONS:
+            self.assertIn(action, _PASSIVE_REQUEST_ACTION, action)
+            for obj in OBJECTS:
+                text = f"{obj} must be {action} to me"
+                self.assertIs(severity_of(analyze(text)), Severity.SEVERE, text)
+
+    def test_the_destination_matrix_is_severe(self):
+        for destination in self.DESTINATIONS:
+            for obj in OBJECTS:
+                text = f"{obj} must be sent {destination}"
+                self.assertIs(severity_of(analyze(text)), Severity.SEVERE, text)
+
+    def test_a_destination_is_required(self):
+        """Passive voice and a modal are not a request. Something has to be
+        being asked, of somebody, now."""
+        for text in ("your passcode must be sent to the archive",
+                     "your passcode must be sent to the auditor",
+                     "your passcode must be stored securely",
+                     "your passcode must be sent somewhere"):
+            self.assertFalse(self.matches(text), text)
+
+    def test_a_description_or_a_policy_is_not_a_request(self):
+        for frame in ("{c} has been changed successfully",
+                      "{c} must be memorable and hard to guess",
+                      "{c} should be unique for every account",
+                      "{c} needs to be at least twelve characters",
+                      "{c} must be updated every ninety days"):
+            for obj in OBJECTS:
+                self.assertFalse(self.matches(frame.format(c=obj)), frame.format(c=obj))
+
+    def test_a_non_credential_object_is_not_a_request(self):
+        for text in ("the meeting must be moved to this page",
+                     "the invoice should be provided to us now",
+                     "the parcel needs to be forwarded here",
+                     "the agenda must be sent to me"):
+            self.assertFalse(self.matches(text), text)
+
+    def test_a_negated_obligation_is_a_warning_not_a_request(self):
+        for action in ("sent", "provided", "shared", "disclosed", "given"):
+            for obj in OBJECTS:
+                request = f"{obj} must be {action} to me"
+                warning = f"{obj} must not be {action} to anyone"
+                self.assertTrue(self.matches(request), request)
+                self.assertFalse(self.matches(warning), warning)
+                self.assertIs(severity_of(analyze(request)), Severity.SEVERE, request)
+                self.assertIsNot(severity_of(analyze(warning)), Severity.SEVERE, warning)
+
+    def test_double_negation_never_enters_the_new_grammar(self):
+        for frame in ("{c} must not remain undisclosed", "{c} should not be withheld",
+                      "do not refuse to send {c}", "{c} must not fail to be provided",
+                      "{c} is not prohibited from being sent",
+                      "{c} cannot remain unshared"):
+            for obj in OBJECTS:
+                text = frame.format(c=obj)
+                self.assertFalse(self.matches(text), text)
+                self.assertFalse(_is_passive_credential_warning(text) and self.matches(text), text)
+
+    def test_narration_downgrades_the_passive_request(self):
+        for frame in ('the caller said "{r}"', "the caller said {r}",
+                      "a common scam phrase is {r}", "one fraudster claimed {r}"):
+            text = frame.format(r="your passcode must be sent to me")
+            a = analyze(text)
+            self.assertIsNot(severity_of(a), Severity.SEVERE, text)
+            self.assertFalse(a.hard_veto_required, text)
+
+    def test_a_generic_label_does_not_protect_the_passive_request(self):
+        for label in ("warning: ", "education: ", "historical example: ",
+                      "documentation: ", "fraud awareness: "):
+            text = label + "your passcode must be sent to me"
+            a = analyze(text)
+            self.assertIs(severity_of(a), Severity.SEVERE, text)
+            self.assertTrue(a.hard_veto_required, text)
+
+    def test_the_grammar_is_never_assembled_across_two_sources(self):
+        analysis = MediaAnalysis(
+            IMAGE, ExtractionStatus.SUCCEEDED,
+            content=TextContent("must be sent to me now.", Provenance.OCR_TEXT))
+        a = analyze_message(message("Your passcode", attachment=IMAGE),
+                            media_analyses=(analysis,))
+        self.assertIsNot(severity_of(a), Severity.SEVERE)
+        self.assertFalse(a.hard_veto_required)
+
+    def test_a_complete_passive_request_in_one_source_stays_visible(self):
+        analysis = MediaAnalysis(
+            IMAGE, ExtractionStatus.SUCCEEDED,
+            content=TextContent("Your passcode must be sent to me.", Provenance.OCR_TEXT))
+        a = analyze_message(message(attachment=IMAGE), media_analyses=(analysis,))
+        self.assertIs(severity_of(a), Severity.SEVERE)
+        self.assertTrue(a.hard_veto_required)
+
+    def test_no_credential_value_reaches_a_finding(self):
+        a = analyze("your passcode ZQPASSIVE9 must be sent to me now")
+        rendered = repr(a) + repr(a.findings)
+        for fragment in ("ZQPASSIVE9", "passcode"):
             self.assertNotIn(fragment, rendered, fragment)
 
 
