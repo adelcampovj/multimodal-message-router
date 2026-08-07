@@ -2571,16 +2571,58 @@ class BoundedEscalationTests(unittest.TestCase):
         self.assertIn("DECEPTIVE_LINK", roots)
 
     def test_a_bounded_episode_still_escalates(self):
-        for text in ("Remit the balance today at http://203.0.113.9/pay",
-                     "Remit the balance today. The status page is at "
-                     "http://203.0.113.9/status",
-                     "This is an official notice from your bank. Pay immediately or "
-                     "face penalty."):
+        for text in (
+            # Same clause.
+            "Remit the balance today at http://203.0.113.9/pay",
+            "This is an official notice from your bank, pay immediately or face penalty.",
+            # The demand's own instruction group.
+            "Pay the required fee now:\n1. use this link to pay http://203.0.113.9/pay",
+            # Adjacent, and naming the episode.
+            "Remit the balance today. Use this link to complete the payment "
+            "http://203.0.113.9/pay",
+            "Remit the balance today. The link for this payment is http://203.0.113.9/pay",
+            "Remit the balance today. The sender of this payment request claims this is "
+            "an official notice from your bank.",
+        ):
             severity, veto, action, policy, _roots = self.probe(text)
             self.assertIs(severity, Severity.SEVERE, text)
             self.assertTrue(veto, text)
             self.assertIs(action, RoutingAction.SUPPRESS, text)
             self.assertEqual(policy, "route.safety.hard_veto", text)
+
+    def test_adjacency_alone_does_not_escalate(self):
+        # Independently substantive, immediately adjacent, and about something
+        # else entirely. Both findings survive; no veto is manufactured.
+        for text, policy in (
+            ("Remit the balance today. The staff rota is at http://203.0.113.9/rota",
+             "route.risk.payment_link_suppress"),
+            ("Remit the balance today. This is an official notice from the transport "
+             "authority.", "route.risk.identity_credential_suppress"),
+        ):
+            severity, veto, action, actual, roots = self.probe(text)
+            self.assertIsNot(severity, Severity.SEVERE, text)
+            self.assertFalse(veto, text)
+            self.assertIn("COERCIVE_PAYMENT", roots, text)
+            self.assertIs(action, RoutingAction.SUPPRESS, text)
+            self.assertEqual(actual, policy, text)
+
+    def test_an_explicit_reference_will_not_guess_between_episodes(self):
+        for text in (
+            # Two demands: which payment is "this payment"?
+            "Remit the balance today. Pay the fee now. Use this link to complete the "
+            "payment http://203.0.113.9/pay",
+            # Two destinations.
+            "Remit the balance today. Use this link to pay http://203.0.113.9/pay and "
+            "also http://198.51.100.7/x",
+            # Two identity episodes.
+            "Remit the balance today. The sender of this payment request claims this is "
+            "an official notice from your bank. This is an official notice from the "
+            "parish council.",
+        ):
+            severity, veto, _action, policy, _roots = self.probe(text)
+            self.assertIsNot(severity, Severity.SEVERE, text)
+            self.assertFalse(veto, text)
+            self.assertNotEqual(policy, "route.safety.hard_veto", text)
 
     def test_removing_either_component_removes_escalation(self):
         for text in ("Remit the balance today.",
@@ -2604,6 +2646,94 @@ class BoundedEscalationTests(unittest.TestCase):
         self.assertEqual(plain[0], padded[0])
         self.assertEqual(plain[1], padded[1])
         self.assertEqual(plain[3], padded[3])
+
+    #: Independently substantive, immediately adjacent, and about something
+    #: else. Standing next to a demand is not being part of it.
+    UNRELATED_NEIGHBOURS = (
+        ("raw-IP rota link", "The staff rota is at http://203.0.113.9/rota"),
+        ("lookalike menu link", "The canteen menu is at http://secure-verify-account.example/menu"),
+        ("separate security notice", "Your mailbox settings changed, review them at "
+                                     "http://203.0.113.9/mailbox"),
+        ("unrelated organisation", "This is an official notice from the transport authority."),
+        ("unrelated brand", "This is an official notice from the electricity board."),
+        ("separate account identity", "This is an official notice from your library account."),
+    )
+    SEPARATORS = (". ", "; ", ": ", "\n", "\r\n", "\r", "\n\n", "\n- ", "\n1. ")
+
+    def test_adjacency_alone_never_escalates(self):
+        for label, neighbour in self.UNRELATED_NEIGHBOURS:
+            for separator in self.SEPARATORS:
+                for text in (f"Remit the balance today{separator}{neighbour}",
+                             f"{neighbour}{separator}Remit the balance today"):
+                    severity, veto, _action, policy, _roots = self.probe(text)
+                    self.assertIsNot(severity, Severity.SEVERE, f"{label}: {text!r}")
+                    self.assertFalse(veto, f"{label}: {text!r}")
+                    self.assertNotEqual(policy, "route.safety.hard_veto", f"{label}: {text!r}")
+
+    def test_adjacency_alone_leaves_both_findings_visible(self):
+        for label, neighbour in self.UNRELATED_NEIGHBOURS:
+            _severity, _veto, action, _policy, roots = self.probe(
+                f"Remit the balance today. {neighbour}")
+            self.assertIn("COERCIVE_PAYMENT", roots, label)
+            self.assertTrue({"DECEPTIVE_LINK", "IDENTITY_INCONSISTENCY"} & set(roots), label)
+            self.assertIs(action, RoutingAction.SUPPRESS, label)
+
+    #: The adjacent clause has to say which payment or sender it is about.
+    EXPLICIT_REFERENCES = (
+        "Use this link to complete the payment http://203.0.113.9/pay",
+        "Pay through this destination http://203.0.113.9/pay",
+        "Send the transfer to this account at http://203.0.113.9/pay",
+        "The link for this payment is http://203.0.113.9/pay",
+        "This payment destination is http://203.0.113.9/pay",
+        "The sender of this payment request claims this is an official notice from your bank.",
+        "The organisation requesting this payment says this is an official notice from your bank.",
+    )
+
+    def test_an_explicit_episode_reference_still_escalates(self):
+        for reference in self.EXPLICIT_REFERENCES:
+            severity, veto, action, policy, _roots = self.probe(
+                f"Remit the balance today. {reference}")
+            self.assertIs(severity, Severity.SEVERE, reference)
+            self.assertTrue(veto, reference)
+            self.assertIs(action, RoutingAction.SUPPRESS, reference)
+            self.assertEqual(policy, "route.safety.hard_veto", reference)
+
+    def test_a_generic_word_is_not_an_episode_reference(self):
+        for generic in ("It is at http://203.0.113.9/pay",
+                        "The link is http://203.0.113.9/pay",
+                        "Here it is: http://203.0.113.9/pay",
+                        "The account is at http://203.0.113.9/pay"):
+            severity, veto, _a, _p, _r = self.probe(f"Remit the balance today. {generic}")
+            self.assertIsNot(severity, Severity.SEVERE, generic)
+            self.assertFalse(veto, generic)
+
+    def test_a_reference_will_not_guess_between_competing_episodes(self):
+        for text in (
+            "Remit the balance today. Pay the fee now. Use this link to complete the "
+            "payment http://203.0.113.9/pay",
+            "Remit the balance today. Use this link to pay http://203.0.113.9/pay and "
+            "also http://198.51.100.7/x",
+            "Remit the balance today. The sender of this payment request claims this is "
+            "an official notice from your bank. This is an official notice from the "
+            "parish council.",
+        ):
+            severity, veto, _a, policy, _r = self.probe(text)
+            self.assertIsNot(severity, Severity.SEVERE, text)
+            self.assertFalse(veto, text)
+            self.assertNotEqual(policy, "route.safety.hard_veto", text)
+
+    def test_an_explicit_reference_never_spans_two_sources(self):
+        for ref, provenance in ((IMAGE, Provenance.OCR_TEXT),
+                                (AUDIO, Provenance.ASR_TRANSCRIPT),
+                                (IMAGE_B, Provenance.QR_DERIVED)):
+            analysis = MediaAnalysis(
+                ref, ExtractionStatus.SUCCEEDED,
+                content=TextContent("Use this link to complete the payment "
+                                    "http://203.0.113.9/pay", provenance))
+            severity, veto, _a, _p, _r = self.probe(
+                "Remit the balance today.", attachment=ref, media=(analysis,))
+            self.assertIsNot(severity, Severity.SEVERE, provenance.name)
+            self.assertFalse(veto, provenance.name)
 
 
 if __name__ == "__main__":

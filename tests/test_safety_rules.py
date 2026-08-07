@@ -660,8 +660,22 @@ class PaymentAndScamTests(unittest.TestCase):
         self.assertTrue(all(f.category is FindingCategory.COERCIVE_PAYMENT for f in severe))
 
     def test_payment_plus_identity_claim_escalates(self):
-        a = analyze("This is an official notice from your bank. Pay immediately or face penalty.")
+        # One clause: the claim and the demand are the same instruction.
+        a = analyze("This is an official notice from your bank, pay immediately or face penalty.")
         self.assertIs(severity_of(a), Severity.SEVERE)
+        # Two clauses, with the second naming whose payment request it is.
+        a = analyze("Pay immediately or face penalty. The sender of this payment request "
+                    "claims this is an official notice from your bank.")
+        self.assertIs(severity_of(a), Severity.SEVERE)
+
+    def test_an_adjacent_identity_claim_alone_does_not_escalate(self):
+        # Standing next to a demand is not the same as being about it: both
+        # findings survive, and ordered suspicious-risk routing still applies.
+        a = analyze("This is an official notice from your bank. Pay immediately or face penalty.")
+        self.assertIsNot(severity_of(a), Severity.SEVERE)
+        self.assertFalse(a.hard_veto_required)
+        self.assertIn("ID_UNSUPPORTED_CLAIM", rule_ids(a))
+        self.assertIn("PAY_URGENT_DEMAND", rule_ids(a))
 
     def test_ordinary_invoice_is_not_severe(self):
         for text in (

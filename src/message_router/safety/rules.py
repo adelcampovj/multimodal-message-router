@@ -2095,6 +2095,34 @@ def _registrable_label(host: str) -> str:
 #: no offset, no content.
 PAYMENT_EPISODE_MARKER = "PAY_EPISODE_LINKED"
 
+#: An adjacent clause naming *this* payment or *this* sender.
+#:
+#: Positive grammar, deliberately: the alternative would be a denylist of
+#: unrelated topics, links and organizations, and the open class there is the
+#: whole world. Each construction below says which episode it is about --
+#: generic "it", "here", "the link", "the account" and "the sender" are
+#: absent on purpose, because on their own they say nothing.
+_EPISODE_REFERENCE_RE = _c(
+    # Where this payment goes.
+    r"\b(?:use |follow |open )?this link to (?:pay|complete|settle|send|transfer)\b"
+    r"|\bthe link for (?:this|that|the) (?:payment|fee|transfer|invoice|charge)\b"
+    r"|\bpay (?:through|via|at|using) this (?:link|destination|address|page|site|account)\b"
+    r"|\bthis payment (?:destination|link|address|page|account)\b"
+    r"|\bsend the (?:payment|transfer|fee|amount) (?:here\b|to this (?:account|address|link|wallet))"
+    r"|\bcomplete (?:it|the payment|the transfer) (?:here\b|at this (?:link|address|page))"
+    r"|\bthe account for (?:this|that|the) (?:payment|transfer|fee|invoice)\b"
+    # An explicit reference back to this payment.
+    r"|\b(?:to|for) (?:this|that) (?:payment|fee|transfer|invoice|charge)\b"
+    r"|\bto (?:complete|settle) the payment\b|\bto pay the fee\b|\bfor the invoice\b"
+    # Who is behind this payment.
+    r"|\bthe sender of (?:this|that) (?:payment|fee|transfer|invoice)(?: request)?\b"
+    r"|\bthe account requesting (?:this|the) (?:payment|fee|transfer|invoice)\b"
+    r"|\bthis payment request claims to be from\b"
+    r"|\bthe organi[sz]ation requesting (?:this|the) (?:payment|transfer|fee|invoice)\b"
+    r"|\bthe identity associated with (?:this|the) (?:payment|invoice|transfer|fee)\b"
+    r"|\bthis sender'?s payment (?:instruction|request)\b"
+)
+
 
 def _payment_episode_marker(
     index: int, demand: _Signal, local: _LocalContext, text: str
@@ -2102,24 +2130,54 @@ def _payment_episode_marker(
     """``(PAYMENT_EPISODE_MARKER,)`` when this clause is part of a payment episode.
 
     Three bounded positions, and nothing else: the demand's own clause, the
-    clause immediately beside it, or the instruction group the demand
-    introduces. A destination or an identity assertion standing next to the
-    demand is part of that demand -- "this is a notice from your bank" then
-    "pay immediately" is one instruction in two clauses. Anywhere further
-    away is not an episode, and neither is another paragraph, another
-    message, or another source.
+    instruction group the demand introduces, or the immediately adjacent
+    clause **naming** the episode.
+
+    Standing next to the demand is not enough. "Remit the balance today.
+    The staff rota is at <address>." puts an ordinary link beside an ordinary
+    demand; nothing says the link is where the money goes, and reading it
+    that way turned two independent suspicious findings into a hard veto. The
+    adjacent clause has to point at *this* payment or *this* sender, exactly
+    one payment anchor has to be in play, and no second destination or
+    identity claim may be competing for the reference.
     """
     if index < 0 or not demand.occurrences:
         return ()
-    here = _Occurrence(index, local.clause(index), local.at_index(index))
+    anchors = {occurrence.index for occurrence in demand.occurrences if occurrence.index >= 0}
+    if not anchors:
+        return ()
     for anchor in demand.occurrences:
         if anchor.index < 0:
             continue
-        if abs(anchor.index - index) <= 1:
+        if anchor.index == index or _in_anchored_list(anchor.index, index, local, text):
             return (PAYMENT_EPISODE_MARKER,)
-        if _relationship(anchor, here, local, text) is not None:
-            return (PAYMENT_EPISODE_MARKER,)
-    return ()
+    if len(anchors) != 1:
+        return ()  # more than one demand; the reference cannot say which
+    if abs(next(iter(anchors)) - index) != 1:
+        return ()
+    if not _EPISODE_REFERENCE_RE.search(local.clause(index)):
+        return ()
+    if _competing_episode(local, text):
+        return ()
+    return (PAYMENT_EPISODE_MARKER,)
+
+
+def _competing_episode(local: _LocalContext, text: str) -> bool:
+    """True when a second destination or identity episode is in play.
+
+    An explicit reference is only unambiguous while there is one thing for it
+    to refer to. Counted by *episode*, not by match: one address written
+    twice is one destination, and one identity assertion matching two
+    patterns is one claim.
+    """
+    if len({match.group(0) for match in _URL_RE.finditer(text)}) > 1:
+        return True
+    claim_clauses = {
+        local.index_at(match.start())
+        for pattern in _IDENTITY_CLAIM
+        for match in pattern.finditer(text)
+    }
+    return len(claim_clauses) > 1
 
 
 def _evaluate_links(
