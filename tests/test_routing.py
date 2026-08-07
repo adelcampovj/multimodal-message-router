@@ -2495,5 +2495,116 @@ class ConditionFreeBenefitRoutingTests(unittest.TestCase):
         self.assertIn("PAY_ADVANCE_FEE", rules)
 
 
+# ---------------------------------------------------------------------------
+# P2C3P3 -- a hard veto is an obligation, so it needs real evidence.
+# ---------------------------------------------------------------------------
+
+
+class BoundedEscalationTests(unittest.TestCase):
+    """Compound severe escalation used to ask only whether a corroborating
+    *category* appeared anywhere in the message. A weak, hedged, quoted or
+    educational link -- material routing had already refused to count -- could
+    turn a merely suspicious payment demand into a hard veto, from any clause
+    and any source."""
+
+    PAYMENT = "Remit the balance today."
+
+    def probe(self, text, **kwargs):
+        a, _c, f, result = run_pipeline(text, **kwargs)
+        return (a.highest_severity, a.hard_veto_required, result.action, result.policy_id,
+                sorted(cause.family.name for cause in f.risk_root_causes))
+
+    #: Each corroborator here is weak, hedged or protected -- not evidence.
+    NON_EVIDENCE = (
+        ("educational", "This security awareness training shows a link like "
+                        "http://203.0.113.9/login"),
+        ("quoted", 'Someone sent me "http://203.0.113.9/login" -- is this a scam'),
+        ("narrated", "The caller said claim it at http://203.0.113.9/login"),
+        ("narrated identity", "A scammer previously said this is an official notice "
+                              "from your bank"),
+        ("educational identity", "A common scam phrase is this is an official notice "
+                                 "from your bank"),
+    )
+
+    def test_non_evidence_cannot_manufacture_a_veto(self):
+        for label, corroborator in self.NON_EVIDENCE:
+            for text in (f"{self.PAYMENT} {corroborator}",
+                         f"{corroborator} {self.PAYMENT}"):
+                severity, veto, _action, policy, _roots = self.probe(text)
+                self.assertIsNot(severity, Severity.SEVERE, f"{label}: {text}")
+                self.assertFalse(veto, f"{label}: {text}")
+                self.assertNotEqual(policy, "route.safety.hard_veto", f"{label}: {text}")
+
+    def test_non_evidence_cannot_manufacture_a_veto_from_another_source(self):
+        for label, corroborator in self.NON_EVIDENCE[:2]:
+            for ref, provenance in ((IMAGE, Provenance.OCR_TEXT),
+                                    (AUDIO, Provenance.ASR_TRANSCRIPT),
+                                    (IMAGE_B, Provenance.QR_DERIVED)):
+                analysis = MediaAnalysis(ref, ExtractionStatus.SUCCEEDED,
+                                         content=TextContent(corroborator, provenance))
+                severity, veto, _a, _p, _r = self.probe(
+                    self.PAYMENT, attachment=ref, media=(analysis,))
+                self.assertIsNot(severity, Severity.SEVERE, f"{label}/{provenance.name}")
+                self.assertFalse(veto, f"{label}/{provenance.name}")
+
+    def test_real_evidence_in_another_clause_does_not_manufacture_a_veto(self):
+        # Independently supported, but not in this payment's episode: the
+        # findings stand, and ordered suspicious-risk routing still applies.
+        severity, veto, action, policy, roots = self.probe(
+            f"{self.PAYMENT} The rota is posted. The status page is at "
+            "http://203.0.113.9/status")
+        self.assertIsNot(severity, Severity.SEVERE)
+        self.assertFalse(veto)
+        self.assertIn("DECEPTIVE_LINK", roots)
+        self.assertIs(action, RoutingAction.SUPPRESS)
+        self.assertEqual(policy, "route.risk.payment_link_suppress")
+
+    def test_real_evidence_in_another_source_does_not_manufacture_a_veto(self):
+        analysis = MediaAnalysis(
+            IMAGE, ExtractionStatus.SUCCEEDED,
+            content=TextContent("The status page is at http://203.0.113.9/status",
+                                Provenance.OCR_TEXT))
+        severity, veto, _action, _policy, roots = self.probe(
+            self.PAYMENT, attachment=IMAGE, media=(analysis,))
+        self.assertIsNot(severity, Severity.SEVERE)
+        self.assertFalse(veto)
+        self.assertIn("DECEPTIVE_LINK", roots)
+
+    def test_a_bounded_episode_still_escalates(self):
+        for text in ("Remit the balance today at http://203.0.113.9/pay",
+                     "Remit the balance today. The status page is at "
+                     "http://203.0.113.9/status",
+                     "This is an official notice from your bank. Pay immediately or "
+                     "face penalty."):
+            severity, veto, action, policy, _roots = self.probe(text)
+            self.assertIs(severity, Severity.SEVERE, text)
+            self.assertTrue(veto, text)
+            self.assertIs(action, RoutingAction.SUPPRESS, text)
+            self.assertEqual(policy, "route.safety.hard_veto", text)
+
+    def test_removing_either_component_removes_escalation(self):
+        for text in ("Remit the balance today.",
+                     "The status page is at http://203.0.113.9/status"):
+            severity, veto, _a, _p, _r = self.probe(text)
+            self.assertIsNot(severity, Severity.SEVERE, text)
+            self.assertFalse(veto, text)
+
+    def test_duplicate_evidence_adds_no_severity(self):
+        once = self.probe("Remit the balance today at http://203.0.113.9/pay")
+        twice = self.probe("Remit the balance today at http://203.0.113.9/pay "
+                           "Remit the balance today at http://203.0.113.9/pay")
+        self.assertEqual(once[0], twice[0])
+        self.assertEqual(once[1], twice[1])
+        self.assertEqual(once[4], twice[4])
+
+    def test_unrelated_protected_content_changes_nothing(self):
+        plain = self.probe("Remit the balance today at http://203.0.113.9/pay")
+        padded = self.probe("The caller said share a code. Remit the balance today at "
+                            "http://203.0.113.9/pay. Thanks and see you soon.")
+        self.assertEqual(plain[0], padded[0])
+        self.assertEqual(plain[1], padded[1])
+        self.assertEqual(plain[3], padded[3])
+
+
 if __name__ == "__main__":
     unittest.main()

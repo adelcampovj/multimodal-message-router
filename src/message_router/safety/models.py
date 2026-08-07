@@ -211,6 +211,21 @@ class SafetyFinding:
         """Whether a later stage is obliged to veto because of this finding."""
         return self.severity.requires_hard_veto
 
+    @property
+    def is_corroborating_evidence(self) -> bool:
+        """Whether this finding may count towards anything beyond itself.
+
+        One predicate, read everywhere corroboration is: by root-cause
+        projection, by the suspicious-combination rules built on those roots,
+        and by compound severe escalation. They used to disagree -- escalation
+        asked only whether a *category* was present anywhere, so a weak,
+        hedged, quoted or educational match that routing had already refused
+        to count could still manufacture a severe veto by itself.
+
+        A weak mention is not evidence, and a hedged one is not either.
+        """
+        return self.severity.rank >= Severity.SUSPICIOUS.rank and not self.ambiguous
+
     def sort_key(self) -> tuple:
         """Total order: strongest first, then stable and content-independent."""
         return (

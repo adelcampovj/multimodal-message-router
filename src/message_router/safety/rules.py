@@ -36,7 +36,8 @@ from ..domain.enums import Reliability
 from .models import DiagnosticCode, FindingCategory, Severity
 from .normalization import NormalizedText, SQUEEZE_MIN_LENGTH, near
 
-__all__ = ["RuleHit", "ContextFlags", "classify_context", "evaluate_content", "evaluate_propagation"]
+__all__ = ["RuleHit", "ContextFlags", "PAYMENT_EPISODE_MARKER", "classify_context",
+           "evaluate_content", "evaluate_propagation"]
 
 
 @dataclass(frozen=True)
@@ -462,6 +463,111 @@ def _has_attribution(clause: str) -> bool:
     return bool(_c(_ATTRIBUTION).search(clause))
 
 
+# ---------------------------------------------------------------------------
+# Narrative framing without quotation marks.
+#
+# Quotation marks are punctuation, and requiring them made the layer read a
+# bank's own fraud warning -- "fraudsters may ask you to send your passcode"
+# -- as a live credential request, while the same sentence with two quote
+# characters was correctly treated as discussion. Punctuation is not what
+# makes something reported speech; attribution is.
+#
+# So the same protection is available unquoted, on the same terms: a bounded
+# attribution construction, in the *same clause* as the dangerous language,
+# and standing *before* it. Nothing here is a semantic judgement about the
+# sentence; each family below is a closed, enumerated construction, and the
+# protection is exactly as strong as the quoted path it mirrors -- no more.
+# ---------------------------------------------------------------------------
+
+#: Who is being reported. Third parties only: the message's own author
+#: reporting themselves is not attribution.
+_NARRATIVE_SUBJECT = (
+    r"(?:the|a|an|one|another|our|their|this)\s+"
+    r"(?:caller|scammer|fraudster|attacker|sender|victim|complainant|customer|"
+    r"report|complaint|incident report|bulletin|log|record|article|guide|"
+    r"documentation|training|module|lesson|message history|message)s?"
+)
+#: The verb that makes it a report rather than an instruction.
+_REPORTING_VERB = (
+    r"(?:said|says|wrote|writes|asked|asks|reported|reports|recorded|records|"
+    r"described|describes|states that|state that|stated that|showed how|shows how|"
+    r"demonstrates how|claimed|claims|may ask|might ask|may request|might request|"
+    r"would ask|involved)"
+)
+_NARRATIVE_REPORTED_RE = _c(
+    r"\b" + _NARRATIVE_SUBJECT + r"\s+(?:previously\s+|earlier\s+|once\s+|then\s+)?"
+    + _REPORTING_VERB + r"\b"
+)
+
+#: Warning, fraud-awareness and educational identification. Each names the
+#: dangerous language as an example of something rather than issuing it.
+_NARRATIVE_IDENTIFICATION_RE = _c(
+    r"\b(?:a|one|another|this|the) common (?:scam|phishing|fraud) "
+    r"(?:phrase|message|line|example|request)\b"
+    r"|\b(?:a|an|one|another|this) example of (?:a |an )?(?:scam|phishing|fraud|attack)\b"
+    r"|\b(?:training|educational|awareness|documented) example\b"
+    r"|\b(?:scammers|fraudsters|attackers|criminals) (?:may|might|often|typically|"
+    r"usually|will|sometimes) (?:ask|say|request|tell|write)\b"
+    r"|\bfor awareness,? (?:scammers|fraudsters|attackers) (?:may|might|often) say\b"
+    r"|\bwatch (?:out )?for messages that say\b"
+    r"|\bnever comply when (?:someone|anyone) says\b"
+    r"|\b(?:fraud warning|scam alert)\b[^.]{0,20}\b(?:says?|asking|asks)\b"
+)
+
+#: Criticism and hypothetical framing.
+_NARRATIVE_CRITICISM_RE = _c(
+    r"\bdo not (?:follow|obey|comply with|act on|respond to) (?:messages|request(?:s)?|"
+    r"anyone|anything) that (?:says?|asks?)\b"
+    r"|\bit is (?:unsafe|dangerous|wrong) to say\b"
+    r"|\bsuppose (?:a|an|some|someone|somebody)\b"
+    r"|\bimagine (?:a|an|someone|somebody|receiving|getting)\b"
+    r"|\ba malicious (?:sender|caller|message) might (?:request|ask|say)\b"
+    r"|\bif (?:someone|somebody|a scammer|an attacker) (?:says?|asks?|writes?)\b"
+)
+
+_NARRATIVE_FRAMES = (
+    _NARRATIVE_REPORTED_RE,
+    _NARRATIVE_IDENTIFICATION_RE,
+    _NARRATIVE_CRITICISM_RE,
+)
+
+#: What disqualifies a narrated span: the clause is making the request now,
+#: on the author's own behalf or as the reader's next step. A generic label
+#: cannot buy protection for any of these.
+_LIVE_REQUEST_RE = _c(
+    r"\b(?:send|pay|transfer|wire|remit|give|forward) (?:me|us)\b"
+    r"|\b(?:to|for) (?:me|us) (?:now|today|immediately|please)\b"
+    r"|\b(?:my|our) (?:account|wallet|number|details)\b"
+    r"|\byour next step\b|\breply with\b|\bcontact me\b|\bmessage me\b"
+    r"|\bbut now\b|\bhowever,?\s+(?:send|pay|reply|contact|transfer)\b"
+    r"|\binstead,?\s+(?:send|pay|reply|contact|transfer)\b"
+    r"|\bactually,?\s+(?:send|pay|reply|contact|transfer)\b"
+)
+
+
+def _narrated_from(clause: str) -> int | None:
+    """Where narration starts in ``clause``, or ``None`` if it does not.
+
+    The frame has to open the narrated span: anything the clause asks for
+    *before* the attribution is the author asking, not somebody being quoted.
+    A first-person request appearing after the frame is part of what is being
+    reported, which is the whole point of reporting it.
+    """
+    starts = [match.start() for pattern in _NARRATIVE_FRAMES
+              for match in [pattern.search(clause)] if match is not None]
+    if not starts:
+        return None
+    frame = min(starts)
+    live = _LIVE_REQUEST_RE.search(clause)
+    if live is not None and live.start() < frame:
+        return None
+    return frame
+
+
+def _is_narrated(clause: str) -> bool:
+    return _narrated_from(clause) is not None
+
+
 class _LocalContext:
     """Framing resolved per clause, with one narrow inheritance rule.
 
@@ -505,6 +611,17 @@ class _LocalContext:
                     educational=flags.educational or previous.educational,
                     quoted=flags.quoted or previous.quoted or enclosed[index],
                 )
+            # Attribution without quotation marks, resolved in this clause and
+            # nowhere else. It reports the same thing the quoted path reports,
+            # so it is recorded the same way -- as discussion, never as
+            # advisory, and never inherited by the next clause.
+            if _is_narrated(clause):
+                flags = ContextFlags(
+                    warning=flags.warning,
+                    notification=flags.notification,
+                    educational=flags.educational,
+                    quoted=True,
+                )
             resolved.append(flags)
         self._flags = resolved
 
@@ -522,6 +639,12 @@ class _LocalContext:
 
     def clause(self, index: int) -> str:
         return self._spans[index][2] if 0 <= index < len(self._spans) else ""
+
+    def at_index(self, index: int) -> ContextFlags:
+        """Framing resolved for a whole clause, by index rather than offset."""
+        if 0 <= index < len(self._flags):
+            return self._flags[index]
+        return self._fallback
 
     def introduces_list(self, index: int, text: str) -> bool:
         """True when this clause ended on a colon, i.e. it announces a list."""
@@ -1891,7 +2014,8 @@ _IDENTITY_CLAIM = _compile_all(
 )
 
 
-def _evaluate_identity(norm: NormalizedText, local: _LocalContext, has_asserted_trust: bool) -> list[RuleHit]:
+def _evaluate_identity(norm: NormalizedText, local: _LocalContext, has_asserted_trust: bool,
+                       demand: _Signal) -> list[RuleHit]:
     """An unsupported claim of official identity, sought at every occurrence.
 
     Stopping at the first claim let a quoted or educational mention of one
@@ -1915,6 +2039,8 @@ def _evaluate_identity(norm: NormalizedText, local: _LocalContext, has_asserted_
                     Severity.SUSPICIOUS,
                     "ID_UNSUPPORTED_CLAIM",
                     DiagnosticCode.IDENTITY_CLAIM_UNSUPPORTED,
+                    indicators=_payment_episode_marker(
+                        local.index_at(match.start()), demand, local, norm.security),
                 )
             ]
     return []
@@ -1963,7 +2089,42 @@ def _registrable_label(host: str) -> str:
     return parts[-2] if len(parts) >= 2 else host
 
 
-def _evaluate_links(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
+#: A content-free marker recording that this occurrence sits inside the same
+#: bounded payment episode as an independently supported payment demand. It
+#: is a closed vocabulary token of the same kind as a rule id -- no clause,
+#: no offset, no content.
+PAYMENT_EPISODE_MARKER = "PAY_EPISODE_LINKED"
+
+
+def _payment_episode_marker(
+    index: int, demand: _Signal, local: _LocalContext, text: str
+) -> tuple[str, ...]:
+    """``(PAYMENT_EPISODE_MARKER,)`` when this clause is part of a payment episode.
+
+    Three bounded positions, and nothing else: the demand's own clause, the
+    clause immediately beside it, or the instruction group the demand
+    introduces. A destination or an identity assertion standing next to the
+    demand is part of that demand -- "this is a notice from your bank" then
+    "pay immediately" is one instruction in two clauses. Anywhere further
+    away is not an episode, and neither is another paragraph, another
+    message, or another source.
+    """
+    if index < 0 or not demand.occurrences:
+        return ()
+    here = _Occurrence(index, local.clause(index), local.at_index(index))
+    for anchor in demand.occurrences:
+        if anchor.index < 0:
+            continue
+        if abs(anchor.index - index) <= 1:
+            return (PAYMENT_EPISODE_MARKER,)
+        if _relationship(anchor, here, local, text) is not None:
+            return (PAYMENT_EPISODE_MARKER,)
+    return ()
+
+
+def _evaluate_links(
+    norm: NormalizedText, local: _LocalContext, demand: _Signal
+) -> list[RuleHit]:
     text = norm.security
     hits: list[RuleHit] = []
     seen_rules: set[str] = set()
@@ -1981,6 +2142,8 @@ def _evaluate_links(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]
                 rule_id,
                 diagnostic,
                 ambiguous=ctx.is_discussion,
+                indicators=_payment_episode_marker(local.index_at(position["at"]), demand,
+                                                  local, text),
             )
         )
 
@@ -2438,12 +2601,16 @@ def evaluate_propagation(norm: NormalizedText | None, forwarding_count: int | No
 def evaluate_content(norm: NormalizedText, has_asserted_trust: bool = False) -> list[RuleHit]:
     """Run every content rule family over one normalized piece of content."""
     local = _LocalContext(norm.security, norm.boundary_offsets)
+    # The payment demands, collected once: the payment rules bind coercive
+    # signals to them, and the link and identity rules record whether they
+    # sit inside the same bounded episode.
+    demand = _collect_signal(_PAYMENT_DEMAND, norm.security, local)
     hits: list[RuleHit] = []
     hits.extend(_evaluate_injection(norm, local))
     hits.extend(_evaluate_credentials(norm, local))
     hits.extend(_evaluate_payment(norm, local))
     hits.extend(_evaluate_urgency(norm, local))
-    hits.extend(_evaluate_identity(norm, local, has_asserted_trust))
-    hits.extend(_evaluate_links(norm, local))
+    hits.extend(_evaluate_identity(norm, local, has_asserted_trust, demand))
+    hits.extend(_evaluate_links(norm, local, demand))
     hits.extend(_evaluate_unsafe_advice(norm, local))
     return hits

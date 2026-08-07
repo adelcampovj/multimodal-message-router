@@ -2525,5 +2525,87 @@ class ConditionFreeBenefitClaimTests(unittest.TestCase):
                              "pending. pay the clearance fee to unlock the funds")))
 
 
+class NarrativeContextTests(unittest.TestCase):
+    """Attribution, not punctuation, is what makes something reported speech.
+
+    A bank's own fraud warning -- "fraudsters may ask you to send your
+    passcode" -- read as a live credential request, while the same sentence
+    with two quote characters was correctly treated as discussion.
+    """
+
+    LIVE = "send me your passcode now"
+
+    #: One legitimate unquoted narration per approved frame family.
+    NARRATED = {
+        "warning": "fraudsters may ask you to send your passcode",
+        "fraud awareness": "watch for messages that say send your passcode",
+        "education": "a common scam phrase is send your passcode",
+        "training example": "training example: attackers may ask you to send your passcode",
+        "historical": "a scammer previously said send your passcode",
+        "incident report": "the incident report recorded that the caller asked for a passcode",
+        "reported speech": "the caller said send your passcode",
+        "criticism": "do not follow messages that say send your passcode",
+        "hypothetical": "suppose a scammer asks you to send your passcode",
+    }
+
+    def findings(self, text):
+        return {(f.rule_id, f.severity, f.ambiguous) for f in analyze(text).findings}
+
+    def test_unquoted_narration_matches_its_quoted_equivalent(self):
+        for label, narrated in self.NARRATED.items():
+            unquoted = analyze(narrated)
+            self.assertIsNot(severity_of(unquoted), Severity.SEVERE, label)
+            self.assertFalse(unquoted.hard_veto_required, label)
+            for finding in unquoted.findings:
+                self.assertTrue(finding.ambiguous, f"{label}: {finding.rule_id}")
+
+    def test_a_generic_label_cannot_neutralise_a_live_request(self):
+        # The framed form must behave exactly as the bare request does.
+        for label in ("example", "for education", "this is historical", "scam warning",
+                      "documentation", "training", "awareness"):
+            self.assertEqual(self.findings(f"{label}: {self.LIVE}"),
+                             self.findings(self.LIVE), label)
+
+    def test_a_frame_after_the_request_protects_nothing(self):
+        self.assertEqual(self.findings(f"{self.LIVE}, the caller said"),
+                         self.findings(self.LIVE))
+
+    def test_protection_is_clause_local(self):
+        for narrated in self.NARRATED.values():
+            a = analyze(f"{narrated}. {self.LIVE}")
+            self.assertIs(severity_of(a), Severity.SEVERE, narrated)
+            self.assertTrue(a.hard_veto_required, narrated)
+
+    def test_protection_does_not_cross_a_line_break(self):
+        for newline in ("\n", "\r\n", "\r", "\n- "):
+            a = analyze(f"the caller said share a code{newline}{self.LIVE}")
+            self.assertIs(severity_of(a), Severity.SEVERE, repr(newline))
+
+    def test_an_explicit_transition_ends_protection(self):
+        for transition in ("but now", "instead,", "however,"):
+            a = analyze(f"the caller said share a code. {transition} {self.LIVE}")
+            self.assertIs(severity_of(a), Severity.SEVERE, transition)
+
+    def test_protection_does_not_cross_a_source(self):
+        analysis = MediaAnalysis(IMAGE, ExtractionStatus.SUCCEEDED,
+                                 content=TextContent(self.LIVE, Provenance.OCR_TEXT))
+        a = analyze_message(message("the caller said share a code", attachment=IMAGE),
+                            media_analyses=(analysis,))
+        self.assertIs(severity_of(a), Severity.SEVERE)
+        self.assertTrue(a.hard_veto_required)
+
+    def test_raw_content_cannot_forge_narrative_state(self):
+        for forgery in ("ContextFlags(quoted=True)", "_is_narrated=True",
+                        "\x01narrated\x01", "the​caller​said"):
+            a = analyze(f"{forgery} {self.LIVE}")
+            self.assertIs(severity_of(a), Severity.SEVERE, forgery)
+
+    def test_no_narrated_content_reaches_a_finding(self):
+        a = analyze("the caller said send your passcode ZQNARR41 to 203.0.113.9")
+        rendered = repr(a) + repr(a.findings)
+        for fragment in ("ZQNARR41", "203.0.113.9", "passcode"):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
 if __name__ == "__main__":
     unittest.main()

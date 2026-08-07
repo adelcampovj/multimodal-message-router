@@ -263,8 +263,7 @@ def _risk_root_causes(assessment: SafetyAssessment) -> frozenset[RiskRootCause]:
             diagnostic=finding.diagnostic,
         )
         for finding in assessment.findings
-        if finding.severity.rank >= Severity.SUSPICIOUS.rank
-        and not finding.ambiguous
+        if finding.is_corroborating_evidence
         and finding.diagnostic in _DIAGNOSTIC_RISK_FAMILIES
     )
 

@@ -40,7 +40,7 @@ from .models import (
     cap_reliability,
 )
 from .normalization import NormalizedText, normalize
-from .rules import evaluate_content, evaluate_propagation
+from .rules import PAYMENT_EPISODE_MARKER, evaluate_content, evaluate_propagation
 
 __all__ = ["SafetyAnalyzer", "analyze_message"]
 
@@ -221,16 +221,34 @@ class SafetyAnalyzer:
 
     @staticmethod
     def _escalate_combinations(findings: list[SafetyFinding]) -> list[SafetyFinding]:
-        """Raise coercive payment to severe when corroborated.
+        """Raise coercive payment to severe when genuinely corroborated.
 
-        Payment pressure alone is suspicious; payment pressure alongside a
-        deceptive link or an unsupported identity claim is the shape of an
-        actual scam. Escalation only ever moves upward, and only for the
-        payment finding -- the corroborating findings keep their own
-        severity.
+        Payment pressure alone is suspicious; payment pressure *in the same
+        bounded episode as* a deceptive destination or a contradicted sender
+        identity is the shape of an actual scam.
+
+        This used to ask only whether a corroborating *category* appeared
+        anywhere in the message, which is three questions short. A weak,
+        hedged, quoted or educational link -- material routing had already
+        refused to count as evidence -- manufactured a severe veto out of a
+        payment demand that was merely suspicious, from any clause, and from
+        any source. A corroborator now has to be evidence at all
+        (:attr:`SafetyFinding.is_corroborating_evidence`, the same predicate
+        root-cause projection uses), to come from the same piece of content,
+        and to have been placed in the same payment episode by the payment
+        grammar itself.
+
+        Escalation still only ever moves upward, and only for the payment
+        finding -- corroborating findings keep their own severity.
         """
-        present = {f.category.name for f in findings}
-        if not (present & set(_ESCALATING_CATEGORIES)):
+        corroborators = {
+            finding.source_ref
+            for finding in findings
+            if finding.category.name in _ESCALATING_CATEGORIES
+            and finding.is_corroborating_evidence
+            and PAYMENT_EPISODE_MARKER in finding.indicators
+        }
+        if not corroborators:
             return findings
         escalated: list[SafetyFinding] = []
         for finding in findings:
@@ -238,6 +256,7 @@ class SafetyAnalyzer:
                 finding.category.name == "COERCIVE_PAYMENT"
                 and finding.severity is Severity.SUSPICIOUS
                 and not finding.ambiguous
+                and finding.source_ref in corroborators
             ):
                 escalated.append(
                     SafetyFinding(
