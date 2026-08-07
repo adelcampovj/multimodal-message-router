@@ -2422,11 +2422,16 @@ class AdvanceFeeEpisodeTests(unittest.TestCase):
         for label, text in self.RELATED.items():
             self.assertTrue(self.fired(text), label)
 
-    def test_the_unsolicited_award_opener_is_self_contained(self):
+    def test_an_unsolicited_award_is_an_anchor_not_a_finding(self):
+        # Announcing a benefit is not withholding one. Without a stated
+        # prerequisite there is no advance-fee episode to report.
         for text in ("you have won a cash prize",
                      "you are the winner of a lottery award",
                      "you have been selected for a cash reward"):
-            self.assertTrue(self.fired(text), text)
+            self.assertFalse(self.fired(text), text)
+        # It still anchors a condition that names it.
+        self.assertTrue(
+            self.fired("you have won a cash prize. pay the release fee to claim your reward"))
 
     def test_a_completed_benefit_cannot_anchor_a_condition(self):
         for text in ("your refund was completed. first, pay the clearance charge",
@@ -2462,6 +2467,62 @@ class AdvanceFeeEpisodeTests(unittest.TestCase):
         rendered = repr(a) + repr(a.findings)
         for fragment in ("ZQTXN44", "9912", "250", "clearance"):
             self.assertNotIn(fragment, rendered, fragment)
+
+
+class ConditionFreeBenefitClaimTests(unittest.TestCase):
+    """A benefit being mentioned is not a benefit being withheld.
+
+    An unsolicited award used to be an advance-fee finding on its own, so a
+    condition-free announcement projected a *substantive* ``ADVANCE_FEE``
+    family -- which then completed a two-family suppression with any
+    unrelated risk elsewhere in the message. Every advance-fee finding now
+    names the condition it is about.
+    """
+
+    #: One condition-free claim per supported benefit family.
+    CLAIMS = (
+        "you have won a prize",
+        "you have been selected for a reward",
+        "you are the winner of the lottery winnings",
+        "a payout has been arranged for you",
+        "compensation has been awarded to you",
+        "you have a claimable balance",
+        "a rebate has been issued to you",
+        "a reimbursement is owed to you",
+        "the funds are awaiting release",
+        "your refund has been approved",
+        "a refund is available to you",
+    )
+    WORDINGS = ("{}", "just to let you know, {}, thanks", "hi sam, {}", "{}!!")
+
+    def test_a_condition_free_claim_is_not_an_advance_fee_finding(self):
+        for claim in self.CLAIMS:
+            for wording in self.WORDINGS:
+                text = wording.format(claim)
+                self.assertNotIn("PAY_ADVANCE_FEE", rule_ids(analyze(text)), text)
+
+    def test_a_condition_free_claim_carries_no_extraction_provenance_either(self):
+        for provenance, ref in ((Provenance.OCR_TEXT, IMAGE),
+                                (Provenance.ASR_TRANSCRIPT, AUDIO)):
+            for claim in self.CLAIMS[:4]:
+                analysis = MediaAnalysis(ref, ExtractionStatus.SUCCEEDED,
+                                         content=TextContent(claim, provenance))
+                a = analyze_message(message(attachment=ref), media_analyses=(analysis,))
+                self.assertNotIn("PAY_ADVANCE_FEE", {f.rule_id for f in a.findings}, claim)
+
+    def test_a_condition_free_claim_still_anchors_a_stated_condition(self):
+        for text in ("you have won a cash prize. pay the release fee to claim your reward",
+                     "your refund has been approved. pay a clearance fee to receive the refund",
+                     "the funds are awaiting release. first, pay the clearance charge"):
+            self.assertIn("PAY_ADVANCE_FEE", rule_ids(analyze(text)), text)
+
+    def test_a_reference_to_another_family_does_not_pick_an_anchor(self):
+        # "the funds" names neither the prize nor the refund, so with two live
+        # benefits in play there is no structural way to say which is meant.
+        self.assertNotIn(
+            "PAY_ADVANCE_FEE",
+            rule_ids(analyze("your prize for march is waiting. your refund for april is "
+                             "pending. pay the clearance fee to unlock the funds")))
 
 
 if __name__ == "__main__":

@@ -745,9 +745,12 @@ class PolicyReachabilityTests(unittest.TestCase):
         ("route.risk.identity_credential_suppress",
          dict(text="This is an official notice from your bank. You have won a refund; "
                    "a clearance fee applies to release it.")),
+        # A complete advance-fee episode -- a benefit, a stated prerequisite,
+        # and the relationship between them -- beside a lookalike link. The
+        # announcement on its own is not a risk and cannot corroborate one.
         ("route.risk.payment_link_suppress",
-         dict(text="You have won a prize. Claim your reward at "
-                   "http://secure-verify-account.example/x")),
+         dict(text="You have won a prize. Pay the release fee to claim your reward. "
+                   "Claim it at http://secure-verify-account.example/x")),
         ("route.risk.advance_fee_pressure_suppress",
          dict(text="You have won a cash prize. Pay the release fee immediately to claim your reward.")),
         ("route.risk.unusual_channel_suppress",
@@ -2415,6 +2418,81 @@ class AdvanceFeeRoutingTests(unittest.TestCase):
                              repr(result.serialize()), repr(result.contributors)))
         for fragment in ("ZQTXN44", "9912", "250", "zqxuser", text):
             self.assertNotIn(fragment, rendered, fragment)
+
+
+class ConditionFreeBenefitRoutingTests(unittest.TestCase):
+    """A condition-free benefit announcement must contribute nothing to a
+    route: no advance-fee family, no root cause, and no route contributor."""
+
+    CLAIMS = ("You have won a prize.", "Your reward is available.",
+              "Your refund has been approved.", "The funds are awaiting release.")
+    #: Each is independently supported and independently justified.
+    RISKS = ("This is an official notice from your bank.",
+             "The status page is at http://203.0.113.9/x",
+             "Do not verify with the bank.",
+             "Remit the balance today using gift cards.")
+    SEPARATORS = (" ", "; ", ": ", "\n", "\r\n", "\r", "\n- ", ", however ", " but ")
+
+    def probe(self, text, **kwargs):
+        a, _c, f, result = run_pipeline(text, **kwargs)
+        return ({fi.rule_id for fi in a.findings},
+                {family.name for family in f.risk_families},
+                {cause.family.name for cause in f.risk_root_causes},
+                {rule for contributor in result.contributors for rule in contributor.rule_ids},
+                result.action, result.policy_id)
+
+    def test_a_condition_free_claim_contributes_nothing(self):
+        for claim in self.CLAIMS:
+            rules, families, roots, contributors, action, _policy = self.probe(claim)
+            self.assertNotIn("PAY_ADVANCE_FEE", rules, claim)
+            self.assertNotIn("ADVANCE_FEE", families, claim)
+            self.assertNotIn("ADVANCE_FEE", roots, claim)
+            self.assertNotIn("RISK_ADVANCE_FEE", contributors, claim)
+            self.assertIsNot(action, RoutingAction.SUPPRESS, claim)
+
+    def test_a_condition_free_claim_cannot_corroborate_an_unrelated_risk(self):
+        for claim in self.CLAIMS:
+            for risk in self.RISKS:
+                alone = self.probe(risk)
+                for separator in self.SEPARATORS:
+                    for text in (claim + separator + risk, risk + separator + claim):
+                        rules, families, roots, contributors, action, policy = self.probe(text)
+                        self.assertNotIn("PAY_ADVANCE_FEE", rules, text)
+                        self.assertNotIn("ADVANCE_FEE", families, text)
+                        self.assertNotIn("ADVANCE_FEE", roots, text)
+                        self.assertNotIn("RISK_ADVANCE_FEE", contributors, text)
+                        # The unrelated risk keeps exactly its own behaviour.
+                        self.assertIs(action, alone[4], text)
+                        self.assertEqual(policy, alone[5], text)
+
+    def test_a_condition_free_claim_cannot_corroborate_across_sources(self):
+        for ref, provenance in ((IMAGE, Provenance.OCR_TEXT),
+                                (AUDIO, Provenance.ASR_TRANSCRIPT),
+                                (IMAGE_B, Provenance.QR_DERIVED)):
+            analysis = MediaAnalysis(
+                ref, ExtractionStatus.SUCCEEDED,
+                content=TextContent("You have won a prize.", provenance))
+            rules, families, roots, contributors, _action, _policy = self.probe(
+                "This is an official notice from your bank.", attachment=ref, media=(analysis,))
+            self.assertNotIn("PAY_ADVANCE_FEE", rules, provenance.name)
+            self.assertNotIn("ADVANCE_FEE", families, provenance.name)
+            self.assertNotIn("ADVANCE_FEE", roots, provenance.name)
+            self.assertNotIn("RISK_ADVANCE_FEE", contributors, provenance.name)
+
+    def test_a_complete_episode_still_suppresses(self):
+        for text in ("You have won a prize. Pay the release fee to claim your reward. "
+                     "This is an official notice from your bank.",
+                     "Your refund is awaiting release. Pay a clearance fee to receive the "
+                     "refund. Do not verify with the bank."):
+            _rules, families, _roots, _contributors, action, _policy = self.probe(text)
+            self.assertIn("ADVANCE_FEE", families, text)
+            self.assertIs(action, RoutingAction.SUPPRESS, text)
+
+    def test_a_standalone_claim_does_not_hide_a_later_complete_episode(self):
+        rules, _families, _roots, _c, _a, _p = self.probe(
+            "You have won a prize. Your refund is awaiting release. Pay a clearance fee "
+            "to receive the refund.")
+        self.assertIn("PAY_ADVANCE_FEE", rules)
 
 
 if __name__ == "__main__":

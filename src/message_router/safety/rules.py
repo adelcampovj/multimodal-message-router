@@ -337,8 +337,8 @@ def _side_is_independent(side: str) -> bool:
         _any(patterns, stripped)
         for patterns in (
             _PAYMENT_DEMAND, _THREAT, _OFF_CHANNEL, _SECRECY,
-            _ANTI_VERIFICATION, _UNSOLICITED_WINNINGS, _BENEFIT_CLAIM,
-            _BENEFIT_CONDITION, _IDENTITY_CLAIM, _TIME_PRESSURE,
+            _ANTI_VERIFICATION, _BENEFIT_CLAIM, _BENEFIT_CONDITION,
+            _IDENTITY_CLAIM, _TIME_PRESSURE,
             # Routine billing is its own construction too: an invoice clause
             # must be separable from whatever follows the comma, or it
             # supplies "ordinary" cover for a demand that is not.
@@ -1036,18 +1036,19 @@ _ANTI_VERIFICATION = _compile_all(
     r"\b(?:do ?n[o']?t|dont)\b[^.]{0,20}\b(?:verify|confirm|double ?check)\b",
     r"\bthere is no need to (?:verify|confirm|check)\b",
 )
-#: An unsolicited award. Self-contained: the whole construction sits in one
-#: clause, so it is a finding on its own account and never a synthesis of two
-#: fragments. "You have won a prize" is the opener of the scam, not half of it.
-_UNSOLICITED_WINNINGS = _compile_all(
+#: An independently supported claim that something is owed to the reader.
+#:
+#: This is the *anchor* half of an advance-fee episode and nothing more. An
+#: unsolicited award used to be a finding on its own, which meant "you have
+#: won a prize" -- with no fee, no charge and nothing asked for -- projected
+#: a substantive ``ADVANCE_FEE`` family. That family then completed a
+#: two-family suppression with any unrelated risk elsewhere in the message,
+#: so an announcement plus a lookalike link suppressed on the strength of a
+#: prerequisite the message never stated. A benefit being *mentioned* is not
+#: a benefit being *withheld*: on its own this produces no finding at all.
+_BENEFIT_CLAIM = _compile_all(
     r"\b(?:you have |you've )?(?:won|win|winner of|selected for)\b[^.]{0,40}"
     r"\b(?:prize|lottery|reward|gift|cash|award)\b",
-)
-
-#: An independently supported claim that something is owed to the reader.
-#: This is the *anchor* half of an advance-fee episode; on its own it says
-#: only that a benefit was mentioned, and produces no finding.
-_BENEFIT_CLAIM = _compile_all(
     r"\b(?:your|a|an|the|this|that)\s+"
     r"(?:refund|rebate|reimbursement|payout|compensation|prize|reward|winnings|settlement)\b",
     r"\b(?:refund|rebate|reimbursement|payout|compensation|prize|reward|winnings)\b"
@@ -1535,14 +1536,35 @@ def _bound_to_payment(
 # ---------------------------------------------------------------------------
 
 #: An adjacent clause naming, by family, the benefit the condition gates.
-#: Naming it is what makes the reference unambiguous.
+#: Naming it is what makes the reference unambiguous -- but only when the
+#: family named is one the anchor actually is. "Pay the fee to unlock the
+#: funds" beside a prize and a refund names neither of them, so it is treated
+#: as underspecified rather than as a reference to whichever happens to be
+#: adjacent (see :func:`_benefit_relationship`).
 _BENEFIT_REFERENCE_RE = _c(
     r"\bto (?:receive|claim|release|obtain|unlock|collect|access|get)\s+"
-    r"(?:the|this|that|your|a|an)?\s*(?:refund|rebate|reimbursement|payout|compensation|"
+    r"(?:the|this|that|your|a|an)?\s*(refund|rebate|reimbursement|payout|compensation|"
     r"prize|reward|winnings|funds|money)\b"
-    r"|\b(?:to|for) (?:this|that|the|your) (?:refund|rebate|reimbursement|payout|"
+    r"|\b(?:to|for) (?:this|that|the|your) (refund|rebate|reimbursement|payout|"
     r"compensation|prize|reward|winnings|funds)\b"
 )
+
+#: The benefit families a clause names, used only to check that a reference
+#: and its anchor are talking about the same kind of thing.
+_BENEFIT_FAMILY_RE = _c(
+    r"\b(refund|rebate|reimbursement|payout|compensation|prize|reward|winnings|funds)\b"
+)
+
+
+def _named_benefit_families(clause: str) -> frozenset[str]:
+    return frozenset(match.group(1) for match in _BENEFIT_FAMILY_RE.finditer(clause))
+
+
+def _referenced_benefit_families(clause: str) -> frozenset[str]:
+    return frozenset(
+        group for match in _BENEFIT_REFERENCE_RE.finditer(clause)
+        for group in match.groups() if group
+    )
 
 #: The same relationship, expressed without saying which benefit. A pronoun
 #: or a bare release verb points at *a* benefit, and where the message names
@@ -1638,11 +1660,14 @@ def _benefit_relationship(
     if abs(anchor.index - other.index) == 1:
         if _distinct_benefit_episode(anchor.clause, other.clause):
             return None
-        if _BENEFIT_REFERENCE_RE.search(other.clause):
+        referenced = _referenced_benefit_families(other.clause)
+        if referenced & _named_benefit_families(anchor.clause):
             return "REL_BENEFIT_REFERENCE"
         if _same_benefit_episode(anchor.clause, other.clause):
             return "REL_BENEFIT_SHARED_ROOT"
-        if _GENERIC_BENEFIT_REFERENCE_RE.search(other.clause):
+        if referenced or _GENERIC_BENEFIT_REFERENCE_RE.search(other.clause):
+            # Either a pronoun, or a reference to a family the anchor is not:
+            # both point at *a* benefit without saying which.
             return "REL_BENEFIT_REFERENCE_GENERIC"
         if _BENEFIT_CONTINUATION_RE.search(other.clause):
             return "REL_BENEFIT_CONTINUATION"
@@ -1687,9 +1712,8 @@ def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHi
     # handed over. Both halves are collected where they sit, and the
     # condition has to reach the benefit through one of the five bounded
     # relationships -- a benefit noun somewhere and a fee noun somewhere else
-    # is not an episode. The unsolicited-award opener is separate: it is one
-    # self-contained clause, not two fragments joined.
-    winnings = _collect_signal(_UNSOLICITED_WINNINGS, text, local)
+    # is not an episode, and a benefit named with no prerequisite at all is
+    # not one either. Every advance-fee finding names a condition.
     benefit = _collect_signal(_BENEFIT_CLAIM, text, local)
     condition = _collect_signal(_BENEFIT_CONDITION, text, local)
     ambiguous_benefit = _benefit_anchor_ambiguity(benefit)
@@ -1705,10 +1729,7 @@ def _evaluate_payment(norm: NormalizedText, local: _LocalContext) -> list[RuleHi
     gated = _bound_occurrences(
         benefit, condition, local, text, relate_benefit, _distinct_benefit_episode
     )
-    advance_fee = _Signal(
-        winnings.occurrences + gated,
-        winnings.unframed or any(not o.flags.is_discussion for o in gated),
-    )
+    advance_fee = _Signal(gated, any(not o.flags.is_discussion for o in gated))
     ordinary = _is_ordinary(demand)
 
     def severity_for(signal: _Signal, base: Severity) -> Severity:
