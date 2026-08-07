@@ -163,6 +163,30 @@ def _alternation(actions: tuple[str, ...]) -> str:
     return "(?:" + "|".join(sorted(actions, key=len, reverse=True)) + ")"
 
 
+#: A trusted token edge for an action word.
+#:
+#: ``\b`` alone is not one. It treats a hyphen, a slash, an ``@`` and a dot as
+#: word edges, so ``disclose-log``, ``http://example.org/send/me``,
+#: ``@send_me`` and ``www.disclose.example`` all satisfy it -- and it does
+#: nothing at all about a stem sitting inside a longer word, which is where
+#: this went wrong: "disclose" is inside "disclosed", "send" is inside
+#: "sender", "enter" is inside "center", "tell" is inside "intelligence" and
+#: "text" is inside "context". An action recognised that way is not an action
+#: anyone performed; it is a spelling coincidence, and it was producing hard
+#: vetoes on incident reports, audit notes and ordinary sentences.
+#:
+#: A dot is admitted only when what follows it is not a word character, so a
+#: sentence-final "disclose." keeps working while a host label does not.
+#: Both lookbehinds are fixed width, as Python requires.
+_TOKEN_START = r"(?<![\w\-/@])(?<!\w\.)"
+_TOKEN_END = r"(?![\w\-/@])(?!\.\w)"
+
+
+def _action_token(actions: tuple[str, ...]) -> str:
+    """The reviewed actions, matchable only as whole tokens."""
+    return _TOKEN_START + _alternation(actions) + _TOKEN_END
+
+
 #: The protective form must cover every action the request form accepts.
 _WARNING_ACTION = _alternation(_DISCLOSURE_ACTIONS + _TRANSMISSION_ACTIONS)
 
@@ -1019,7 +1043,18 @@ def _evaluate_injection(norm: NormalizedText, local: _LocalContext) -> list[Rule
 #: Built from the shared action list, so the request grammar and the
 #: protective warning grammar cannot drift apart. Adding an action here adds
 #: its warning form in the same edit.
-_REQUEST_VERB = _alternation(_DISCLOSURE_ACTIONS)
+#:
+#: Matched as a token. The proximity matcher below carries no boundaries of
+#: its own, so an unbounded alternation let the base form match inside its
+#: own participle -- which is how "the passcode was disclosed yesterday in
+#: the incident", a sentence out of an incident report, became a severe
+#: credential request with a hard veto. Which historical sentences were
+#: caught depended on nothing but spelling: "disclosed", "provided",
+#: "shared", "entered", "forwarded", "submitted" and "given" contain their
+#: base form and "sent" does not. The passive forms that really are current
+#: demands are matched by their own bounded grammar further down, so
+#: nothing is lost by requiring a whole token here.
+_REQUEST_VERB = _action_token(_DISCLOSURE_ACTIONS)
 _RECIPIENT_POSSESSIVE = r"(?:your|the|me|us|it)"
 
 # A bare "pin" is a credential in one sense and a sewing supply, a map

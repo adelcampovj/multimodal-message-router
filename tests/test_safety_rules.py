@@ -8,6 +8,7 @@ left alone, which is where a rule set like this usually goes wrong.
 from __future__ import annotations
 
 import datetime as dt
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -40,11 +41,13 @@ from message_router.safety.normalization import (  # noqa: E402
     normalize,
 )
 from message_router.safety.rules import (  # noqa: E402
+    _CREDENTIAL_COMPILED,
     _CREDENTIAL_PASSIVE,
     _DISCLOSURE_ACTIONS,
     _PASSIVE_DISCLOSURE,
     _PASSIVE_REQUEST_ACTION,
     _WARNING_ACTION,
+    _action_token,
     _is_passive_credential_warning,
     _segment,
     _side_is_independent,
@@ -2887,13 +2890,30 @@ class PassiveCredentialWarningTests(unittest.TestCase):
             self.assertTrue(a.hard_veto_required, text)
 
     def test_protection_ends_at_a_new_imperative_in_the_same_clause(self):
-        """A prohibition and a demand in one breath is not a warning. The
-        demand is what has to survive."""
-        for tail in ("pay the 500 processing fee now to release your prize",
-                     "stop taking your prescribed medication",
-                     "click http://192.0.2.10/verify now"):
+        """A prohibition and a demand in one breath is not a warning, and the
+        demand keeps its own findings rather than inheriting the warning's
+        silence.
+
+        The severity these cases carried used to come from the credential
+        matcher reading "disclosed" as the verb "disclose" -- a match on a
+        participle, not a request. With that gone, each demand is asserted
+        against what it produces on its own.
+        """
+        for tail, expected in (
+                ("pay the 500 processing fee now to release your prize", "PAY_ADVANCE_FEE"),
+                ("click http://192.0.2.10/verify now", "LNK_RAW_IP")):
             text = f"your passcode should never be disclosed, {tail}"
             self.assertFalse(_is_passive_credential_warning(text), text)
+            self.assertIn(expected, rule_ids(analyze(text)), text)
+            # And identical to the demand standing on its own.
+            self.assertEqual(rule_ids(analyze(text)) - {"CRED_SECRET_DISCLOSURE_MENTION"},
+                             rule_ids(analyze(tail)), text)
+
+    def test_a_credential_request_beside_a_warning_still_vetoes(self):
+        """The credential case, which is the one this grammar is about: a live
+        request after the comma is severe, and the warning does not cover it."""
+        for tail in ("send me your passcode now", "your passcode must be sent to me"):
+            text = f"your passcode should never be disclosed, {tail}"
             a = analyze(text)
             self.assertIs(severity_of(a), Severity.SEVERE, text)
             self.assertTrue(a.hard_veto_required, text)
@@ -3180,6 +3200,156 @@ class PassiveCredentialRequestTests(unittest.TestCase):
         a = analyze("your passcode ZQPASSIVE9 must be sent to me now")
         rendered = repr(a) + repr(a.findings)
         for fragment in ("ZQPASSIVE9", "passcode"):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
+# ---------------------------------------------------------------------------
+# P2C3QR5 -- an action is a token, not a substring.
+# ---------------------------------------------------------------------------
+
+
+class ActionTokenBoundaryTests(unittest.TestCase):
+    """The active matcher pairs an action with a credential inside a bounded
+    gap, and the alternation carried no boundaries at all -- so the base form
+    matched inside its own participle. "The passcode was disclosed yesterday
+    in the incident" became a severe credential request with a hard veto, and
+    so did "the sender of the passcode was traced", "the data center holds the
+    passcode" and "the context of your OTP is unchanged". Which sentences were
+    caught depended on nothing but spelling: "disclosed" contains "disclose",
+    "sent" does not contain "send"."""
+
+    #: Base form, participle, gerund. Not a morphology model -- an explicit
+    #: table, used only to assert that the three are treated differently.
+    FORMS = (("disclose", "disclosed", "disclosing"), ("send", "sent", "sending"),
+             ("provide", "provided", "providing"), ("share", "shared", "sharing"),
+             ("enter", "entered", "entering"), ("forward", "forwarded", "forwarding"),
+             ("submit", "submitted", "submitting"), ("give", "given", "giving"))
+    #: Ordinary words that happen to contain a reviewed action stem.
+    LONGER = ("context", "center", "intelligence", "sender", "shareholder",
+              "enterprise", "nondisclosure", "disclosure", "provider", "typewriter",
+              "entertainment", "stereotype", "forgiven", "resend", "telltale")
+    OBJECTS = ("your password", "your passcode", "your OTP", "your PIN",
+               "your login code", "your verification code", "your recovery code",
+               "your card details", "your bank details", "the passcode", "the PIN",
+               "the OTP", "the card details", "the bank details")
+
+    def active_match(self, text):
+        return any(request.search(text)
+                   for _rid, request, _target, _diag in _CREDENTIAL_COMPILED)
+
+    def test_historical_narration_is_not_a_request(self):
+        for frame in ("{c} was disclosed yesterday", "{c} was shared previously",
+                      "{c} was sent during the incident",
+                      "{c} was provided in the earlier report",
+                      "{c} was entered during the prior event",
+                      "{c} was forwarded before the investigation",
+                      "{c} was submitted previously",
+                      "{c} was given during the incident",
+                      "{c} was typed during the demonstration",
+                      "{c} was messaged during the prior exchange"):
+            for obj in self.OBJECTS:
+                text = frame.format(c=obj)
+                a = analyze(text)
+                self.assertIsNot(severity_of(a), Severity.SEVERE, text)
+                self.assertFalse(a.hard_veto_required, text)
+
+    def test_the_base_form_is_still_a_request(self):
+        for frame in ("disclose {c}", "send me {c}", "provide {c}", "share {c}",
+                      "enter {c}", "forward {c}", "submit {c}", "give me {c}",
+                      "reply with {c}", "tell me {c}", "type {c} here"):
+            for obj in self.OBJECTS:
+                for shape in ("{r}", "Please {r}", "{r} now", "{r}.", "{r}!"):
+                    text = shape.format(r=frame.format(c=obj))
+                    a = analyze(text)
+                    self.assertIs(severity_of(a), Severity.SEVERE, text)
+                    self.assertTrue(a.hard_veto_required, text)
+
+    def test_each_inflection_is_judged_on_its_own(self):
+        """Base form asks; the participle asks only inside the bounded passive
+        grammar; the gerund and the bare past do not ask at all."""
+        for base, past, gerund in self.FORMS:
+            direct = f"{base} the passcode now"
+            passive = f"the passcode must be {past} to me"
+            historical = f"the passcode was {past} last year"
+            noun = f"the {gerund} of the passcode was reviewed"
+            self.assertIs(severity_of(analyze(direct)), Severity.SEVERE, direct)
+            self.assertIs(severity_of(analyze(passive)), Severity.SEVERE, passive)
+            self.assertIsNot(severity_of(analyze(historical)), Severity.SEVERE, historical)
+            self.assertIsNot(severity_of(analyze(noun)), Severity.SEVERE, noun)
+
+    def test_a_stem_inside_a_longer_word_is_not_an_action(self):
+        for word in self.LONGER:
+            for obj in self.OBJECTS:
+                text = f"the {word} of {obj} was reviewed"
+                self.assertFalse(self.active_match(text), text)
+                self.assertIsNot(severity_of(analyze(text)), Severity.SEVERE, text)
+
+    def test_a_stem_touching_a_separator_is_not_an_action(self):
+        """A hyphen, a slash, an ``@`` and a dotted label are all word edges to
+        ``\\b``, which is why ``\\b`` on its own is not a token boundary."""
+        for text in ("the disclose-log entry for your passcode was archived",
+                     "a send-queue error affected your passcode",
+                     "see http://disclose-your-passcode.example/x about your passcode",
+                     "the report is at http://example.org/send/me/ for your passcode",
+                     "@send_me_now filed a ticket about your passcode",
+                     "rule SEND_ME_CREDENTIAL fired for your passcode",
+                     "the flag disclose_target covers your passcode",
+                     "senddisclosure of your passcode was reviewed",
+                     "www.disclose.example holds your passcode"):
+            self.assertFalse(self.active_match(text), text)
+            self.assertIsNot(severity_of(analyze(text)), Severity.SEVERE, text)
+
+    def test_a_sentence_final_action_still_matches(self):
+        """The dot rule admits punctuation and refuses host labels, so an
+        imperative at the end of a sentence is untouched."""
+        for text in ("your passcode, please disclose.", "your OTP, please provide."):
+            self.assertTrue(self.active_match(text), text)
+
+    def test_the_token_helper_accepts_only_whole_tokens(self):
+        pattern = re.compile(_action_token(("send", "disclose")), re.IGNORECASE)
+        for accepted in ("send me", "please disclose", "disclose.", "(disclose)",
+                         "disclose, now", "SEND ME"):
+            self.assertIsNotNone(pattern.search(accepted), accepted)
+        for refused in ("sender", "sends", "sending", "resend", "disclosed",
+                        "disclosing", "send-queue", "send_me", "a/send/b",
+                        "@send", "www.send.example", "senddisclosure"):
+            self.assertIsNone(pattern.search(refused), refused)
+
+    def test_matched_active_and_historical_pairs_differ(self):
+        for active, historical in (
+                ("disclose {c} now", "{c} was disclosed previously"),
+                ("send me {c}", "{c} was sent during the incident"),
+                ("provide {c} to this requester", "{c} was provided during the investigation"),
+                ("enter {c} on this page", "{c} was entered in the earlier test")):
+            for obj in self.OBJECTS:
+                self.assertIs(severity_of(analyze(active.format(c=obj))),
+                              Severity.SEVERE, active.format(c=obj))
+                self.assertIsNot(severity_of(analyze(historical.format(c=obj))),
+                                 Severity.SEVERE, historical.format(c=obj))
+
+    def test_narration_never_hides_a_separate_live_request(self):
+        for frame in ('the caller said "{x}"', "the caller said {x}",
+                      "the incident report recorded that {x}",
+                      "our security awareness training explains how {x}",
+                      "this guide documents how {x}"):
+            narration = frame.format(x="the passcode was disclosed last year")
+            for separator in (". ", "; ", ": ", "\n", "\r\n", "\n- ", "\n1. ", "\n\n"):
+                for request in ("send me your passcode now",
+                                "your passcode must be sent to me"):
+                    for text in (narration + separator + request,
+                                 request + separator + narration):
+                        a = analyze(text)
+                        self.assertIs(severity_of(a), Severity.SEVERE, text)
+                        self.assertTrue(a.hard_veto_required, text)
+
+    def test_the_warning_grammar_still_covers_every_request_action(self):
+        for action in _DISCLOSURE_ACTIONS:
+            self.assertIn(action, _WARNING_ACTION, action)
+
+    def test_no_credential_value_reaches_a_finding(self):
+        a = analyze("your passcode ZQTOKEN311 was disclosed yesterday in the incident")
+        rendered = repr(a) + repr(a.findings)
+        for fragment in ("ZQTOKEN311", "passcode"):
             self.assertNotIn(fragment, rendered, fragment)
 
 

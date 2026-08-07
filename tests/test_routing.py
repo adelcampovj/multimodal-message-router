@@ -2896,17 +2896,27 @@ class PassiveWarningRoutingTests(unittest.TestCase):
             self.assertIs(action, RoutingAction.SUPPRESS, text)
             self.assertEqual(policy, "route.safety.hard_veto", text)
 
-    def test_a_demand_beside_a_warning_is_not_silenced(self):
-        """Protection ends at the new imperative, so the demand keeps its own
-        route instead of inheriting the warning's."""
+    def test_a_demand_beside_a_warning_keeps_its_own_route(self):
+        """Protection ends at the new imperative, so the demand routes as it
+        would on its own rather than inheriting the warning's deferral."""
         for tail in ("pay the 500 processing fee now to release your prize",
-                     "stop taking your prescribed medication"):
+                     "send me your passcode now"):
+            beside = self.probe(f"Your passcode should never be disclosed, {tail}")
+            alone = self.probe(tail)
+            self.assertIs(beside[2], RoutingAction.SUPPRESS, tail)
+            self.assertEqual(beside[3], alone[3], tail)
+
+    def test_a_medical_demand_after_a_boundary_still_vetoes(self):
+        """Across every boundary that ends a clause, the unsafe-advice rule is
+        untouched by the warning in front of it."""
+        for separator in (". ", "; ", "\n", "\r\n", "\n- ", "\n\n"):
             severity, veto, action, policy = self.probe(
-                f"Your passcode should never be disclosed, {tail}")
-            self.assertIs(severity, Severity.SEVERE, tail)
-            self.assertTrue(veto, tail)
-            self.assertIs(action, RoutingAction.SUPPRESS, tail)
-            self.assertEqual(policy, "route.safety.hard_veto", tail)
+                "Your passcode should never be disclosed." + separator
+                + "stop taking your prescribed medication")
+            self.assertIs(severity, Severity.SEVERE, repr(separator))
+            self.assertTrue(veto, repr(separator))
+            self.assertIs(action, RoutingAction.SUPPRESS, repr(separator))
+            self.assertEqual(policy, "route.safety.hard_veto", repr(separator))
 
     def test_protection_never_crosses_a_source(self):
         analysis = MediaAnalysis(
@@ -3040,6 +3050,77 @@ class PassiveRequestRoutingTests(unittest.TestCase):
         self.assertIsNot(severity, Severity.SEVERE)
         self.assertFalse(veto)
         self.assertNotEqual(policy, "route.safety.hard_veto")
+
+
+class HistoricalNarrationRoutingTests(unittest.TestCase):
+    """P2C3QR5 end to end. An incident report, an audit note and several
+    ordinary sentences reached ``route.safety.hard_veto`` and were suppressed,
+    because an action stem matched inside a longer word."""
+
+    HISTORICAL = (
+        "Your passcode was disclosed yesterday in the incident.",
+        "The OTP was shared previously with the auditor.",
+        "Your login code was provided in the earlier report.",
+        "The card details were entered during the prior event.",
+        "Your recovery code was forwarded before the investigation.",
+        "The bank details were submitted previously.",
+        "Your PIN was given during the incident.",
+        "The sender of your passcode was traced.",
+        "The data center holds your passcode securely.",
+        "The context of your OTP is unchanged.",
+        "Our intelligence team logged your passcode.",
+        "A shareholder asked about your passcode.",
+    )
+    ACTIVE = ("Disclose your passcode now.", "Send me your OTP.",
+              "Please provide your login code.", "Reply with your card details.",
+              "Enter your PIN on this page.", "Message me your bank details.")
+    PASSIVE = ("Your passcode must be sent to me.",
+               "Your login code should be provided to us now.",
+               "The PIN must be disclosed to support.",
+               "Your bank details are required from you.")
+
+    def probe(self, text, **kwargs):
+        a, _c, f, result = run_pipeline(text, **kwargs)
+        return (a.highest_severity, a.hard_veto_required, result.action, result.policy_id,
+                sorted(cause.family.name for cause in f.risk_root_causes))
+
+    def test_historical_narration_defers(self):
+        for text in self.HISTORICAL:
+            severity, veto, action, policy, roots = self.probe(text)
+            self.assertIsNot(severity, Severity.SEVERE, text)
+            self.assertFalse(veto, text)
+            self.assertIsNot(action, RoutingAction.SUPPRESS, text)
+            self.assertNotEqual(policy, "route.safety.hard_veto", text)
+            self.assertNotIn("INFORMATION_REQUEST", roots, text)
+
+    def test_direct_active_requests_still_suppress(self):
+        for text in self.ACTIVE:
+            severity, veto, action, policy, roots = self.probe(text)
+            self.assertIs(severity, Severity.SEVERE, text)
+            self.assertTrue(veto, text)
+            self.assertIs(action, RoutingAction.SUPPRESS, text)
+            self.assertEqual(policy, "route.safety.hard_veto", text)
+            self.assertIn("INFORMATION_REQUEST", roots, text)
+
+    def test_bounded_passive_requests_still_suppress(self):
+        for text in self.PASSIVE:
+            severity, veto, action, policy, _roots = self.probe(text)
+            self.assertIs(severity, Severity.SEVERE, text)
+            self.assertTrue(veto, text)
+            self.assertIs(action, RoutingAction.SUPPRESS, text)
+            self.assertEqual(policy, "route.safety.hard_veto", text)
+
+    def test_narration_beside_a_live_request_still_suppresses(self):
+        for narration in self.HISTORICAL[:4]:
+            for separator in (" ", "\n", "\n\n", "; "):
+                for request in ("Send me your passcode now.",
+                                "Your passcode must be sent to me."):
+                    for text in (narration + separator + request,
+                                 request + separator + narration):
+                        severity, veto, _a, policy, _r = self.probe(text)
+                        self.assertIs(severity, Severity.SEVERE, text)
+                        self.assertTrue(veto, text)
+                        self.assertEqual(policy, "route.safety.hard_veto", text)
 
 
 if __name__ == "__main__":
