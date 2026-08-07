@@ -269,7 +269,8 @@ def classify_context(norm: NormalizedText) -> ContextFlags:
     """
     text = norm.security
     return ContextFlags(
-        warning=_any(_WARNING_PATTERNS, text) or _is_pronoun_warning(text),
+        warning=(_any(_WARNING_PATTERNS, text) or _is_pronoun_warning(text)
+                 or _is_passive_credential_warning(text)),
         notification=_any(_NOTIFICATION_PATTERNS, text),
         educational=_any(_EDUCATIONAL_PATTERNS, text),
         quoted=_any(_QUOTED_PATTERNS, text),
@@ -819,7 +820,8 @@ def _quoted_spans(text: str) -> tuple[tuple[int, int], ...]:
 
 def _flags_for(clause: str) -> ContextFlags:
     return ContextFlags(
-        warning=_any(_WARNING_PATTERNS, clause) or _is_pronoun_warning(clause),
+        warning=(_any(_WARNING_PATTERNS, clause) or _is_pronoun_warning(clause)
+                 or _is_passive_credential_warning(clause)),
         notification=_any(_NOTIFICATION_PATTERNS, clause),
         educational=_any(_EDUCATIONAL_PATTERNS, clause),
         quoted=_any(_QUOTED_PATTERNS, clause),
@@ -1035,6 +1037,142 @@ _MESSAGE_TRANSMISSION_RE = _c(
     + r"|\bsend\s+an?\s+" + _MESSAGE_ACTION + r"\s+to\s+" + _TRANSMISSION_DESTINATION
     + r"\s+(?:with|containing|including|holding)\s+" + _TRANSMITTED_CREDENTIAL
 )
+
+
+# ---------------------------------------------------------------------------
+# Bounded credential warnings in passive and reordered word order.
+# ---------------------------------------------------------------------------
+#
+# The action-first grammar near the top of this file reads one order only:
+# negator, then action, then the secret. English writes the same prohibition
+# at least two other ways. "Your passcode should never be disclosed" names
+# the secret first; "callers must never be given your passcode" names the
+# recipient first. Both were read as a *request*, because the request grammar
+# is deliberately order-independent and the protective grammar was not -- so
+# a bank's own advice was vetoed as the phishing attempt it warns against.
+#
+# The correction is symmetry, not inference. The same closed action list is
+# written out in the passive, joined by the receipt end of the same act, and
+# governed by a bounded negative form that has to stand in front of it.
+# Nothing here reads meaning: every part is an enumerated token, the span is
+# one clause, and a form that merely *contains* a negative word does not
+# qualify.
+
+#: The shared disclosure actions in the passive. One list again, for the
+#: reason given where the active list is defined: a verb that is a request in
+#: one voice and invisible in the other is a silent hole.
+_PASSIVE_DISCLOSURE = _alternation((
+    "disclosed", "shared", "sent", "given", "provided", "entered", "forwarded",
+    "submitted", "revealed", "told", "typed", "pasted", "transmitted",
+    "confirmed", "verified", "texted", "messaged", "handed over", "read out",
+    "shown", "divulged", "repeated", "passed on",
+))
+#: The receipt end of the same act. "Nobody should receive your code" and
+#: "never give anybody your code" prohibit one event from two sides.
+_RECEIPT_ACTION = _alternation(("receive", "receives", "obtain", "obtains"))
+_WARNING_PASSIVE_ACTION = r"(?:" + _PASSIVE_DISCLOSURE + r"|" + _RECEIPT_ACTION + r")"
+
+#: Who a warning names as the party that must not be told. Closed on
+#: purpose: an open noun would let the negative-subject form below reach
+#: "no invoice should be sent", which is about an invoice, not a secret.
+_WARNING_RECIPIENT = (
+    r"(?:callers?|agents?|representatives?|operators?|advisors?|advisers?|"
+    r"employees?|colleagues?|strangers?|contacts?|third partie?s?|parties|"
+    r"persons?|people|customers?|clients?|members?|staff(?: members?)?|"
+    r"others?)"
+)
+_NEGATIVE_SUBJECT = (
+    r"(?:no ?one|nobody|none of (?:them|us|you)|no\s+" + _WARNING_RECIPIENT + r")"
+)
+#: A bounded prohibition or impossibility. Every member is a closed-class
+#: token or a reviewed modal carrying its own negator. A bare "not" is
+#: deliberately not enough -- "it is not prohibited to send your passcode"
+#: has a negative word in it and is a demand.
+_PROHIBITION = (
+    r"(?:never|cannot|can ?not|ca ?n'?t|wo ?n'?t|"
+    r"(?:must|should|shall|may|might|can|could|will|would|need|needs|is|are|"
+    r"do|does|am|ought to)\s*n[o']?t|" + _NEGATIVE_SUBJECT + r")"
+)
+#: What turns a prohibition back into a demand: "do not refuse to send",
+#: "nobody should fail to provide", "must not be prevented from being sent".
+#: Checked only in the span between the negative form and the action it is
+#: supposed to govern, never anywhere else in the clause.
+_INVERSION_RE = _c(
+    r"\b(?:refuse[sd]?|refusing|avoid(?:s|ed|ing)?|fail(?:s|ed|ing)?|"
+    r"hesitate[sd]?|hesitating|neglect(?:s|ed|ing)?|omit(?:s|ted|ting)?|"
+    r"decline[sd]?|declining|forget(?:s|ting)?|withh(?:old|olds|eld|olding)|"
+    r"prohibit(?:s|ed|ing)?|forbid(?:s|den|ding)?|ban(?:s|ned|ning)?|"
+    r"prevent(?:s|ed|ing)?|stop(?:s|ped|ping)?|delay(?:s|ed|ing)?)\b"
+)
+#: Prohibition first, then the action it governs, within one bounded gap.
+#: The order *is* the governance rule: a negative form arriving after the
+#: action is not governing it, and a gap that leaves the sentence -- the
+#: class excludes "." -- is not local.
+_PASSIVE_WARNING_RE = _c(
+    r"\b" + _PROHIBITION + r"(?P<gap>[^.]{0,25}?)"
+    r"(?:\b(?:be|been|being|get|got|gets)\s+)?\b" + _WARNING_PASSIVE_ACTION + r"\b"
+)
+#: The same prohibition written as a state rather than an act: "your
+#: passcode must remain private". Bounded to a reviewed obligation, a
+#: reviewed state verb, and a reviewed privacy word.
+_SECRECY_STATE_RE = _c(
+    r"\b(?:must|should|shall|has to|have to|needs? to|is to|are to|ought to)\s+"
+    r"(?:always\s+|only\s+|strictly\s+)?"
+    r"(?:remain|stay|be kept|be held|be treated as)\s+"
+    r"(?:strictly\s+|entirely\s+|completely\s+|fully\s+)?"
+    r"(?:private|confidential|secret|secure)\b"
+)
+#: A prohibition protects nothing in a clause that is, in the same breath,
+#: asking for the secret to arrive somewhere *now*. The verbs are the shared
+#: request list and the destinations are the current ones; a passive
+#: participle can never satisfy this, because the word boundary rejects it.
+_CURRENT_DESTINATION = (
+    r"(?:me|us|here|this (?:page|link|number|account|form|chat|site|address)|"
+    r"our (?:account|number|team|desk|page|link)|my (?:account|number))"
+)
+_DIRECTED_REQUEST_RE = _c(
+    r"\b" + _REQUEST_VERB + r"\s+(?:me|us)\b"
+    r"|\b" + _REQUEST_VERB + r"\b[^.]{0,30}?\b(?:to|with|for|on|at|into)\s+"
+    + _CURRENT_DESTINATION + r"\b"
+)
+#: Where protection ends inside a clause. Every other termination -- a
+#: trusted adversative, a line, a bullet, a paragraph, a heading, a change of
+#: attribution or of provenance -- has already ended the clause before this
+#: is reached. The one that has not is a bare comma in front of a new
+#: imperative, and a warning must not reach across it: "your passcode should
+#: never be disclosed, pay the release fee now" prohibits one thing and
+#: demands another, and silencing the demand is the whole failure this
+#: grammar exists to avoid. The verb list is closed and the position is
+#: structural -- clause start, or immediately after a comma.
+_NEW_DIRECTIVE_RE = _c(
+    r"(?:^|,)\s*(?:(?:and|then|so|now|but|instead|also|please|next)\s+)*"
+    r"\b(?:" + _REQUEST_VERB + r"|pay|transfer|wire|remit|deposit|click|tap|"
+    r"open|visit|go to|download|install|buy|purchase|order|stop|start|ignore|"
+    r"disregard|follow|scan|log ?in|sign ?in|update|renew|activate|claim|"
+    r"register|call|dial|contact|answer|approve|authorise|authorize)\b"
+)
+
+
+def _is_passive_credential_warning(clause: str) -> bool:
+    """A bounded negative credential warning in passive or reordered order.
+
+    Every condition of the approved invariant is checked inside ``clause``,
+    and the clause *is* the governed span -- which is what keeps this local:
+    a supported credential object, a supported negative form, a supported
+    disclosure or receipt action, the negative form standing in front of that
+    action with no inversion between the two, no request aimed at a current
+    destination, and no new imperative anywhere in the same clause.
+    """
+    if not any(target.search(clause) for _rid, _req, target, _diag in _CREDENTIAL_COMPILED):
+        return False
+    if _LIVE_REQUEST_RE.search(clause) or _DIRECTED_REQUEST_RE.search(clause):
+        return False
+    if _NEW_DIRECTIVE_RE.search(clause):
+        return False
+    for match in _PASSIVE_WARNING_RE.finditer(clause):
+        if not _INVERSION_RE.search(match.group("gap")):
+            return True
+    return bool(_SECRECY_STATE_RE.search(clause))
 
 
 def _evaluate_credentials(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:

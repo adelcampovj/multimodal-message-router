@@ -41,7 +41,9 @@ from message_router.safety.normalization import (  # noqa: E402
 )
 from message_router.safety.rules import (  # noqa: E402
     _DISCLOSURE_ACTIONS,
+    _PASSIVE_DISCLOSURE,
     _WARNING_ACTION,
+    _is_passive_credential_warning,
     _segment,
     _side_is_independent,
 )
@@ -2765,6 +2767,171 @@ class WarningThenRequestTests(unittest.TestCase):
 
     def test_no_credential_value_reaches_a_finding(self):
         a = analyze("our bank will never ask for your passcode, but send me your "
+                    "passcode ZQSECRET7 now")
+        rendered = repr(a) + repr(a.findings)
+        for fragment in ("ZQSECRET7", "passcode"):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
+# ---------------------------------------------------------------------------
+# P2C3QR3 -- warning symmetry across word order.
+# ---------------------------------------------------------------------------
+
+
+class PassiveCredentialWarningTests(unittest.TestCase):
+    """The protective grammar read one word order; the request grammar reads
+    every order. "Your passcode should never be disclosed" -- the sentence a
+    bank prints on its own statements -- was therefore scored as the demand it
+    prohibits, vetoed, and suppressed."""
+
+    #: The reviewed active/passive pairing. Adding a disclosure action without
+    #: adding its passive form is the drift this table exists to fail on.
+    #: "reply with" names the same event as "sent", which is why it maps there.
+    PASSIVE_OF = {
+        "reply with": "sent", "read out": "read out", "hand over": "handed over",
+        "send": "sent", "share": "shared", "give": "given", "tell": "told",
+        "forward": "forwarded", "provide": "provided", "submit": "submitted",
+        "enter": "entered", "type": "typed", "confirm": "confirmed",
+        "verify": "verified", "text": "texted", "paste": "pasted",
+        "reveal": "revealed", "disclose": "disclosed", "transmit": "transmitted",
+    }
+    OBJECTS = ("your password", "your passcode", "your OTP", "the OTP",
+               "your login code", "your verification code", "the recovery code",
+               "your authentication code", "your card details",
+               "your banking credentials", "the passcode")
+    NEGATIVES = ("should never be", "must not be", "should not be", "must never be",
+                 "cannot be", "can not be", "shouldn't be", "mustn't be",
+                 "will never be", "is not to be", "may never be")
+    RECIPIENTS = ("Callers", "callers", "A caller", "support agents",
+                  "Nobody", "no one", "No representative", "no representatives",
+                  "Strangers", "a stranger", "Third parties", "Staff",
+                  "staff members", "Unknown contacts")
+
+    def test_the_passive_grammar_covers_every_reviewed_active_action(self):
+        self.assertEqual(set(self.PASSIVE_OF), set(_DISCLOSURE_ACTIONS))
+        for action, passive in self.PASSIVE_OF.items():
+            self.assertIn(passive, _PASSIVE_DISCLOSURE, action)
+
+    def test_every_credential_first_warning_stays_non_severe(self):
+        for obj in self.OBJECTS:
+            for negative in self.NEGATIVES:
+                for passive in ("disclosed", "shared", "sent", "given", "provided",
+                                "entered", "forwarded", "submitted", "revealed",
+                                "told", "shown"):
+                    text = f"{obj} {negative} {passive}."
+                    self.assertIsNot(severity_of(analyze(text)), Severity.SEVERE, text)
+
+    def test_every_recipient_first_warning_stays_non_severe(self):
+        for recipient in self.RECIPIENTS:
+            for form in ("must never be given", "must not be sent",
+                         "should not be told", "must not be shown",
+                         "should never receive", "should not be provided"):
+                for obj in self.OBJECTS:
+                    text = f"{recipient} {form} {obj}."
+                    self.assertIsNot(severity_of(analyze(text)), Severity.SEVERE, text)
+
+    def test_a_secrecy_obligation_is_a_warning_too(self):
+        for obj in self.OBJECTS:
+            for state in ("must remain private", "should remain confidential",
+                          "must be kept secret", "has to stay private"):
+                text = f"{obj} {state}."
+                self.assertIsNot(severity_of(analyze(text)), Severity.SEVERE, text)
+
+    def test_the_action_first_order_is_unchanged(self):
+        for obj in self.OBJECTS:
+            for form in ("Never share {o} with anyone.", "Do not send {o} to a caller.",
+                         "Never disclose {o} over the phone."):
+                text = form.format(o=obj)
+                self.assertIsNot(severity_of(analyze(text)), Severity.SEVERE, text)
+
+    def test_a_passive_request_is_not_a_warning(self):
+        """Passive voice on its own protects nothing: without a prohibition
+        governing the action, the sentence is still asking."""
+        for obj in self.OBJECTS:
+            for form in ("{o} should be provided to us now.",
+                         "{o} needs to be entered on this page.",
+                         "{o} must be disclosed to support.",
+                         "{o} should be forwarded here.",
+                         "{o} must be given to this account.",
+                         "{o} needs to be submitted now."):
+                text = form.format(o=obj)
+                self.assertFalse(_is_passive_credential_warning(text), text)
+                self.assertIs(severity_of(analyze(text)), Severity.SEVERE, text)
+
+    def test_a_negative_word_alone_is_not_a_prohibition(self):
+        """Double negation and inversion put the demand back. None of these
+        may buy protection from the new grammar."""
+        for text in ("do not refuse to send your passcode",
+                     "you must not avoid sharing your passcode",
+                     "nobody should fail to provide your passcode",
+                     "your passcode should not remain undisclosed",
+                     "your passcode must not be withheld",
+                     "it is not prohibited to send your passcode",
+                     "do not fail to enter your passcode",
+                     "your passcode must not be prevented from being sent to me",
+                     "callers must not be stopped from being given your passcode",
+                     "nobody should be prevented from receiving your passcode"):
+            self.assertFalse(_is_passive_credential_warning(text), text)
+
+    def test_protection_ends_at_a_request_in_the_same_clause(self):
+        for text in ("your passcode must remain private, send it to me",
+                     "your passcode should never be disclosed, enter it on this page",
+                     "your card details must never be shared, provide them to us now",
+                     "callers must never be given your passcode, forward it to us"):
+            self.assertFalse(_is_passive_credential_warning(text), text)
+            a = analyze(text)
+            self.assertIs(severity_of(a), Severity.SEVERE, text)
+            self.assertTrue(a.hard_veto_required, text)
+
+    def test_protection_ends_at_a_new_imperative_in_the_same_clause(self):
+        """A prohibition and a demand in one breath is not a warning. The
+        demand is what has to survive."""
+        for tail in ("pay the 500 processing fee now to release your prize",
+                     "stop taking your prescribed medication",
+                     "click http://192.0.2.10/verify now"):
+            text = f"your passcode should never be disclosed, {tail}"
+            self.assertFalse(_is_passive_credential_warning(text), text)
+            a = analyze(text)
+            self.assertIs(severity_of(a), Severity.SEVERE, text)
+            self.assertTrue(a.hard_veto_required, text)
+
+    def test_a_warning_never_neutralises_a_separate_request(self):
+        for warning in ("your passcode should never be disclosed",
+                        "callers must never be given your passcode",
+                        "your passcode must remain private"):
+            for separator in (". ", "; ", "\n", "\r\n", "\r", ", but ", ", however ",
+                              ", instead ", ", actually ", ", then ", "\n- ", "\n* ",
+                              "\n• ", "\n1. ", "\n1) ", "\n\n"):
+                for request in ("send me your passcode", "reply with your passcode",
+                                "tell me your passcode", "submit your passcode now"):
+                    forward = warning + separator + request
+                    reverse = request + separator + warning
+                    self.assertIs(severity_of(analyze(forward)), Severity.SEVERE,
+                                  f"{separator!r}|{request}")
+                    self.assertIs(severity_of(analyze(reverse)), Severity.SEVERE,
+                                  f"{separator!r}|{request}")
+
+    def test_a_generic_label_cannot_convert_a_request(self):
+        for label in ("warning: ", "education: ", "historical example: ",
+                      "documentation: ", "fraud awareness: "):
+            for request in ("send me your passcode",
+                            "your passcode must be disclosed to support"):
+                text = label + request
+                a = analyze(text)
+                self.assertIs(severity_of(a), Severity.SEVERE, text)
+                self.assertTrue(a.hard_veto_required, text)
+
+    def test_protection_does_not_cross_a_source(self):
+        analysis = MediaAnalysis(
+            IMAGE, ExtractionStatus.SUCCEEDED,
+            content=TextContent("Send me your passcode now.", Provenance.OCR_TEXT))
+        a = analyze_message(message("Your passcode should never be disclosed.",
+                                    attachment=IMAGE), media_analyses=(analysis,))
+        self.assertIs(severity_of(a), Severity.SEVERE)
+        self.assertTrue(a.hard_veto_required)
+
+    def test_no_credential_value_reaches_a_finding(self):
+        a = analyze("your passcode should never be disclosed. send me your "
                     "passcode ZQSECRET7 now")
         rendered = repr(a) + repr(a.findings)
         for fragment in ("ZQSECRET7", "passcode"):

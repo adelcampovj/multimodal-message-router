@@ -2832,5 +2832,94 @@ class BoundedEscalationTests(unittest.TestCase):
             self.assertIsNot(action, RoutingAction.SUPPRESS, warning)
 
 
+class PassiveWarningRoutingTests(unittest.TestCase):
+    """P2C3QR3 end to end. A bank's own advice, written with the secret or the
+    recipient first, reached ``route.safety.hard_veto`` and was suppressed --
+    the strongest outcome the router has, spent on the warning itself."""
+
+    WARNINGS = (
+        "Your passcode should never be disclosed.",
+        "Your passcode must not be disclosed to callers.",
+        "Callers must never be given your passcode.",
+        "Nobody should be provided your recovery code.",
+        "Third parties must not be shown your card details.",
+        "No representative should receive your login code.",
+        "Your verification code must remain private.",
+    )
+
+    def probe(self, text, **kwargs):
+        a, _c, _f, result = run_pipeline(text, **kwargs)
+        return a.highest_severity, a.hard_veto_required, result.action, result.policy_id
+
+    def test_a_passive_warning_is_not_vetoed(self):
+        for warning in self.WARNINGS:
+            severity, veto, action, policy = self.probe(warning)
+            self.assertIsNot(severity, Severity.SEVERE, warning)
+            self.assertFalse(veto, warning)
+            self.assertIsNot(action, RoutingAction.SUPPRESS, warning)
+            self.assertNotEqual(policy, "route.safety.hard_veto", warning)
+
+    def test_a_live_request_after_a_passive_warning_still_suppresses(self):
+        for warning in self.WARNINGS:
+            for separator in (". ", "; ", "\n", "\r\n", ", but ", ", however ",
+                              ", instead ", ", actually ", ", then ", "\n- ",
+                              "\n1. ", "\n\n"):
+                text = warning + separator + "send me your passcode now"
+                label = f"{warning}|{separator!r}"
+                severity, veto, action, policy = self.probe(text)
+                self.assertIs(severity, Severity.SEVERE, label)
+                self.assertTrue(veto, label)
+                self.assertIs(action, RoutingAction.SUPPRESS, label)
+                self.assertEqual(policy, "route.safety.hard_veto", label)
+
+    def test_a_passive_warning_after_a_request_does_not_erase_it(self):
+        for warning in self.WARNINGS:
+            for separator in (". ", "; ", "\n", ", but ", ", however "):
+                text = "Send me your passcode now" + separator + warning
+                label = f"{warning}|{separator!r}"
+                severity, veto, action, policy = self.probe(text)
+                self.assertIs(severity, Severity.SEVERE, label)
+                self.assertTrue(veto, label)
+                self.assertIs(action, RoutingAction.SUPPRESS, label)
+                self.assertEqual(policy, "route.safety.hard_veto", label)
+
+    def test_a_passive_request_is_still_suppressed(self):
+        """Passive voice is not protection: with no prohibition governing the
+        action, the sentence is asking, and the route says so."""
+        for text in ("Your passcode should be provided to us now.",
+                     "Your login code needs to be entered on this page.",
+                     "Your card details must be disclosed to support.",
+                     "Your recovery code must be given to this account."):
+            severity, veto, action, policy = self.probe(text)
+            self.assertIs(severity, Severity.SEVERE, text)
+            self.assertTrue(veto, text)
+            self.assertIs(action, RoutingAction.SUPPRESS, text)
+            self.assertEqual(policy, "route.safety.hard_veto", text)
+
+    def test_a_demand_beside_a_warning_is_not_silenced(self):
+        """Protection ends at the new imperative, so the demand keeps its own
+        route instead of inheriting the warning's."""
+        for tail in ("pay the 500 processing fee now to release your prize",
+                     "stop taking your prescribed medication"):
+            severity, veto, action, policy = self.probe(
+                f"Your passcode should never be disclosed, {tail}")
+            self.assertIs(severity, Severity.SEVERE, tail)
+            self.assertTrue(veto, tail)
+            self.assertIs(action, RoutingAction.SUPPRESS, tail)
+            self.assertEqual(policy, "route.safety.hard_veto", tail)
+
+    def test_protection_never_crosses_a_source(self):
+        analysis = MediaAnalysis(
+            IMAGE, ExtractionStatus.SUCCEEDED,
+            content=TextContent("Send me your passcode now.", Provenance.OCR_TEXT))
+        severity, veto, action, policy = self.probe(
+            "Callers must never be given your passcode.",
+            attachment=IMAGE, media=(analysis,))
+        self.assertIs(severity, Severity.SEVERE)
+        self.assertTrue(veto)
+        self.assertIs(action, RoutingAction.SUPPRESS)
+        self.assertEqual(policy, "route.safety.hard_veto")
+
+
 if __name__ == "__main__":
     unittest.main()
