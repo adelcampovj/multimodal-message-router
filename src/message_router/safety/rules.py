@@ -292,7 +292,7 @@ _CLAUSE_BOUNDARY_RE = re.compile(r"[.!?;:]+")
 #: see :func:`_side_is_independent` -- which is a structural test over the
 #: existing framing and safety patterns, not an inference about meaning.
 _WEAK_SEPARATOR_RE = _c(
-    r",\s+(?:but|however|yet|nevertheless|instead|then|therefore|still)\b"
+    r",\s+(?:but|however|yet|nevertheless|instead|then|therefore|still|actually)\b"
     r"|\s+(?:but|yet|and then|while|although)\b"
 )
 
@@ -331,8 +331,15 @@ def _side_is_independent(side: str, lookahead: str = "") -> bool:
     for _rid, pattern, _diag in _INJECTION_COMPILED:
         if pattern.search(stripped):
             return True
-    for _rid, request_pattern, _target, _diag in _CREDENTIAL_COMPILED:
-        if request_pattern.search(stripped):
+    # Both halves of the credential grammar count. Only the *request* half did,
+    # so "our bank will never ask for your passcode" -- which names a secret
+    # and says something about it, but asks for nothing -- was not evaluable,
+    # the adversative in front of the next clause had its boundary refused,
+    # and the warning and a live request that followed it shared one clause.
+    # The warning wording then reached across the transition and silenced the
+    # request outright. A full stop in the same place had never done that.
+    for _rid, request_pattern, target_pattern, _diag in _CREDENTIAL_COMPILED:
+        if request_pattern.search(stripped) or target_pattern.search(stripped):
             return True
     if _MESSAGE_TRANSMISSION_RE.search(stripped):
         return True

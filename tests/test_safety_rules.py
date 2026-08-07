@@ -2670,5 +2670,106 @@ class AdversativeBoundaryTests(unittest.TestCase):
             self.assertNotIn(fragment, rendered, fragment)
 
 
+class WarningThenRequestTests(unittest.TestCase):
+    """A warning protects what it says, not what comes after it.
+
+    "Our bank will never ask for your passcode, but send me your passcode
+    now" produced no finding at all. The warning half names a secret and
+    asks for nothing, so it was not independently evaluable, the adversative
+    boundary was refused, and both halves shared one clause -- at which point
+    the warning wording reached across the transition and silenced the live
+    request. A full stop in the same place had always worked.
+    """
+
+    CREDENTIALS = ("passcode", "password", "otp", "pin", "login code",
+                   "verification code", "authentication code", "recovery code")
+    TRANSITIONS = (", but ", ", however ", ", instead ", ", actually ", ", then ")
+    STRONG = ("; ", ". ", "\n", "\r\n", "\r", "\n- ", "\n* ", "\n• ", "\n1. ", "\n1) ",
+              "\n\n")
+    ACTIONS = ("send me", "send us", "reply with", "provide", "share", "enter",
+               "disclose", "forward", "submit", "type", "tell me")
+
+    def severe(self, text):
+        a = analyze(text)
+        return severity_of(a) is Severity.SEVERE and a.hard_veto_required
+
+    def test_a_warning_does_not_hide_a_later_request(self):
+        for credential in self.CREDENTIALS:
+            warning = f"our bank will never ask for your {credential}"
+            request = f"send me your {credential} now"
+            for separator in self.TRANSITIONS + self.STRONG:
+                self.assertTrue(self.severe(warning + separator + request),
+                                f"{credential}: {separator!r}")
+
+    def test_every_supported_action_survives_a_warning(self):
+        warning = "our bank will never ask for your passcode"
+        for action in self.ACTIONS:
+            request = f"{action} your passcode now"
+            if not self.severe(request):
+                continue  # not independently severe on its own
+            self.assertTrue(self.severe(f"{warning}, but {request}"), action)
+
+    def test_a_warning_alone_is_still_not_a_request(self):
+        for credential in self.CREDENTIALS:
+            for warning in (f"we will never ask you to disclose your {credential}",
+                            f"never share your {credential} with anyone",
+                            f"do not send your {credential} to anyone",
+                            f"we will never request your {credential}"):
+                a = analyze(warning)
+                self.assertIsNot(severity_of(a), Severity.SEVERE, warning)
+                self.assertFalse(a.hard_veto_required, warning)
+
+    def test_a_later_warning_does_not_erase_an_earlier_request(self):
+        for tail in ("our bank will never ask for your passcode",
+                     "a common scam phrase is share your passcode",
+                     "the caller said share your passcode"):
+            for separator in (". ", ", but "):
+                self.assertTrue(
+                    self.severe(f"send me your passcode now{separator}{tail}"), tail)
+
+    def test_negation_does_not_cross_a_transition(self):
+        self.assertFalse(self.severe("never share your passcode with anyone"))
+        self.assertTrue(self.severe(
+            "never share your passcode, but send me your passcode now"))
+        self.assertTrue(self.severe(
+            "do not share your passcode. now send me your passcode"))
+
+    def test_a_generic_label_still_hides_nothing(self):
+        request = "send me your passcode now"
+        bare = {(f.rule_id, f.severity) for f in analyze(request).findings}
+        for label in ("warning", "education", "historical", "documentation",
+                      "fraud awareness", "training", "example"):
+            labelled = {(f.rule_id, f.severity)
+                        for f in analyze(f"{label}: {request}").findings}
+            self.assertEqual(labelled, bare, label)
+
+    def test_a_credential_name_makes_its_side_evaluable(self):
+        # The warning half names a secret; that is enough to be judged on its
+        # own, which is what lets the adversative boundary be taken.
+        self.assertTrue(_side_is_independent("our bank will never ask for your passcode"))
+        self.assertEqual(
+            len(_segment("our bank will never ask for your passcode, but send me "
+                         "your passcode now")), 2)
+
+    def test_a_coordinated_credential_phrase_is_still_not_split(self):
+        self.assertEqual(len(_segment("the pin and account number are on the card")), 1)
+
+    def test_protection_does_not_cross_a_source(self):
+        analysis = MediaAnalysis(
+            IMAGE, ExtractionStatus.SUCCEEDED,
+            content=TextContent("Send me your passcode now.", Provenance.OCR_TEXT))
+        a = analyze_message(message("Our bank will never ask for your passcode.",
+                                    attachment=IMAGE), media_analyses=(analysis,))
+        self.assertIs(severity_of(a), Severity.SEVERE)
+        self.assertTrue(a.hard_veto_required)
+
+    def test_no_credential_value_reaches_a_finding(self):
+        a = analyze("our bank will never ask for your passcode, but send me your "
+                    "passcode ZQSECRET7 now")
+        rendered = repr(a) + repr(a.findings)
+        for fragment in ("ZQSECRET7", "passcode"):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
 if __name__ == "__main__":
     unittest.main()

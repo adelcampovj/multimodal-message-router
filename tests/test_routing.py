@@ -2808,6 +2808,29 @@ class BoundedEscalationTests(unittest.TestCase):
         self.assertIsNot(severity, Severity.SEVERE)
         self.assertFalse(veto)
 
+    def test_a_warning_does_not_hide_a_later_credential_request(self):
+        # End to end: the warning stays a warning, the request stays severe,
+        # and the veto is the request's own -- not a manufactured one.
+        for separator in (", but ", ", however ", ", instead ", ", actually ",
+                          ", then ", ". ", "; ", "\n"):
+            severity, veto, action, policy, roots = self.probe(
+                f"Our bank will never ask for your passcode{separator}"
+                "send me your passcode now")
+            self.assertIs(severity, Severity.SEVERE, repr(separator))
+            self.assertTrue(veto, repr(separator))
+            self.assertIs(action, RoutingAction.SUPPRESS, repr(separator))
+            self.assertEqual(policy, "route.safety.hard_veto", repr(separator))
+            self.assertIn("INFORMATION_REQUEST", roots, repr(separator))
+
+    def test_a_warning_on_its_own_still_defers(self):
+        for warning in ("We will never ask you to disclose your passcode.",
+                        "Never share your passcode with anyone.",
+                        "Do not send your OTP to anyone."):
+            severity, veto, action, _policy, _roots = self.probe(warning)
+            self.assertIsNot(severity, Severity.SEVERE, warning)
+            self.assertFalse(veto, warning)
+            self.assertIsNot(action, RoutingAction.SUPPRESS, warning)
+
 
 if __name__ == "__main__":
     unittest.main()
