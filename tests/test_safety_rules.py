@@ -54,7 +54,7 @@ from message_router.safety.rules import (  # noqa: E402
     _segment,
     _side_is_independent,
     _terminates_protection,
-    _unified_payment_span,
+    _direct_payment_governance,
 )
 from message_router.safety import (  # noqa: E402
     FindingCategory,
@@ -3666,12 +3666,19 @@ class PaymentCommaEpisodeTests(unittest.TestCase):
             self.assertIsNot(severity_of(analyze(reduced)), Severity.SEVERE, reduced)
         self.assertIs(severity_of(analyze(complete)), Severity.SEVERE)
 
-    def test_the_span_test_reads_only_the_demands_own_breath(self):
-        clause = "remit the balance today, the staff rota is at http"
-        self.assertTrue(_unified_payment_span(clause, 5))
-        self.assertFalse(_unified_payment_span(clause, len(clause) - 4))
-        unified = "remit the balance today at http"
-        self.assertTrue(_unified_payment_span(unified, len(unified) - 4))
+    def test_the_relationship_test_requires_a_governing_connector(self):
+        """P2C3QR9 replaced the span test with direct payment governance: the
+        payment construction has to reach the destination through one of the
+        authorized connectors, not merely share a span with it."""
+        for clause in ("remit the balance today at http",
+                       "pay the fee now to http",
+                       "pay immediately via gift cards at http"):
+            self.assertTrue(_direct_payment_governance(clause, len(clause) - 4), clause)
+        for clause in ("remit the balance today, the staff rota is at http",
+                       "remit the balance today and the staff rota is at http",
+                       "remit the balance today (the staff rota is at http",
+                       "remit the balance today http"):
+            self.assertFalse(_direct_payment_governance(clause, len(clause) - 4), clause)
 
     def test_ambiguity_still_refuses_to_guess(self):
         for text in ("pay the March fee now. pay the April fee now. use this link to "
@@ -3685,6 +3692,114 @@ class PaymentCommaEpisodeTests(unittest.TestCase):
                     "http://203.0.113.9/ZQROTA88")
         rendered = repr(a) + repr(a.findings)
         for fragment in ("ZQPAY7741", "ZQROTA88", "203.0.113.9", "balance"):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
+# ---------------------------------------------------------------------------
+# P2C3QR9 -- direct payment governance replaces span co-location.
+# ---------------------------------------------------------------------------
+
+
+class DirectPaymentGovernanceTests(unittest.TestCase):
+    """Sharing a span was still the whole relationship test: a payment anchor
+    and an unrelated destination in one clause, one comma span, one bracket or
+    either side of an "and" were read as one episode and promoted to a hard
+    veto. The relationship is now the joint itself -- an already-recognised
+    payment construction reaching an already-reported destination through one
+    authorized connector."""
+
+    RAW_IP = "http://203.0.113.9/pay"
+    LOOKALIKE = "http://secure-verify-account.example/pay"
+    #: Anchors the existing payment grammar already recognises on its own.
+    ANCHORS = ("pay the fee now", "remit the balance today", "send the payment now",
+               "send the transfer now", "transfer the balance immediately",
+               "complete the payment now", "make the payment immediately")
+    CONNECTORS = ("to", "at", "through", "via", "using")
+    UNRELATED = ("the staff rota is at http://203.0.113.9/rota",
+                 "the canteen menu is at http://secure-verify-account.example/menu",
+                 "your mailbox settings are at http://203.0.113.9/mailbox")
+    CO_LOCATION = ("{p} {r}", "{p}, {r}", "{p} and {r}", "{p} or {r}", "{p} ({r})",
+                   "{p} because {r}", "{p} by the way {r}", "{p} - {r}", "{p}\n{r}")
+
+    def marked(self, text):
+        return any(PAYMENT_EPISODE_MARKER in f.indicators
+                   for f in analyze(text).findings)
+
+    def test_governance_qualifies_for_every_recognised_anchor(self):
+        for anchor in self.ANCHORS:
+            for connector in self.CONNECTORS:
+                for destination in (self.RAW_IP, self.LOOKALIKE):
+                    text = f"{anchor} {connector} {destination}"
+                    a = analyze(text)
+                    self.assertTrue(self.marked(text), text)
+                    self.assertIs(severity_of(a), Severity.SEVERE, text)
+                    self.assertTrue(a.hard_veto_required, text)
+
+    def test_co_location_alone_never_qualifies(self):
+        for anchor in self.ANCHORS:
+            for risk in self.UNRELATED:
+                for form in self.CO_LOCATION:
+                    for text in (form.format(p=anchor, r=risk),
+                                 form.format(p=risk, r=anchor)):
+                        a = analyze(text)
+                        self.assertFalse(self.marked(text), text)
+                        self.assertIsNot(severity_of(a), Severity.SEVERE, text)
+                        self.assertFalse(a.hard_veto_required, text)
+
+    def test_both_findings_stay_visible(self):
+        a = analyze("remit the balance today and the staff rota is at "
+                    "http://203.0.113.9/rota")
+        self.assertIn("PAY_URGENT_DEMAND", rule_ids(a))
+        self.assertIn("LNK_RAW_IP", rule_ids(a))
+
+    def test_every_component_is_required(self):
+        for anchor in self.ANCHORS:
+            baseline = f"{anchor} at {self.RAW_IP}"
+            self.assertTrue(self.marked(baseline), baseline)
+            for reduced in (f"the balance summary is at {self.RAW_IP}",
+                            anchor,
+                            f"{anchor} {self.RAW_IP}",
+                            f"{anchor} and {self.RAW_IP}"):
+                self.assertFalse(self.marked(reduced), reduced)
+            self.assertTrue(self.marked(baseline), baseline)
+
+    def test_ambiguity_refuses_to_guess(self):
+        for text in (f"pay the fee now and remit the balance today at {self.RAW_IP}",
+                     f"pay the fee now at {self.RAW_IP} and http://203.0.113.9/other",
+                     f"pay the fee now at {self.RAW_IP} the rota is at http://203.0.113.9/b"):
+            self.assertFalse(self.marked(text), text)
+
+    def test_a_destination_before_the_demand_is_not_governance(self):
+        """Only the explicit-reference path reads that order."""
+        self.assertFalse(self.marked(f"{self.RAW_IP} pay the fee now"))
+        self.assertFalse(self.marked(f"the rota is at {self.RAW_IP} pay the fee now"))
+
+    def test_an_already_enumerated_payment_method_stays_inside_the_joint(self):
+        """"Pay immediately via gift cards at <address>" names how the money
+        travels; the method is the off-channel rule's own vocabulary, not new
+        filler, and anything unrecognised still ends the joint."""
+        self.assertTrue(self.marked(f"pay immediately via gift cards at {self.LOOKALIKE}"))
+        self.assertFalse(self.marked(
+            f"pay the fee now via gift cards and the staff rota is at {self.RAW_IP}"))
+
+    def test_the_connector_is_syntax_not_payment_intent(self):
+        """Bare via/through/using remain insufficient on their own."""
+        for text in ("using this link the rota is at http://203.0.113.9/rota",
+                     "via http://203.0.113.9/rota",
+                     "the rota is reachable through http://203.0.113.9/rota"):
+            self.assertFalse(self.marked(text), text)
+
+    def test_an_unrecognised_action_does_not_become_an_anchor(self):
+        """Reported, not added: the anchor grammar is unchanged."""
+        for text in (f"settle the outstanding charge now at {self.RAW_IP}",
+                     f"settle the balance today at {self.RAW_IP}",
+                     f"the wire transfer department is on the third floor at {self.RAW_IP}"):
+            self.assertFalse(self.marked(text), text)
+
+    def test_no_content_reaches_a_finding(self):
+        a = analyze("pay the ZQFEE9931 fee now at http://203.0.113.9/ZQDEST771")
+        rendered = repr(a) + repr(a.findings)
+        for fragment in ("ZQFEE9931", "ZQDEST771", "203.0.113.9"):
             self.assertNotIn(fragment, rendered, fragment)
 
 

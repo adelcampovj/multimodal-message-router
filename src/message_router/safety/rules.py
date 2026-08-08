@@ -2697,20 +2697,92 @@ def _comma_span_at(clause: str, offset: int) -> tuple[int, int]:
     return (0, len(clause))
 
 
-def _unified_payment_span(clause: str, offset: int) -> bool:
-    """True when a payment demand shares the comma span holding ``offset``.
+#: Relationship syntax, not payment intent.
+#:
+#: On their own these are five of the commonest words in English, and none of
+#: them says anything about money. They earn their place here only as the
+#: joint between a payment construction that was already recognised and a
+#: destination that was already a finding -- which is why "via" and "through"
+#: stay insufficient by themselves exactly as before.
+_GOVERNANCE_CONNECTOR = r"(?:to|at|through|via|using)"
+_GOVERNANCE_CONNECTOR_RE = _c(r"^\s*\b" + _GOVERNANCE_CONNECTOR + r"\b")
+#: Closed determiners, the same ones the reference grammar already uses.
+_GOVERNANCE_DETERMINER_RE = _c(r"^\s*\b(?:the|this|that|our|your|their|a|an)\b")
 
-    A comma is punctuation, not a relationship. "Remit the balance today at
-    <address>" is one instruction and the address is part of it; "Remit the
-    balance today, the staff rota is at <address>" is two complete statements
-    that happen to be punctuated together, and nothing in it says the address
-    is where the money goes. Both used to satisfy the same clause test,
-    because a bare comma is the one separator that leaves a clause intact --
-    so the second became a hard veto while every other punctuation mark, and
-    every reviewed adversative, left it two independent suspicious findings.
+
+def _governance_gap(gap: str) -> bool:
+    """True when nothing but relationship syntax stands in the gap.
+
+    Consumed one unit at a time, and every unit is already enumerated
+    somewhere else in this file: an authorized connector, a closed
+    determiner, or one of the payment methods the off-channel rule already
+    recognises -- "pay immediately via gift cards at <address>" names how the
+    money travels, and that is part of the instruction, not filler. At least
+    one connector must appear, and anything unrecognised ends it, which is
+    why "and the staff rota is at", "because", "by the way", a bracket and a
+    dash can never become a joint.
+    """
+    rest, connector = gap, False
+    while True:
+        if not rest.strip():
+            return connector
+        match = _GOVERNANCE_CONNECTOR_RE.match(rest)
+        if match:
+            rest, connector = rest[match.end():], True
+            continue
+        match = _GOVERNANCE_DETERMINER_RE.match(rest)
+        if match:
+            rest = rest[match.end():]
+            continue
+        stripped = rest.lstrip()
+        method = next((m for m in (p.match(stripped) for p in _OFF_CHANNEL) if m), None)
+        if method is None:
+            return False
+        rest = stripped[method.end():]
+
+
+def _merged_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Overlapping matches describe one construction, not several."""
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _direct_payment_governance(clause: str, offset: int) -> bool:
+    """True when a payment construction structurally governs this destination.
+
+    Sharing a span is not a relationship. "Remit the balance today at
+    <address>" says where the money goes; "Remit the balance today and the
+    staff rota is at <address>" says nothing of the kind, and neither does a
+    comma, a bracket, an "or", or any other way of putting two complete
+    statements near each other. Only the joint counts, and every part of it
+    already existed: the payment anchor is the same construction the payment
+    rules recognise, the destination is the same occurrence the link rules
+    report, and the connector is the one token allowed between them.
+
+    Order matters -- a destination that arrives *before* the demand is not
+    being paid to, and that reading is left to the explicit-reference path --
+    and exactly one payment construction may be in play, so a second demand
+    inside the same span refuses rather than guesses.
     """
     start, end = _comma_span_at(clause, offset)
-    return any(pattern.search(clause, start, end) for pattern in _PAYMENT_DEMAND)
+    if not start <= offset <= end:
+        return False
+    anchors = _merged_spans([
+        (match.start(), match.end())
+        for pattern in _PAYMENT_DEMAND
+        for match in pattern.finditer(clause, start, end)
+    ])
+    if len(anchors) != 1:
+        return False
+    _anchor_start, anchor_end = anchors[0]
+    if anchor_end > offset:
+        return False
+    return _governance_gap(clause[anchor_end:offset])
 
 
 def _payment_episode_marker(
@@ -2746,7 +2818,13 @@ def _payment_episode_marker(
         if anchor.index < 0:
             continue
         if anchor.index == index:
-            if _unified_payment_span(clause, offset):
+            # Direct payment governance: the payment construction reaches the
+            # destination through the one connector allowed between them. Not
+            # co-location -- sharing a clause, a comma span, a bracket or an
+            # "and" says nothing about where the money goes, and reading it
+            # that way turned unrelated pairs into hard vetoes.
+            if (_direct_payment_governance(clause, offset)
+                    and not _competing_episode(local, text)):
                 return (PAYMENT_EPISODE_MARKER,)
             continue
         if _in_anchored_list(anchor.index, index, local, text):
