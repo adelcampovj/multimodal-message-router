@@ -2594,7 +2594,7 @@ def _evaluate_identity(norm: NormalizedText, local: _LocalContext, has_asserted_
                     "ID_UNSUPPORTED_CLAIM",
                     DiagnosticCode.IDENTITY_CLAIM_UNSUPPORTED,
                     indicators=_payment_episode_marker(
-                        local.index_at(match.start()), demand, local, norm.security),
+                        match.start(), demand, local, norm.security),
                 )
             ]
     return []
@@ -2678,38 +2678,89 @@ _EPISODE_REFERENCE_RE = _c(
 )
 
 
-def _payment_episode_marker(
-    index: int, demand: _Signal, local: _LocalContext, text: str
-) -> tuple[str, ...]:
-    """``(PAYMENT_EPISODE_MARKER,)`` when this clause is part of a payment episode.
+def _comma_spans(clause: str) -> tuple[tuple[int, int], ...]:
+    """``clause`` cut at bare commas. Not a segmentation: these spans exist
+    only to answer whether two occurrences are in the same breath."""
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for match in _BARE_COMMA_RE.finditer(clause):
+        spans.append((cursor, match.start()))
+        cursor = match.end()
+    spans.append((cursor, len(clause)))
+    return tuple(spans)
 
-    Three bounded positions, and nothing else: the demand's own clause, the
-    instruction group the demand introduces, or the immediately adjacent
-    clause **naming** the episode.
+
+def _comma_span_at(clause: str, offset: int) -> tuple[int, int]:
+    for start, end in _comma_spans(clause):
+        if start <= offset <= end:
+            return (start, end)
+    return (0, len(clause))
+
+
+def _unified_payment_span(clause: str, offset: int) -> bool:
+    """True when a payment demand shares the comma span holding ``offset``.
+
+    A comma is punctuation, not a relationship. "Remit the balance today at
+    <address>" is one instruction and the address is part of it; "Remit the
+    balance today, the staff rota is at <address>" is two complete statements
+    that happen to be punctuated together, and nothing in it says the address
+    is where the money goes. Both used to satisfy the same clause test,
+    because a bare comma is the one separator that leaves a clause intact --
+    so the second became a hard veto while every other punctuation mark, and
+    every reviewed adversative, left it two independent suspicious findings.
+    """
+    start, end = _comma_span_at(clause, offset)
+    return any(pattern.search(clause, start, end) for pattern in _PAYMENT_DEMAND)
+
+
+def _payment_episode_marker(
+    position: int, demand: _Signal, local: _LocalContext, text: str
+) -> tuple[str, ...]:
+    """``(PAYMENT_EPISODE_MARKER,)`` when this occurrence is part of a payment episode.
+
+    Three bounded positions, and nothing else: the demand's own instruction,
+    the instruction group the demand introduces, or a clause **naming** the
+    episode.
 
     Standing next to the demand is not enough. "Remit the balance today.
     The staff rota is at <address>." puts an ordinary link beside an ordinary
     demand; nothing says the link is where the money goes, and reading it
     that way turned two independent suspicious findings into a hard veto. The
-    adjacent clause has to point at *this* payment or *this* sender, exactly
+    naming clause has to point at *this* payment or *this* sender, exactly
     one payment anchor has to be in play, and no second destination or
     identity claim may be competing for the reference.
+
+    Sharing a clause is not enough either, for the same reason: the test is
+    the demand's own comma span, so a unified instruction still qualifies and
+    two complete statements sharing a comma do not.
     """
+    index = local.index_at(position)
     if index < 0 or not demand.occurrences:
         return ()
     anchors = {occurrence.index for occurrence in demand.occurrences if occurrence.index >= 0}
     if not anchors:
         return ()
+    clause = local.clause(index)
+    offset = position - local.bounds[index][0]
     for anchor in demand.occurrences:
         if anchor.index < 0:
             continue
-        if anchor.index == index or _in_anchored_list(anchor.index, index, local, text):
+        if anchor.index == index:
+            if _unified_payment_span(clause, offset):
+                return (PAYMENT_EPISODE_MARKER,)
+            continue
+        if _in_anchored_list(anchor.index, index, local, text):
             return (PAYMENT_EPISODE_MARKER,)
     if len(anchors) != 1:
         return ()  # more than one demand; the reference cannot say which
-    if abs(next(iter(anchors)) - index) != 1:
+    only = next(iter(anchors))
+    if abs(only - index) > 1:
         return ()
-    if not _EPISODE_REFERENCE_RE.search(local.clause(index)):
+    # An explicit reference read where the occurrence sits. Inside the shared
+    # clause that is the occurrence's own comma span, so the reference cannot
+    # be borrowed from the demand on the other side of the comma.
+    span = clause if only != index else clause[slice(*_comma_span_at(clause, offset))]
+    if not _EPISODE_REFERENCE_RE.search(span):
         return ()
     if _competing_episode(local, text):
         return ()
@@ -2817,8 +2868,7 @@ def _evaluate_links(
                 rule_id,
                 diagnostic,
                 ambiguous=ctx.is_discussion,
-                indicators=_payment_episode_marker(local.index_at(position), demand,
-                                                   local, text),
+                indicators=_payment_episode_marker(position, demand, local, text),
             )
         )
     return hits

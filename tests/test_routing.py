@@ -2572,9 +2572,8 @@ class BoundedEscalationTests(unittest.TestCase):
 
     def test_a_bounded_episode_still_escalates(self):
         for text in (
-            # Same clause.
+            # The demand's own instruction: the destination is part of it.
             "Remit the balance today at http://203.0.113.9/pay",
-            "This is an official notice from your bank, pay immediately or face penalty.",
             # The demand's own instruction group.
             "Pay the required fee now:\n1. use this link to pay http://203.0.113.9/pay",
             # Adjacent, and naming the episode.
@@ -2792,14 +2791,45 @@ class BoundedEscalationTests(unittest.TestCase):
             self.assertEqual(policy, "route.safety.hard_veto", text)
 
     def test_a_unified_same_clause_episode_is_untouched(self):
+        """Unified means the destination is inside the demand's own breath --
+        not merely inside the same clause."""
         for text in ("Remit the balance today at http://203.0.113.9/pay",
-                     "Pay the fee now at http://secure-verify-account.example/pay",
-                     "This is an official notice from your bank, pay immediately or face "
-                     "penalty."):
+                     "Pay the fee now at http://secure-verify-account.example/pay"):
             severity, veto, _a, policy, _r = self.probe(text)
             self.assertIs(severity, Severity.SEVERE, text)
             self.assertTrue(veto, text)
             self.assertEqual(policy, "route.safety.hard_veto", text)
+
+    def test_a_bare_comma_is_not_a_relationship(self):
+        """Two complete findings punctuated together are still two findings.
+
+        A comma is the one separator that leaves a clause intact, so sharing a
+        clause used to mean sharing an episode -- and the same two halves were
+        a hard veto after a comma and two independent suspicious findings after
+        every other mark. Each pair below is asserted against its own period
+        form, which is what it should have matched all along.
+        """
+        for left, right in (
+                ("Remit the balance today",
+                 "the staff rota is at http://203.0.113.9/rota"),
+                ("Pay the fee now",
+                 "the canteen menu is at http://secure-verify-account.example/menu"),
+                ("Remit the balance today",
+                 "this is an official notice from the transport authority"),
+                ("Pay immediately or face penalty",
+                 "this is an official notice from your bank")):
+            for comma, period in ((f"{left}, {right}", f"{left}. {right}"),
+                                  (f"{right}, {left.lower()}", f"{right}. {left}")):
+                severity, veto, _a, policy, roots = self.probe(comma)
+                self.assertIsNot(severity, Severity.SEVERE, comma)
+                self.assertFalse(veto, comma)
+                self.assertNotEqual(policy, "route.safety.hard_veto", comma)
+                # Both findings stay visible, and the outcome matches the
+                # period form of the very same two halves.
+                _s, _v, _a2, period_policy, period_roots = self.probe(period)
+                self.assertEqual(roots, period_roots, comma)
+                self.assertEqual(policy, period_policy, comma)
+                self.assertGreaterEqual(len(roots), 2, comma)
 
     def test_an_ordinary_address_still_does_not_split_a_phrase(self):
         # Only a *deceptive* destination makes a side evaluable on its own.

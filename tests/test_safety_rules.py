@@ -41,6 +41,7 @@ from message_router.safety.normalization import (  # noqa: E402
     normalize,
 )
 from message_router.safety.rules import (  # noqa: E402
+    PAYMENT_EPISODE_MARKER,
     _CREDENTIAL_COMPILED,
     _CREDENTIAL_PASSIVE,
     _DISCLOSURE_ACTIONS,
@@ -53,6 +54,7 @@ from message_router.safety.rules import (  # noqa: E402
     _segment,
     _side_is_independent,
     _terminates_protection,
+    _unified_payment_span,
 )
 from message_router.safety import (  # noqa: E402
     FindingCategory,
@@ -669,13 +671,29 @@ class PaymentAndScamTests(unittest.TestCase):
         self.assertTrue(all(f.category is FindingCategory.COERCIVE_PAYMENT for f in severe))
 
     def test_payment_plus_identity_claim_escalates(self):
-        # One clause: the claim and the demand are the same instruction.
-        a = analyze("This is an official notice from your bank, pay immediately or face penalty.")
-        self.assertIs(severity_of(a), Severity.SEVERE)
-        # Two clauses, with the second naming whose payment request it is.
+        # A clause naming whose payment request it is.
         a = analyze("Pay immediately or face penalty. The sender of this payment request "
                     "claims this is an official notice from your bank.")
         self.assertIs(severity_of(a), Severity.SEVERE)
+        a = analyze("Pay the fee now. The account requesting this payment says this is "
+                    "an official notice from your bank.")
+        self.assertIs(severity_of(a), Severity.SEVERE)
+
+    def test_a_comma_between_two_complete_findings_is_not_an_episode(self):
+        """A claim and a demand punctuated together are still two findings.
+
+        This used to escalate, and its own full-stop form did not -- the comma
+        was the only separator that left one clause, and sharing a clause was
+        read as sharing an episode.
+        """
+        comma = analyze("This is an official notice from your bank, pay immediately "
+                        "or face penalty.")
+        period = analyze("This is an official notice from your bank. Pay immediately "
+                         "or face penalty.")
+        self.assertIsNot(severity_of(comma), Severity.SEVERE)
+        self.assertFalse(comma.hard_veto_required)
+        self.assertEqual(rule_ids(comma), rule_ids(period))
+        self.assertEqual(severity_of(comma), severity_of(period))
 
     def test_an_adjacent_identity_claim_alone_does_not_escalate(self):
         # Standing next to a demand is not the same as being about it: both
@@ -3561,6 +3579,112 @@ class IndependentSpanTerminationTests(unittest.TestCase):
                     "stop taking your ZQDRUG5501 medication")
         rendered = repr(a) + repr(a.findings)
         for fragment in ("ZQSPAN8812", "ZQDRUG5501", "passcode", "medication"):
+            self.assertNotIn(fragment, rendered, fragment)
+
+
+# ---------------------------------------------------------------------------
+# P2C3QR7 -- a comma is punctuation, not a payment relationship.
+# ---------------------------------------------------------------------------
+
+
+class PaymentCommaEpisodeTests(unittest.TestCase):
+    """A payment demand and an unrelated destination or identity claim, joined
+    by nothing but a comma, were read as one episode and promoted to a hard
+    veto -- while the identical halves separated by a full stop, a semicolon,
+    a line break, a bullet or any reviewed adversative stayed two independent
+    suspicious findings. The comma is simply the one separator that leaves a
+    clause intact, and sharing a clause was taken as sharing an episode."""
+
+    PAYMENTS = ("remit the balance today", "pay the fee now",
+                "send the transfer immediately", "settle the outstanding charge now")
+    RISKS = ("the staff rota is at http://203.0.113.9/rota",
+             "the canteen menu is at http://secure-verify-account.example/menu",
+             "this is an official notice from the transport authority",
+             "this is an official notice from your library account",
+             "your mailbox settings are at http://203.0.113.9/mailbox")
+    COMMAS = (", ", ",  ", ",", ", please ", ", now ")
+    SEPARATORS = (", ", ": ", "; ", ". ", "\n", "\r\n", "\r", ", but ", ", however ",
+                  ", instead ", ", actually ", ", then ", "\n- ", "\n* ", "\n• ",
+                  "\n1. ", "\n1) ", "\n\n")
+
+    def test_a_bare_comma_never_links_two_unrelated_risks(self):
+        for payment in self.PAYMENTS:
+            for risk in self.RISKS:
+                for comma in self.COMMAS:
+                    for text in (payment + comma + risk, risk + comma + payment):
+                        a = analyze(text)
+                        self.assertIsNot(severity_of(a), Severity.SEVERE, text)
+                        self.assertFalse(a.hard_veto_required, text)
+                        for finding in a.findings:
+                            self.assertNotIn(PAYMENT_EPISODE_MARKER,
+                                             finding.indicators, text)
+
+    def test_both_findings_stay_visible(self):
+        a = analyze("remit the balance today, the staff rota is at http://203.0.113.9/rota")
+        self.assertIn("PAY_URGENT_DEMAND", rule_ids(a))
+        self.assertIn("LNK_RAW_IP", rule_ids(a))
+
+    def test_the_relationship_does_not_depend_on_the_punctuation(self):
+        for payment in self.PAYMENTS:
+            for risk in self.RISKS:
+                marked = {
+                    separator: any(PAYMENT_EPISODE_MARKER in f.indicators
+                                   for f in analyze(payment + separator + risk).findings)
+                    for separator in self.SEPARATORS
+                }
+                self.assertEqual(set(marked.values()), {False},
+                                 f"{payment}|{sorted(k for k, v in marked.items() if v)}")
+
+    def test_a_unified_instruction_still_links(self):
+        """The destination inside the demand's own breath is still part of it."""
+        for text in ("remit the balance today at http://203.0.113.9/pay",
+                     "pay the fee now at http://secure-verify-account.example/pay"):
+            a = analyze(text)
+            self.assertTrue(any(PAYMENT_EPISODE_MARKER in f.indicators
+                                for f in a.findings), text)
+            self.assertIs(severity_of(a), Severity.SEVERE, text)
+
+    def test_an_explicit_reference_still_links_across_a_comma(self):
+        """The reference, not the comma, is what joins the episode -- so the
+        approved grammar keeps working in the position the comma leaves."""
+        for text in ("pay the fee now, use this link to complete the payment "
+                     "http://203.0.113.9/pay",
+                     "remit the balance today, the link for this payment is "
+                     "http://203.0.113.9/pay"):
+            a = analyze(text)
+            self.assertTrue(any(PAYMENT_EPISODE_MARKER in f.indicators
+                                for f in a.findings), text)
+            self.assertIs(severity_of(a), Severity.SEVERE, text)
+
+    def test_removing_the_relationship_removes_the_link(self):
+        complete = "remit the balance today at http://203.0.113.9/pay"
+        self.assertIs(severity_of(analyze(complete)), Severity.SEVERE)
+        for reduced in ("the balance summary is at http://203.0.113.9/pay",
+                        "remit the balance today",
+                        "remit the balance today, the staff rota is at "
+                        "http://203.0.113.9/rota"):
+            self.assertIsNot(severity_of(analyze(reduced)), Severity.SEVERE, reduced)
+        self.assertIs(severity_of(analyze(complete)), Severity.SEVERE)
+
+    def test_the_span_test_reads_only_the_demands_own_breath(self):
+        clause = "remit the balance today, the staff rota is at http"
+        self.assertTrue(_unified_payment_span(clause, 5))
+        self.assertFalse(_unified_payment_span(clause, len(clause) - 4))
+        unified = "remit the balance today at http"
+        self.assertTrue(_unified_payment_span(unified, len(unified) - 4))
+
+    def test_ambiguity_still_refuses_to_guess(self):
+        for text in ("pay the March fee now. pay the April fee now. use this link to "
+                     "complete the payment http://203.0.113.9/pay",
+                     "pay the fee now, this is an official notice from the transport "
+                     "authority and this is an official notice from the parking office"):
+            self.assertFalse(analyze(text).hard_veto_required, text)
+
+    def test_no_content_reaches_a_finding(self):
+        a = analyze("remit the balance ZQPAY7741 today, the staff rota is at "
+                    "http://203.0.113.9/ZQROTA88")
+        rendered = repr(a) + repr(a.findings)
+        for fragment in ("ZQPAY7741", "ZQROTA88", "203.0.113.9", "balance"):
             self.assertNotIn(fragment, rendered, fragment)
 
 
