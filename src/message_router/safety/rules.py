@@ -187,6 +187,98 @@ def _action_token(actions: tuple[str, ...]) -> str:
     return _TOKEN_START + _alternation(actions) + _TOKEN_END
 
 
+# ---------------------------------------------------------------------------
+# An action word being *named* rather than performed.
+# ---------------------------------------------------------------------------
+#
+# A whole token is still not always an action. "The field 'disclose' describes
+# the passcode" is a sentence about a column heading: the word is the subject
+# matter, not the instruction, and nobody is being asked for anything. Bounding
+# the token stopped participles and substrings; it could not tell operative use
+# from documentary use, so a schema note, a glossary line and an incident-report
+# vocabulary list were each read as a live credential request and vetoed.
+#
+# The test is a *relation*, never a word list on its own: the action has to
+# stand in a reviewed naming construction. Quotation marks alone are not one --
+# that would hand out an exemption for two characters, exactly as elsewhere in
+# this file -- and none of these words are suppressed globally. A clause that
+# names an action *and* uses another one keeps the one it uses.
+
+#: Nouns that introduce a name rather than an instruction.
+_NAMING_NOUN = (
+    r"(?:field|label|term|word|token|value|column|rule|key|schema|example|"
+    r"entry|setting|flag|parameter|attribute|property|header|heading|option|"
+    r"documentation|placeholder|name)s?"
+)
+#: Closed connectors allowed between the naming noun and the name itself.
+_NAMING_CONNECTOR = (
+    r"(?:name[sd]?|called|named|labell?ed|for|of|uses?|lists?|reads?|says?|"
+    r"is|are|was|were)"
+)
+#: Verbs that say the preceding word *is a name*.
+_NAMING_VERB = (
+    r"(?:describes?|means?|refers? to|denotes?|indicates?|stands? for|"
+    r"is called|are called|is named|are named|is labell?ed|are labell?ed|"
+    r"is used for|are used for)"
+)
+#: The same relation written the other way round.
+_NAMING_INTRO = (
+    r"(?:calls? it|refers? to it as|known as|is called|are called|is named|"
+    r"are named|is labell?ed|are labell?ed)"
+)
+#: A naming verb whose object is quoted. The quotation is required here,
+#: because these verbs are ordinary words in every other context.
+_NAMING_ACTION_VERB = (
+    r"(?:lists?|names?|calls?|labels?|shows?|contains?|records?|logs?|"
+    r"documents?|mentions?|uses?)"
+)
+_QUOTE_OPEN = "[\"'“‘]"
+_QUOTE_CLOSE = "[\"'”’]"
+_ACTION_TOKEN_RE = _c(_action_token(_DISCLOSURE_ACTIONS))
+_ACT = _action_token(_DISCLOSURE_ACTIONS)
+_NAMED_ACTION_RE = _c(
+    # the field "disclose"   /   the label disclose
+    r"\b" + _NAMING_NOUN + r"\b(?:\s+" + _NAMING_CONNECTOR + r"\b){0,2}\s*"
+    + _QUOTE_OPEN + r"?(?P<a1>" + _ACT + r")" + _QUOTE_CLOSE + r"?"
+    # "disclose" describes ...   /   disclose means ...
+    + r"|" + _QUOTE_OPEN + r"?(?P<a2>" + _ACT + r")" + _QUOTE_CLOSE + r"?\s+"
+    + _NAMING_VERB
+    # ... calls it disclose
+    + r"|\b" + _NAMING_INTRO + r"\s+" + _QUOTE_OPEN + r"?(?P<a3>" + _ACT + r")"
+    + _QUOTE_CLOSE + r"?"
+    # ... lists "disclose"
+    + r"|\b" + _NAMING_ACTION_VERB + r"\s+" + _QUOTE_OPEN + r"(?P<a4>" + _ACT + r")"
+    + _QUOTE_CLOSE
+)
+
+
+def _named_action_spans(clause: str) -> tuple[tuple[int, int], ...]:
+    """Where an action word is being named rather than performed."""
+    spans: list[tuple[int, int]] = []
+    for match in _NAMED_ACTION_RE.finditer(clause):
+        for group in ("a1", "a2", "a3", "a4"):
+            if match.group(group) is not None:
+                spans.append(match.span(group))
+    return tuple(spans)
+
+
+def _has_operative_action(clause: str) -> bool:
+    """True unless every action token in ``clause`` is only being named.
+
+    Collect-then-aggregate, as everywhere else here: each occurrence is judged
+    where it sits. A clause that discusses "disclose" as a column heading and
+    then tells the reader to send something still has an operative action, and
+    is still a request.
+    """
+    named = _named_action_spans(clause)
+    if not named:
+        return True
+    return any(
+        not any(start <= match.start() < end for start, end in named)
+        for match in _ACTION_TOKEN_RE.finditer(clause)
+    )
+
+
 #: The protective form must cover every action the request form accepts.
 _WARNING_ACTION = _alternation(_DISCLOSURE_ACTIONS + _TRANSMISSION_ACTIONS)
 
@@ -412,40 +504,85 @@ def _side_is_independent(side: str, lookahead: str = "") -> bool:
     )
 
 
-def _terminates_protection(right: str) -> bool:
-    """True when ``right`` is an independently supported current credential request.
-
-    This is the *whole* acceptance test for a bare comma, and it is
-    deliberately the strongest one in this file: the side has to carry a
-    complete request under the existing bounded grammar -- the secret and the
-    ask, in one of the reviewed forms -- judged on its own with nothing
-    borrowed from the other side of the comma. A credential merely being
-    *named* is not enough, which is what keeps "the PIN, the password, or the
-    OTP" from being torn into three, and a side that is itself a warning,
-    a quotation or a training example is refused outright, because that is
-    the opposite of a live request.
-    """
-    stripped = right.strip()
-    if len(stripped) < 3:
-        return False
-    flags = _flags_for(stripped)
+def _severe_credential_side(side: str) -> bool:
+    """A complete credential request, judged on this side alone."""
+    flags = _flags_for(side)
     if flags.warning or flags.quoted or flags.educational:
         return False
-    if _is_passive_credential_warning(stripped) or _is_narrated(stripped):
+    if _is_passive_credential_warning(side):
         return False
-    for _rid, request_pattern, _target, _diag in _CREDENTIAL_COMPILED:
-        if request_pattern.search(stripped):
-            return True
-    if _MESSAGE_TRANSMISSION_RE.search(stripped):
+    if _has_operative_action(side):
+        for _rid, request_pattern, _target, _diag in _CREDENTIAL_COMPILED:
+            if request_pattern.search(side):
+                return True
+    if _MESSAGE_TRANSMISSION_RE.search(side):
         return True
     for _rid, pattern, _diag in _CREDENTIAL_PASSIVE:
-        match = pattern.search(stripped)
+        match = pattern.search(side)
         if match is None:
             continue
         gap = (match.groupdict().get("gap") or "") + (match.groupdict().get("gap2") or "")
         if not _GAP_NEGATOR_RE.search(gap) and not _INVERSION_RE.search(gap):
             return True
     return False
+
+
+def _severe_injection_side(side: str) -> bool:
+    """A complete instruction-override attempt, judged on this side alone."""
+    if _flags_for(side).is_discussion:
+        return False
+    return any(pattern.search(side) for _rid, pattern, _diag in _INJECTION_COMPILED)
+
+
+def _severe_advice_side(side: str) -> bool:
+    """A complete dangerous instruction, judged on this side alone.
+
+    The gates are the unsafe-advice rule's own, asked of this side by itself:
+    that is what makes the negator in front of the comma -- someone else's
+    credential warning -- stop counting as an argument against a medical
+    instruction it has nothing to do with.
+    """
+    if (_any(_ADVICE_CRITICAL_CONTEXT, side) or _any(_EDUCATIONAL_PATTERNS, side)
+            or _any(_QUOTED_PATTERNS, side) or _any(_PROFESSIONAL_GUIDANCE, side)):
+        return False
+    for _rid, pattern, _diag, harm_is_negation in _UNSAFE_COMPILED:
+        match = pattern.search(side)
+        if match is None:
+            continue
+        if _advice_is_warning(side, match.start(), harm_is_negation):
+            continue
+        if _advice_is_directive(side, match.start()):
+            return True
+    return False
+
+
+def _terminates_protection(right: str) -> bool:
+    """True when ``right`` independently carries a complete severe occurrence.
+
+    This is the *whole* acceptance test for a bare comma, and it is
+    deliberately the strongest one in this file. Each severe family is asked
+    the same question it would be asked anyway -- but about this side, by
+    itself. Nothing crosses the comma: not the credential object, not the
+    medical target, not the action, not the framing, not the provenance. A
+    side qualifies only if it would have produced its finding standing alone,
+    which is why a credential merely being *named* is not enough and "the PIN,
+    the password, or the OTP" is still not torn into three.
+
+    Family-neutral by construction. It used to ask about credentials only, so
+    a warning about a passcode -- protected content, correctly protected --
+    reached across a comma and silenced a medical instruction that had nothing
+    to do with it, and reported speech did the same to a live demand. Neither
+    family is named here; both are simply asked.
+    """
+    stripped = right.strip()
+    if len(stripped) < 3:
+        return False
+    # Reported speech is not a live occurrence, whatever it reports.
+    if _is_narrated(stripped):
+        return False
+    return (_severe_credential_side(stripped)
+            or _severe_injection_side(stripped)
+            or _severe_advice_side(stripped))
 
 
 def _inside_shown_quotation(text: str, position: int) -> bool:
@@ -519,15 +656,19 @@ def _segment(text: str, boundaries: tuple[int, ...] = ()) -> list[tuple[int, int
         for match in _BARE_COMMA_RE.finditer(text, span_start, span_end):
             if _inside_shown_quotation(text, match.start()):
                 continue
-            # Reported speech governs what follows it, so a comma inside a
-            # narrated span is part of what is being reported.
-            if _is_narrated(text[cursor:match.start()]):
-                continue
             # Either side. Protection must not reach forwards over the comma
             # into a demand, and a warning written *after* one must not reach
             # backwards and erase it -- "send me your passcode, never share
             # your passcode with anyone" is the same bypass spelled in the
             # other order, and the request is what has to survive both.
+            #
+            # A narrated left side is no longer an exemption on its own. It
+            # was, and reported speech then absorbed whatever came after the
+            # comma: "the caller said it was urgent, send me your passcode"
+            # kept the demand inside the report. What the frame governs is
+            # what it reports, not everything typed afterwards -- so the
+            # question is asked of the right side, by itself, and a side that
+            # is *itself* narrated still answers no.
             if (_terminates_protection(text[match.end():span_end])
                     or _terminates_protection(text[cursor:match.start()])):
                 final.append((cursor, match.start()))
@@ -1420,9 +1561,15 @@ def _evaluate_credentials(norm: NormalizedText, local: _LocalContext) -> list[Ru
         # request occurrences rather than forming a rule of its own: framing,
         # ambiguity, deduplication and severity are then decided in exactly
         # one place, by the code below, for both voices.
+        # An action word that the clause is *naming* rather than performing is
+        # not an ask. Judged per clause, so a glossary line and a demand in the
+        # same message are still told apart.
+        active_asks = [
+            m for m in _clause_scan(request_pattern, text, local)
+            if _has_operative_action(local.clause_at(m.start()))
+        ]
         request_contexts = [
-            local.at(m.start())
-            for m in _clause_scan(request_pattern, text, local) + passive_by_rule[rule_id]
+            local.at(m.start()) for m in active_asks + passive_by_rule[rule_id]
         ]
         target_present = bool(target_contexts)
 
