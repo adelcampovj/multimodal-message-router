@@ -2759,11 +2759,33 @@ _GOVERNANCE_ACTION = (
     _c(r"\b(?:pay|remit|transfer)\b"),
     # G2 make payment, G7 complete payment -- the bounded phrase only.
     _c(r"\b(?:make|complete)\s+(?:the\s+|a\s+|this\s+)?payment\b"),
-    # G4 send, and only where the send governs a payment purpose. A bare
-    # "send the codes now" is a payment demand and not a payment destination.
-    _c(r"\bsend\b[^.]{0,20}"
-       r"\b(?:payment|fee|balance|transfer|invoice|charge|amount)\b"),
 )
+#: The objects the pre-existing directed-payment relationship governs. Listed
+#: here only to *read* that rule's own result; nothing is added to it, which
+#: is why "amount" -- a payment word that rule does not govern -- is absent.
+_GOVERNED_PAYMENT_PURPOSE = frozenset(
+    {"payment", "fee", "transfer", "invoice", "charge", "balance"}
+)
+
+
+def _send_governs_payment_purpose(anchor: str) -> bool:
+    """G4: send, and only where it actually governs a payment purpose.
+
+    The relationship is not this function's invention -- it is the directed
+    payment rule that has been in this file since the payment episodes were
+    first bounded, which puts the verb, a run of closed determiners and the
+    object next to each other. Nothing between them is free text.
+
+    Distance was the previous test, and distance is not evidence: "send the
+    codes for payment now" has a payment word four characters away and sends
+    codes. The object of "for" is not the object of "send", and a window
+    cannot tell the difference.
+    """
+    for match in _PAYMENT_DIRECTED_RE.finditer(anchor):
+        governed = match.group(0).lower().split()
+        if governed[0] == "send" and governed[-1] in _GOVERNED_PAYMENT_PURPOSE:
+            return True
+    return False
 #: Families that detect payment perfectly well and may not bind a
 #: destination. "Outstanding balance" names a state rather than an act at
 #: all, and "wire" is left to the noun phrase it usually belongs to.
@@ -2782,7 +2804,9 @@ def _is_direct_governance_payment_anchor(anchor: str) -> bool:
     """
     if any(pattern.search(anchor) for pattern in _GOVERNANCE_EXCLUDED_ACTION):
         return False
-    return any(pattern.search(anchor) for pattern in _GOVERNANCE_ACTION)
+    if any(pattern.search(anchor) for pattern in _GOVERNANCE_ACTION):
+        return True
+    return _send_governs_payment_purpose(anchor)
 
 
 def _merged_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:

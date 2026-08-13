@@ -56,6 +56,7 @@ from message_router.safety.rules import (  # noqa: E402
     _terminates_protection,
     _direct_payment_governance,
     _is_direct_governance_payment_anchor,
+    _send_governs_payment_purpose,
 )
 from message_router.safety import (  # noqa: E402
     FindingCategory,
@@ -3812,6 +3813,61 @@ class DirectPaymentGovernanceTests(unittest.TestCase):
                     self.assertFalse(a.hard_veto_required, text)
         for anchor in self.ANCHORS:
             self.assertTrue(_is_direct_governance_payment_anchor(anchor), anchor)
+
+    #: The objects the pre-existing directed-payment rule actually governs.
+    #: "amount" is deliberately absent -- that rule does not govern it, and
+    #: P2C3QR9R2 reuses the rule rather than widening it.
+    GOVERNED_PURPOSES = ("payment", "fee", "transfer", "invoice", "charge", "balance")
+
+    def test_send_governs_only_a_payment_purpose_it_actually_takes(self):
+        """P2C3QR9R2: G4 used a character window, so "send the codes for
+        payment now" -- which sends codes -- bound a destination because a
+        payment word sat four characters away. The object of "for" is not the
+        object of "send", and only the pre-existing directed-payment
+        relationship can tell the difference."""
+        for purpose in self.GOVERNED_PURPOSES:
+            self.assertTrue(_send_governs_payment_purpose(f"send the {purpose} now"), purpose)
+        for anchor in ("send the codes for payment now",
+                       "send the codes about the invoice now",
+                       "send the codes re the fee now",
+                       "send the codes with balance now",
+                       "send the codes no charge now",
+                       "send the codes amount now",
+                       "send the codes after transfer now",
+                       "send the codes for transfer now",
+                       "send the codes we got payment now",
+                       "send the codes (payment) now",
+                       "send the codes so payment now",
+                       "send the codes now, payment terms apply",
+                       "send the codes to us right away",
+                       "send me the passcode now"):
+            self.assertFalse(_send_governs_payment_purpose(anchor), anchor)
+
+    def test_the_send_purpose_vocabulary_is_not_widened(self):
+        """"Amount" is a payment word the pre-existing rule does not govern,
+        so G4 does not govern it either."""
+        self.assertFalse(_send_governs_payment_purpose("send the amount now"))
+        for connector in self.CONNECTORS:
+            for destination in (self.RAW_IP, self.LOOKALIKE):
+                text = f"send the amount now {connector} {destination}"
+                self.assertFalse(self.marked(text), text)
+
+    def test_a_governed_send_still_binds_its_destination(self):
+        for purpose in self.GOVERNED_PURPOSES:
+            for connector in self.CONNECTORS:
+                for destination in (self.RAW_IP, self.LOOKALIKE):
+                    text = f"send the {purpose} now {connector} {destination}"
+                    self.assertTrue(self.marked(text), text)
+
+    def test_an_ungoverned_send_never_binds_a_destination(self):
+        for purpose in self.GOVERNED_PURPOSES:
+            for connector in self.CONNECTORS:
+                text = f"send the codes for {purpose} now {connector} {self.RAW_IP}"
+                # "transfer" is separately eligible under the accepted G5
+                # family, which this phase does not redesign.
+                if purpose == "transfer":
+                    continue
+                self.assertFalse(self.marked(text), text)
 
     def test_an_excluded_family_is_not_promoted_by_a_neighbour(self):
         """An excluded action in front of an eligible one is a second payment
