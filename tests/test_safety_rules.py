@@ -55,6 +55,7 @@ from message_router.safety.rules import (  # noqa: E402
     _side_is_independent,
     _terminates_protection,
     _direct_payment_governance,
+    _is_direct_governance_payment_anchor,
 )
 from message_router.safety import (  # noqa: E402
     FindingCategory,
@@ -3671,10 +3672,10 @@ class PaymentCommaEpisodeTests(unittest.TestCase):
         payment construction has to reach the destination through one of the
         authorized connectors, not merely share a span with it."""
         for clause in ("remit the balance today at http",
-                       "pay the fee now to http",
-                       "pay immediately via gift cards at http"):
+                       "pay the fee now to http"):
             self.assertTrue(_direct_payment_governance(clause, len(clause) - 4), clause)
-        for clause in ("remit the balance today, the staff rota is at http",
+        for clause in ("pay immediately via gift cards at http",
+                       "remit the balance today, the staff rota is at http",
                        "remit the balance today and the staff rota is at http",
                        "remit the balance today (the staff rota is at http",
                        "remit the balance today http"):
@@ -3774,13 +3775,53 @@ class DirectPaymentGovernanceTests(unittest.TestCase):
         self.assertFalse(self.marked(f"{self.RAW_IP} pay the fee now"))
         self.assertFalse(self.marked(f"the rota is at {self.RAW_IP} pay the fee now"))
 
-    def test_an_already_enumerated_payment_method_stays_inside_the_joint(self):
-        """"Pay immediately via gift cards at <address>" names how the money
-        travels; the method is the off-channel rule's own vocabulary, not new
-        filler, and anything unrecognised still ends the joint."""
-        self.assertTrue(self.marked(f"pay immediately via gift cards at {self.LOOKALIKE}"))
+    def test_a_payment_method_breaks_the_joint(self):
+        """P2C3QR9R: a method is not relationship syntax. "Pay immediately via
+        gift cards at <address>" routes the money through the method, and this
+        rule cannot say the payment governs whatever follows it -- the
+        off-channel finding still stands on its own."""
+        for method in ("gift cards", "bitcoin", "western union", "moneygram", "crypto"):
+            for anchor in self.ANCHORS:
+                text = f"{anchor} via {method} at {self.RAW_IP}"
+                self.assertFalse(self.marked(text), text)
         self.assertFalse(self.marked(
             f"pay the fee now via gift cards and the staff rota is at {self.RAW_IP}"))
+
+    def test_an_explicit_reference_still_recovers_across_a_method(self):
+        """The other approved relationships are unaffected: a later span that
+        names the episode binds the destination on its own evidence."""
+        self.assertTrue(self.marked(
+            "pay the fee now via gift cards. use this link to complete the payment "
+            f"{self.RAW_IP}"))
+
+    def test_only_the_reviewed_action_families_may_govern(self):
+        """Detecting a payment demand and being allowed to bind a destination
+        are different privileges. Every family below is still an ordinary
+        payment demand; none of them may reach a destination."""
+        for anchor in ("deposit the funds now",              # U1
+                       "wire the amount now",                # U2
+                       "the outstanding balance is due today",   # U3
+                       "the outstanding amount is due now",      # U3
+                       "send the codes to us right away"):       # send, no purpose
+            self.assertFalse(_is_direct_governance_payment_anchor(anchor), anchor)
+            for connector in self.CONNECTORS:
+                for destination in (self.RAW_IP, self.LOOKALIKE):
+                    text = f"{anchor} {connector} {destination}"
+                    a = analyze(text)
+                    self.assertFalse(self.marked(text), text)
+                    self.assertFalse(a.hard_veto_required, text)
+        for anchor in self.ANCHORS:
+            self.assertTrue(_is_direct_governance_payment_anchor(anchor), anchor)
+
+    def test_an_excluded_family_is_not_promoted_by_a_neighbour(self):
+        """An excluded action in front of an eligible one is a second payment
+        episode, whether or not it completed an anchor of its own."""
+        self.assertFalse(_is_direct_governance_payment_anchor("deposit and pay the fee now"))
+        for excluded in ("deposit the funds now", "wire the amount now", "deposit"):
+            for anchor in self.ANCHORS:
+                for text in (f"{excluded} and {anchor} at {self.RAW_IP}",
+                             f"{anchor} and {excluded} at {self.RAW_IP}"):
+                    self.assertFalse(self.marked(text), text)
 
     def test_the_connector_is_syntax_not_payment_intent(self):
         """Bare via/through/using remain insufficient on their own."""

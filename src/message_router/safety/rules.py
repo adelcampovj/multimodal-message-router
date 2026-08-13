@@ -2713,14 +2713,18 @@ _GOVERNANCE_DETERMINER_RE = _c(r"^\s*\b(?:the|this|that|our|your|their|a|an)\b")
 def _governance_gap(gap: str) -> bool:
     """True when nothing but relationship syntax stands in the gap.
 
-    Consumed one unit at a time, and every unit is already enumerated
-    somewhere else in this file: an authorized connector, a closed
-    determiner, or one of the payment methods the off-channel rule already
-    recognises -- "pay immediately via gift cards at <address>" names how the
-    money travels, and that is part of the instruction, not filler. At least
-    one connector must appear, and anything unrecognised ends it, which is
-    why "and the staff rota is at", "because", "by the way", a bracket and a
-    dash can never become a joint.
+    Consumed one unit at a time, and both units are already enumerated
+    elsewhere in this file: an authorized connector and a closed determiner.
+    At least one connector must appear, and anything unrecognised ends it,
+    which is why "and the staff rota is at", "because", "by the way", a
+    bracket and a dash can never become a joint.
+
+    A payment *method* is not relationship syntax either. "Pay immediately
+    via gift cards at <address>" routes the money through the method, and the
+    address on the far side of it is not something this rule can say the
+    payment governs; the off-channel finding stands on its own, and a link to
+    that destination has to be established by one of the other approved
+    relationships or not at all.
     """
     rest, connector = gap, False
     while True:
@@ -2734,11 +2738,51 @@ def _governance_gap(gap: str) -> bool:
         if match:
             rest = rest[match.end():]
             continue
-        stripped = rest.lstrip()
-        method = next((m for m in (p.match(stripped) for p in _OFF_CHANNEL) if m), None)
-        if method is None:
-            return False
-        rest = stripped[method.end():]
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Which payment actions may bind a destination.
+# ---------------------------------------------------------------------------
+#
+# Recognising a payment demand and being allowed to make a destination part of
+# that demand are two different privileges. The relationship read the payment
+# rule's whole action list, so every legacy family in it silently gained
+# destination-binding power -- and a hard veto with it. The list below is the
+# reviewed subset; everything else keeps its ordinary payment detection
+# exactly as before and simply cannot form this relationship.
+
+#: The reviewed governance families. Each is a construction the payment
+#: grammar already recognises on its own; nothing is added here.
+_GOVERNANCE_ACTION = (
+    # G1 pay, G3 remit, G5 transfer.
+    _c(r"\b(?:pay|remit|transfer)\b"),
+    # G2 make payment, G7 complete payment -- the bounded phrase only.
+    _c(r"\b(?:make|complete)\s+(?:the\s+|a\s+|this\s+)?payment\b"),
+    # G4 send, and only where the send governs a payment purpose. A bare
+    # "send the codes now" is a payment demand and not a payment destination.
+    _c(r"\bsend\b[^.]{0,20}"
+       r"\b(?:payment|fee|balance|transfer|invoice|charge|amount)\b"),
+)
+#: Families that detect payment perfectly well and may not bind a
+#: destination. "Outstanding balance" names a state rather than an act at
+#: all, and "wire" is left to the noun phrase it usually belongs to.
+_GOVERNANCE_EXCLUDED_ACTION = (
+    _c(r"\bdeposit\b"),                            # U1
+    _c(r"\bwire\b(?!\s+transfer\b)"),              # U2
+    _c(r"\boutstanding\s+(?:amount|balance)\b"),   # U3
+)
+
+
+def _is_direct_governance_payment_anchor(anchor: str) -> bool:
+    """True when this payment construction may govern a destination.
+
+    An excluded family anywhere in the construction refuses it outright, so
+    standing next to an authorized action never promotes one.
+    """
+    if any(pattern.search(anchor) for pattern in _GOVERNANCE_EXCLUDED_ACTION):
+        return False
+    return any(pattern.search(anchor) for pattern in _GOVERNANCE_ACTION)
 
 
 def _merged_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -2779,8 +2823,15 @@ def _direct_payment_governance(clause: str, offset: int) -> bool:
     ])
     if len(anchors) != 1:
         return False
-    _anchor_start, anchor_end = anchors[0]
+    anchor_start, anchor_end = anchors[0]
     if anchor_end > offset:
+        return False
+    # Read from the start of the span, not just the matched anchor: an
+    # excluded action that never completed an anchor of its own -- "deposit
+    # and transfer the balance immediately" -- is still a second payment
+    # episode standing in front of this one, and it refuses rather than
+    # letting the eligible construction speak for both.
+    if not _is_direct_governance_payment_anchor(clause[start:anchor_end]):
         return False
     return _governance_gap(clause[anchor_end:offset])
 
