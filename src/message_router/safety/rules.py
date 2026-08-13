@@ -585,7 +585,99 @@ def _terminates_protection(right: str) -> bool:
             or _severe_advice_side(stripped))
 
 
-def _inside_shown_quotation(text: str, position: int) -> bool:
+#: Built once, on first use, because every member is defined further down the
+#: file than the segmentation that consults them.
+_SEVERE_POSITIVES: tuple[re.Pattern[str], ...] | None = None
+
+
+def _severe_positives() -> tuple[re.Pattern[str], ...]:
+    """Every pattern a side needs before it can terminate a protected span.
+
+    Read the three severe-side tests above and each one has the same shape: a
+    row of gates that can only ever *refuse*, and behind them one of these
+    patterns. None of them returns ``True`` without a match here, so a side
+    containing no match at all is a side :func:`_terminates_protection`
+    already answers ``False`` for -- it just spends the whole battery finding
+    that out, once per comma, over suffixes that overlap almost completely.
+
+    Holding the patterns rather than the answer is what keeps this honest: it
+    decides nothing, it removes no gate, and a side that clears it is still
+    asked every question it was asked before.
+    """
+    global _SEVERE_POSITIVES
+    if _SEVERE_POSITIVES is None:
+        _SEVERE_POSITIVES = (
+            tuple(request for _rid, request, _target, _diag in _CREDENTIAL_COMPILED)
+            + (_MESSAGE_TRANSMISSION_RE,)
+            + tuple(pattern for _rid, pattern, _diag in _CREDENTIAL_PASSIVE)
+            + tuple(pattern for _rid, pattern, _diag in _INJECTION_COMPILED)
+            + tuple(pattern for _rid, pattern, _diag, _negation in _UNSAFE_COMPILED)
+        )
+    return _SEVERE_POSITIVES
+
+
+def _severe_candidate_spans(clause: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Where a severe occurrence could possibly sit inside one clause.
+
+    Measured against the clause, never the whole message, and that is a
+    correctness requirement rather than a convenience. Several of these
+    patterns end on ``(?=$|\\s*[.,;:!?])``: they accept the end of the string
+    they are searching, so a match that is real at the end of a clause is not
+    always real at the same offset of the message containing it. Searching
+    the clause the sides are cut from keeps the two views identical -- a side
+    ends either at the clause end, which is this string's end, or at the
+    comma that cut it, which the punctuation alternative already accepts.
+
+    Returned as starts and a running maximum of the ends beside them, which
+    is what lets :func:`_may_terminate` answer without walking the list.
+    """
+    found: list[tuple[int, int]] = []
+    for pattern in _severe_positives():
+        found.extend((match.start(), match.end()) for match in pattern.finditer(clause))
+    found.sort()
+    starts: list[int] = []
+    highest: list[int] = []
+    furthest = -1
+    for start, end in found:
+        furthest = max(furthest, end)
+        starts.append(start)
+        highest.append(furthest)
+    return tuple(starts), tuple(highest)
+
+
+def _may_terminate(
+    candidates: tuple[tuple[int, ...], tuple[int, ...]], start: int, end: int
+) -> bool:
+    """True when a candidate occurrence reaches into ``[start, end)`` at all.
+
+    Overlap, not containment, and the difference is the whole correctness
+    argument. :meth:`re.Pattern.finditer` reports non-overlapping matches, so
+    an occurrence that begins just before a comma consumes the text a second
+    one inside the side would have matched: asking for a candidate that sits
+    wholly within the side loses that side entirely. Overlap cannot -- the
+    leftmost match found from any point at or before a real occurrence must
+    itself reach past that occurrence's start -- so a side carrying a severe
+    occurrence always reaches the test that decides it.
+    """
+    starts, highest = candidates
+    # How many candidates begin before ``end``. Written out rather than
+    # imported: the safety layer's import list is a reviewed one, and a
+    # five-line bisection is a smaller thing to justify than an addition to
+    # it. ``starts`` is sorted, so the running maximum beside it answers
+    # "does any of those reach past ``start``" in one lookup.
+    low, high = 0, len(starts)
+    while low < high:
+        middle = (low + high) // 2
+        if starts[middle] < end:
+            low = middle + 1
+        else:
+            high = middle
+    return low > 0 and highest[low - 1] > start
+
+
+def _inside_shown_quotation(
+    text: str, position: int, quotations: tuple[tuple[int, int], ...] | None = None
+) -> bool:
     """True when ``position`` sits inside a quotation the message is *showing*.
 
     Quote marks on their own are not enough -- that would hand out an
@@ -594,8 +686,15 @@ def _inside_shown_quotation(text: str, position: int) -> bool:
     quotation has to attribute it, or frame it as something received, quoted
     or taught. A quotation opened *after* the comma is not one this comma is
     inside, so wrapping a demand in quotes buys nothing.
+
+    ``quotations`` is the same tuple :func:`_quoted_spans` returns for this
+    text, handed in when a caller already has it. It is a pure function of
+    ``text``, so passing it changes nothing except how often it is built --
+    which used to be once per comma, over the whole message.
     """
-    for start, end in _quoted_spans(text):
+    if quotations is None:
+        quotations = _quoted_spans(text)
+    for start, end in quotations:
         if start <= position <= end:
             prefix = text[:start]
             if _has_attribution(prefix) or _flags_for(prefix).is_discussion:
@@ -636,7 +735,22 @@ def _segment(text: str, boundaries: tuple[int, ...] = ()) -> list[tuple[int, int
     refined: list[tuple[int, int]] = []
     for span_start, span_end in spans:
         cursor = span_start
-        for match in _WEAK_SEPARATOR_RE.finditer(text, span_start, span_end):
+        separators = list(_WEAK_SEPARATOR_RE.finditer(text, span_start, span_end))
+        # Asked of the whole clause before it is asked of the sides. Every
+        # way this test says "independent" is a pattern firing somewhere in
+        # what it was handed, so a clause it refuses has nothing for a piece
+        # of that clause to fire on either -- and each separator was
+        # otherwise re-reading a longer and longer prefix of the same clause
+        # to rediscover that. A clause it accepts skips nothing.
+        #
+        # A span never crosses a typed boundary, so every candidate in it
+        # looks ahead to the same line end and the widest lookahead any of
+        # them could get is the one measured here.
+        if separators:
+            reach = next(end for end in line_ends if end >= span_start)
+            if not _side_is_independent(text[span_start:span_end], text[span_start:reach]):
+                separators = []
+        for match in separators:
             left, right = text[cursor:match.start()], text[match.end():span_end]
             ahead = text[match.end():next(e for e in line_ends if e >= match.end())]
             if _side_is_independent(left) and _side_is_independent(right, ahead):
@@ -651,10 +765,24 @@ def _segment(text: str, boundaries: tuple[int, ...] = ()) -> list[tuple[int, int
     # with two ends, and cutting it would turn something being reported into
     # something being said.
     final: list[tuple[int, int]] = []
+    quotations: tuple[tuple[int, int], ...] | None = None
     for span_start, span_end in refined:
         cursor = span_start
-        for match in _BARE_COMMA_RE.finditer(text, span_start, span_end):
-            if _inside_shown_quotation(text, match.start()):
+        commas = list(_BARE_COMMA_RE.finditer(text, span_start, span_end))
+        # What a side would have to contain before any of this could matter.
+        # A clause carrying no severe occurrence anywhere cannot hand one to
+        # a side cut out of it, so every comma in it already answered "no" --
+        # each after re-reading the rest of the clause with the full battery.
+        # One reading of the clause replaces all of them. Where a clause does
+        # carry one, nothing below is skipped.
+        candidates = _severe_candidate_spans(text[span_start:span_end]) if commas else ((), ())
+        if not candidates[0]:
+            final.append((span_start, span_end))
+            continue
+        if quotations is None:
+            quotations = _quoted_spans(text)
+        for match in commas:
+            if _inside_shown_quotation(text, match.start(), quotations):
                 continue
             # Either side. Protection must not reach forwards over the comma
             # into a demand, and a warning written *after* one must not reach
@@ -669,8 +797,18 @@ def _segment(text: str, boundaries: tuple[int, ...] = ()) -> list[tuple[int, int
             # what it reports, not everything typed afterwards -- so the
             # question is asked of the right side, by itself, and a side that
             # is *itself* narrated still answers no.
-            if (_terminates_protection(text[match.end():span_end])
-                    or _terminates_protection(text[cursor:match.start()])):
+            #
+            # The candidate test in front of each side is a precondition, not
+            # a second opinion: it admits everything the side test could have
+            # accepted, so the two questions are asked in the same order and
+            # answered the same way. What it removes is the rescan of a
+            # suffix that has nothing in it to find.
+            right = (match.end() - span_start, span_end - span_start)
+            left = (cursor - span_start, match.start() - span_start)
+            if ((_may_terminate(candidates, *right)
+                 and _terminates_protection(text[match.end():span_end]))
+                    or (_may_terminate(candidates, *left)
+                        and _terminates_protection(text[cursor:match.start()]))):
                 final.append((cursor, match.start()))
                 cursor = match.end()
         final.append((cursor, span_end))
