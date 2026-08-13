@@ -2755,11 +2755,34 @@ def _governance_gap(gap: str) -> bool:
 #: The reviewed governance families. Each is a construction the payment
 #: grammar already recognises on its own; nothing is added here.
 _GOVERNANCE_ACTION = (
-    # G1 pay, G3 remit, G5 transfer.
-    _c(r"\b(?:pay|remit|transfer)\b"),
+    # G1 pay, G3 remit.
+    _c(r"\b(?:pay|remit)\b"),
     # G2 make payment, G7 complete payment -- the bounded phrase only.
     _c(r"\b(?:make|complete)\s+(?:the\s+|a\s+|this\s+)?payment\b"),
 )
+#: The objects the pre-existing reference relationship takes.
+_REFERENCE_OBJECTS = frozenset(
+    {"payment", "fee", "amount", "transfer", "charge", "invoice", "balance", "sum"}
+)
+
+
+def _transfer_acts_as_payment(anchor: str) -> bool:
+    """G5: transfer, and only where it is the verb rather than the subject.
+
+    "Transfer" is a noun at least as often as a verb -- a transfer request, a
+    transfer status, a bank transfer, the fee for a transfer -- and token
+    presence cannot tell those from an instruction to move money. The
+    relationship used here is the reference grammar that has been in this
+    file since payment references were first bounded, and it requires the
+    determiner for exactly this reason: without one, "wire transfer" reads as
+    a verb governing an object, and every mention of a wire transfer becomes
+    a payment instruction.
+    """
+    for match in _PAYMENT_REFERENCE_RE.finditer(anchor):
+        acting = match.group(0).lower().split()
+        if acting[0] in ("transfer", "transferring") and acting[-1] in _REFERENCE_OBJECTS:
+            return True
+    return False
 #: The objects the pre-existing directed-payment relationship governs. Listed
 #: here only to *read* that rule's own result; nothing is added to it, which
 #: is why "amount" -- a payment word that rule does not govern -- is absent.
@@ -2806,7 +2829,7 @@ def _is_direct_governance_payment_anchor(anchor: str) -> bool:
         return False
     if any(pattern.search(anchor) for pattern in _GOVERNANCE_ACTION):
         return True
-    return _send_governs_payment_purpose(anchor)
+    return _send_governs_payment_purpose(anchor) or _transfer_acts_as_payment(anchor)
 
 
 def _merged_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:

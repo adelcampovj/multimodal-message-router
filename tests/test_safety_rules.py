@@ -57,6 +57,7 @@ from message_router.safety.rules import (  # noqa: E402
     _direct_payment_governance,
     _is_direct_governance_payment_anchor,
     _send_governs_payment_purpose,
+    _transfer_acts_as_payment,
 )
 from message_router.safety import (  # noqa: E402
     FindingCategory,
@@ -3863,11 +3864,63 @@ class DirectPaymentGovernanceTests(unittest.TestCase):
         for purpose in self.GOVERNED_PURPOSES:
             for connector in self.CONNECTORS:
                 text = f"send the codes for {purpose} now {connector} {self.RAW_IP}"
-                # "transfer" is separately eligible under the accepted G5
-                # family, which this phase does not redesign.
-                if purpose == "transfer":
-                    continue
                 self.assertFalse(self.marked(text), text)
+
+    #: The objects the pre-existing reference relationship takes.
+    REFERENCE_OBJECTS = ("payment", "fee", "amount", "transfer",
+                         "charge", "invoice", "balance", "sum")
+    #: Ordinary compound nouns. "Transfer" is a noun at least as often as a
+    #: verb, and none of these is an instruction to move money.
+    TRANSFER_COMPOUNDS = ("transfer request", "transfer status", "transfer history",
+                          "transfer record", "transfer receipt", "transfer department",
+                          "transfer documentation", "transfer fee", "bank transfer",
+                          "wire transfer")
+
+    def test_transfer_governs_only_when_it_is_the_verb(self):
+        """P2C3QR9R3: G5 accepted any "transfer" token in the region, so a
+        transfer status, a bank transfer and "send the codes after transfer
+        now" each bound a destination. The pre-existing reference grammar
+        requires the determiner precisely so a compound noun cannot read as a
+        verb governing an object."""
+        for obj in self.REFERENCE_OBJECTS:
+            self.assertTrue(_transfer_acts_as_payment(f"transfer the {obj} now"), obj)
+        for anchor in ("send the codes for transfer now",
+                       "send the codes after transfer now",
+                       "send the codes about transfer now",
+                       "send the codes before transfer now",
+                       "send the codes during transfer now",
+                       "the transfer topic is closed now",
+                       "the codes and the transfer are ready now",
+                       "click the link and transfer status now",
+                       "the codes (transfer) are ready now",
+                       "codes transfer ready now"):
+            self.assertFalse(_transfer_acts_as_payment(anchor), anchor)
+
+    def test_a_transfer_noun_compound_is_not_an_action(self):
+        for compound in self.TRANSFER_COMPOUNDS:
+            anchor = f"the {compound} is ready now"
+            self.assertFalse(_transfer_acts_as_payment(anchor), compound)
+            for connector in self.CONNECTORS:
+                for destination in (self.RAW_IP, self.LOOKALIKE):
+                    text = f"{anchor} {connector} {destination}"
+                    a = analyze(text)
+                    self.assertFalse(self.marked(text), text)
+                    self.assertFalse(a.hard_veto_required, text)
+
+    def test_a_governing_transfer_still_binds_its_destination(self):
+        for obj in self.REFERENCE_OBJECTS:
+            for connector in self.CONNECTORS:
+                for destination in (self.RAW_IP, self.LOOKALIKE):
+                    text = f"transfer the {obj} now {connector} {destination}"
+                    self.assertTrue(self.marked(text), text)
+
+    def test_the_transfer_vocabulary_is_not_widened(self):
+        """Only the pre-existing reference grammar's own forms qualify: the
+        determiner is required, and a bare verb with no object is not an
+        instruction to move anything."""
+        for anchor in ("transfer now", "transfer immediately",
+                       "transfer balance now", "transfer fee now"):
+            self.assertFalse(_transfer_acts_as_payment(anchor), anchor)
 
     def test_an_excluded_family_is_not_promoted_by_a_neighbour(self):
         """An excluded action in front of an eligible one is a second payment
