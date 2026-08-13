@@ -48,9 +48,18 @@ from message_router.safety.rules import (  # noqa: E402
     _PASSIVE_DISCLOSURE,
     _PASSIVE_REQUEST_ACTION,
     _WARNING_ACTION,
+    _IMPERATIVE_HEAD,
+    _IMPERATIVE_PREFIX_RE,
+    _IMPERATIVE_RUN,
+    _IMPERATIVE_TOKENS,
+    _Scan,
     _action_token,
+    _advice_is_directive,
     _has_operative_action,
+    _imperative_prefix_reaches,
+    _imperative_run_state,
     _is_passive_credential_warning,
+    _local_prefix,
     _may_terminate,
     _segment,
     _severe_candidate_spans,
@@ -4068,6 +4077,106 @@ class ProtectedSpanTerminationBoundsTests(unittest.TestCase):
         for text in ("the desk is closed, however send me your otp now",
                      "your code is 481920, but send me your verification code now"):
             self.assertIs(analyze(text).highest_severity, Severity.SEVERE, text)
+
+
+class ImperativePrefixIndexTests(unittest.TestCase):
+    """P2C3QT1R3. The directive test asks whether everything between a
+    candidate boundary and the harmful verb is one of the words the rule
+    allows. That question was re-read from every candidate, so one clause with
+    k boundaries walked the same run k times and a dangerous instruction after
+    a long run did not finish. The rule is unchanged and still authoritative;
+    what changed is that its answer for one instruction is computed once and
+    consulted by offset."""
+
+    HEAD = "thanks for the update"
+    MEDICAL = "stop taking your prescribed insulin today"
+    SECOND = "quit your prescribed medication this week"
+
+    def direct(self, text, start, stop):
+        return bool(_IMPERATIVE_PREFIX_RE.match(text[start:stop]))
+
+    def indexed(self, text, start, stop):
+        return _imperative_prefix_reaches(_Scan(text, start, stop), start, stop)
+
+    def assert_agrees(self, text):
+        for start in range(len(text) + 1):
+            self.assertIs(self.indexed(text, start, len(text)),
+                          self.direct(text, start, len(text)),
+                          f"{text[:32]!r}|{start}")
+
+    def test_the_rule_is_still_built_from_the_shared_source(self):
+        """The guard against drift: the rule *is* these constants. A token
+        added to one without the other would change this string."""
+        self.assertEqual(_IMPERATIVE_PREFIX_RE.pattern,
+                         "^" + _IMPERATIVE_HEAD + _IMPERATIVE_RUN + "$")
+        for token in _IMPERATIVE_TOKENS:
+            self.assertIn(token, _IMPERATIVE_RUN)
+
+    def test_ordered_alternation_is_not_committed_to_early(self):
+        """``ok`` stands in front of ``okay``. A reader that took the first
+        branch that matched would stop short of an end the rule reaches."""
+        for text in ("ok okay hey ", "okay", "okayok", "okokay", "okayokay",
+                     "OK OKAY HEY ", "okay,ok,okay"):
+            self.assert_agrees(text)
+
+    def test_the_optional_quote_and_marker_are_honoured(self):
+        for text in ('" ', '" , ', "' and ", "- ", "- and ", "1. ", "1. and ",
+                     "(1) and ", "12. ", "123. ", "--- ", "  - 1. and "):
+            self.assert_agrees(text)
+
+    def test_the_empty_prefix_is_a_directive(self):
+        self.assertTrue(self.indexed("", 0, 0))
+        self.assertIs(self.indexed("", 0, 0), self.direct("", 0, 0))
+
+    def test_accepted_and_rejected_long_runs_agree(self):
+        for text in ("," * 400, "and " * 200, ", " * 300,
+                     "," * 200 + "x" + "," * 200, "the weather " * 60,
+                     "," * 200 + " the weather is fine "):
+            self.assert_agrees(text)
+
+    def test_candidate_starts_before_and_after_invalid_material(self):
+        for text in ("the weather is fine ", ",,, the weather is fine ",
+                     "the weather is fine ,,, ", "and the weather and "):
+            self.assert_agrees(text)
+
+    def test_the_run_state_is_read_once_per_instruction(self):
+        state = _imperative_run_state("," * 20, 20)
+        self.assertEqual(len(state), 21)
+        self.assertTrue(all(state))
+        mixed = "the weather" + "," * 10
+        self.assertTrue(_imperative_run_state(mixed, len(mixed))[len("the weather")])
+        self.assertFalse(_imperative_run_state(mixed, len(mixed))[0])
+
+    def test_the_three_boundary_sensitive_cases_are_unchanged(self):
+        """The candidate's own start stays authoritative: measuring from the
+        instruction instead would call each of these an imperative."""
+        for text in ("reminder, the weather is fine stop taking your prescribed insulin today",
+                     "reminder, the room upstairs is warm stop taking your prescribed insulin today",
+                     "notice, we counted the chairs twice stop taking your prescribed insulin today"):
+            side = text[text.index(",") + 2:]
+            offset = side.index("stop")
+            self.assertEqual(_local_prefix(side, offset), 0, text[:30])
+            self.assertFalse(_advice_is_directive(side, offset), text[:30])
+            self.assertFalse(_terminates_protection(side), text[:30])
+            self.assertIsNot(analyze(text).highest_severity, Severity.SEVERE, text[:30])
+
+    def test_a_real_directive_after_a_permitted_run_still_qualifies(self):
+        for lead in ("", ", ", ",,,, ", "and ", "ok ", "- ", "1. "):
+            text = lead + self.MEDICAL
+            self.assertIs(analyze(text).highest_severity, Severity.SEVERE, repr(lead))
+
+    def test_dense_runs_before_an_instruction_stay_live(self):
+        """A liveness bound far above the measured cost. Before this the same
+        run was walked once per boundary and the analysis did not finish."""
+        import time
+
+        for text in (self.HEAD + "," * 8_000 + " " + self.MEDICAL,
+                     self.HEAD + "," * 4_000 + " " + self.MEDICAL + "," * 4_000 + " ok",
+                     self.HEAD + "," * 4_000 + " " + self.MEDICAL + "," * 4_000 + " " + self.SECOND):
+            start = time.perf_counter()
+            assessment = analyze(text)
+            self.assertIs(assessment.highest_severity, Severity.SEVERE)
+            self.assertLess(time.perf_counter() - start, 30.0)
 
 
 if __name__ == "__main__":

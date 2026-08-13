@@ -252,17 +252,17 @@ _NAMED_ACTION_RE = _c(
 )
 
 
-def _named_action_spans(clause: str) -> tuple[tuple[int, int], ...]:
+def _named_action_spans(clause) -> tuple[tuple[int, int], ...]:
     """Where an action word is being named rather than performed."""
     spans: list[tuple[int, int]] = []
-    for match in _NAMED_ACTION_RE.finditer(clause):
+    for match in _as_scan(clause).finditer(_NAMED_ACTION_RE):
         for group in ("a1", "a2", "a3", "a4"):
             if match.group(group) is not None:
                 spans.append(match.span(group))
     return tuple(spans)
 
 
-def _has_operative_action(clause: str) -> bool:
+def _has_operative_action(clause) -> bool:
     """True unless every action token in ``clause`` is only being named.
 
     Collect-then-aggregate, as everywhere else here: each occurrence is judged
@@ -270,12 +270,13 @@ def _has_operative_action(clause: str) -> bool:
     then tells the reader to send something still has an operative action, and
     is still a request.
     """
-    named = _named_action_spans(clause)
+    scan = _as_scan(clause)
+    named = _named_action_spans(scan)
     if not named:
         return True
     return any(
         not any(start <= match.start() < end for start, end in named)
-        for match in _ACTION_TOKEN_RE.finditer(clause)
+        for match in scan.finditer(_ACTION_TOKEN_RE)
     )
 
 
@@ -352,8 +353,10 @@ _SECRET_NOUN_RE = _c(
 )
 
 
-def _is_pronoun_warning(text: str) -> bool:
-    return bool(_SECRET_NOUN_RE.search(text)) and bool(_PRONOUN_WARNING_RE.search(text))
+def _is_pronoun_warning(text) -> bool:
+    scan = _as_scan(text)
+    return (scan.search(_SECRET_NOUN_RE) is not None
+            and scan.search(_PRONOUN_WARNING_RE) is not None)
 
 
 @dataclass(frozen=True)
@@ -432,6 +435,128 @@ _WEAK_SEPARATOR_RE = _c(
 _BARE_COMMA_RE = _c(r",\s*")
 
 
+class _Scan:
+    """One side of a candidate boundary, kept as its clause plus true offsets.
+
+    Every question the severe-side tests ask is one of two kinds. *Where a
+    pattern matches* is a fact about the text: it does not move when a
+    different comma is being considered, so it is enumerated once per clause
+    and consulted by offset. *What that match means here* -- whether a
+    negator stands in front of it, whether the instruction begins this side,
+    whether a frame reports it -- is a fact about the candidate, and is still
+    derived from the true candidate boundary every time it is asked.
+
+    Holding both together is the point. The clause and the offsets travel as
+    one value, so the boundary-sensitive half cannot quietly start measuring
+    from an occurrence instead of from the comma that was asked about, which
+    is the transformation this design exists to make unrepresentable.
+    """
+
+    __slots__ = ("clause", "start", "end", "_facts", "_text")
+
+    def __init__(self, clause, start=0, end=None, facts=None):
+        self.clause = clause
+        self.start = start
+        self.end = len(clause) if end is None else end
+        # Shared across every candidate cut from one clause, never across
+        # clauses, and never outliving the analysis that built it.
+        self._facts = {} if facts is None else facts
+        self._text = None
+
+    @property
+    def text(self):
+        if self._text is None:
+            self._text = self.clause[self.start:self.end]
+        return self._text
+
+    def stripped(self):
+        """This side with surrounding whitespace dropped, as a scan.
+
+        Offsets move; the clause does not, so the enumerated facts stay valid
+        and the trailing edge keeps meaning what it meant.
+        """
+        start, end = self.start, self.end
+        while start < end and self.clause[start].isspace():
+            start += 1
+        while end > start and self.clause[end - 1].isspace():
+            end -= 1
+        return _Scan(self.clause, start, end, self._facts)
+
+    def _enumerate(self, pattern):
+        """Every position this pattern can match from, in clause order.
+
+        Enumerated from each position rather than by ``finditer`` because a
+        side may begin inside what a non-overlapping walk had already
+        consumed: the match a candidate would have found on its own is
+        exactly the leftmost one starting at or after where it begins.
+        """
+        found = self._facts.get(pattern)
+        if found is None:
+            collected, position = [], 0
+            limit = len(self.clause)
+            while position <= limit:
+                match = pattern.search(self.clause, position)
+                if match is None:
+                    break
+                collected.append(match)
+                position = match.start() + 1
+            found = tuple(collected)
+            self._facts[pattern] = found
+        return found
+
+    def search(self, pattern):
+        """The match this side would have found searching itself."""
+        for match in self._enumerate(pattern):
+            if match.start() < self.start:
+                continue
+            return match if match.end() <= self.end else None
+        return None
+
+    def finditer(self, pattern):
+        """The non-overlapping walk this side would have made itself."""
+        position = self.start
+        for match in self._enumerate(pattern):
+            if match.start() < position:
+                continue
+            if match.end() > self.end:
+                return
+            yield match
+            position = match.end()
+
+    def any(self, patterns):
+        return any(self.search(pattern) is not None for pattern in patterns)
+
+    def before(self, patterns, offset):
+        """Does one of ``patterns`` match between this side's start and ``offset``?
+
+        The candidate's own start, never an occurrence's: this is the "what
+        stands in front of it" half, measured from the boundary that was
+        asked about.
+        """
+        for pattern in patterns:
+            for match in self._enumerate(pattern):
+                if match.start() < self.start:
+                    continue
+                if match.end() > offset:
+                    break
+                return True
+        return False
+
+    def run_state(self, end):
+        """Imperative-run membership for every offset up to ``end``, once."""
+        key = ("imperative-run", end)
+        state = self._facts.get(key)
+        if state is None:
+            state = _imperative_run_state(self.clause, end)
+            self._facts[key] = state
+        return state
+
+
+def _as_scan(value):
+    """Accept a plain string or a scan, so callers holding one still work."""
+    return value if isinstance(value, _Scan) else _Scan(value, 0, len(value))
+
+
 def _side_is_independent(side: str, lookahead: str = "") -> bool:
     """True when a side carries framing or an independently matchable rule.
 
@@ -504,21 +629,22 @@ def _side_is_independent(side: str, lookahead: str = "") -> bool:
     )
 
 
-def _severe_credential_side(side: str) -> bool:
+def _severe_credential_side(side) -> bool:
     """A complete credential request, judged on this side alone."""
-    flags = _flags_for(side)
+    scan = _as_scan(side)
+    flags = _flags_for(scan)
     if flags.warning or flags.quoted or flags.educational:
         return False
-    if _is_passive_credential_warning(side):
+    if _is_passive_credential_warning(scan):
         return False
-    if _has_operative_action(side):
+    if _has_operative_action(scan):
         for _rid, request_pattern, _target, _diag in _CREDENTIAL_COMPILED:
-            if request_pattern.search(side):
+            if scan.search(request_pattern):
                 return True
-    if _MESSAGE_TRANSMISSION_RE.search(side):
+    if scan.search(_MESSAGE_TRANSMISSION_RE):
         return True
     for _rid, pattern, _diag in _CREDENTIAL_PASSIVE:
-        match = pattern.search(side)
+        match = scan.search(pattern)
         if match is None:
             continue
         gap = (match.groupdict().get("gap") or "") + (match.groupdict().get("gap2") or "")
@@ -527,14 +653,15 @@ def _severe_credential_side(side: str) -> bool:
     return False
 
 
-def _severe_injection_side(side: str) -> bool:
+def _severe_injection_side(side) -> bool:
     """A complete instruction-override attempt, judged on this side alone."""
-    if _flags_for(side).is_discussion:
+    scan = _as_scan(side)
+    if _flags_for(scan).is_discussion:
         return False
-    return any(pattern.search(side) for _rid, pattern, _diag in _INJECTION_COMPILED)
+    return scan.any(tuple(pattern for _rid, pattern, _diag in _INJECTION_COMPILED))
 
 
-def _severe_advice_side(side: str) -> bool:
+def _severe_advice_side(side) -> bool:
     """A complete dangerous instruction, judged on this side alone.
 
     The gates are the unsafe-advice rule's own, asked of this side by itself:
@@ -542,21 +669,22 @@ def _severe_advice_side(side: str) -> bool:
     credential warning -- stop counting as an argument against a medical
     instruction it has nothing to do with.
     """
-    if (_any(_ADVICE_CRITICAL_CONTEXT, side) or _any(_EDUCATIONAL_PATTERNS, side)
-            or _any(_QUOTED_PATTERNS, side) or _any(_PROFESSIONAL_GUIDANCE, side)):
+    scan = _as_scan(side)
+    if (scan.any(_ADVICE_CRITICAL_CONTEXT) or scan.any(_EDUCATIONAL_PATTERNS)
+            or scan.any(_QUOTED_PATTERNS) or scan.any(_PROFESSIONAL_GUIDANCE)):
         return False
     for _rid, pattern, _diag, harm_is_negation in _UNSAFE_COMPILED:
-        match = pattern.search(side)
+        match = scan.search(pattern)
         if match is None:
             continue
-        if _advice_is_warning(side, match.start(), harm_is_negation):
+        if _advice_is_warning(scan, match.start(), harm_is_negation):
             continue
-        if _advice_is_directive(side, match.start()):
+        if _advice_is_directive(scan, match.start()):
             return True
     return False
 
 
-def _terminates_protection(right: str) -> bool:
+def _terminates_protection(right) -> bool:
     """True when ``right`` independently carries a complete severe occurrence.
 
     This is the *whole* acceptance test for a bare comma, and it is
@@ -574,8 +702,8 @@ def _terminates_protection(right: str) -> bool:
     to do with it, and reported speech did the same to a live demand. Neither
     family is named here; both are simply asked.
     """
-    stripped = right.strip()
-    if len(stripped) < 3:
+    stripped = _as_scan(right).stripped()
+    if stripped.end - stripped.start < 3:
         return False
     # Reported speech is not a live occurrence, whatever it reports.
     if _is_narrated(stripped):
@@ -781,6 +909,14 @@ def _segment(text: str, boundaries: tuple[int, ...] = ()) -> list[tuple[int, int
             continue
         if quotations is None:
             quotations = _quoted_spans(text)
+        # One clause, read once for where its patterns match and once for the
+        # imperative runs behind each instruction, then consulted from each
+        # candidate in turn. Every right-hand side ends where this clause
+        # ends, so facts gathered here answer each of them exactly, and the
+        # candidate's own start stays the start every boundary-sensitive
+        # question is measured from.
+        clause = text[span_start:span_end].rstrip()
+        facts: dict = {}
         for match in commas:
             if _inside_shown_quotation(text, match.start(), quotations):
                 continue
@@ -805,8 +941,11 @@ def _segment(text: str, boundaries: tuple[int, ...] = ()) -> list[tuple[int, int
             # suffix that has nothing in it to find.
             right = (match.end() - span_start, span_end - span_start)
             left = (cursor - span_start, match.start() - span_start)
+            offset = match.end() - span_start
+            right_side = (_Scan(clause, offset, len(clause), facts)
+                          if offset <= len(clause) else text[match.end():span_end])
             if ((_may_terminate(candidates, *right)
-                 and _terminates_protection(text[match.end():span_end]))
+                 and _terminates_protection(right_side))
                     or (_may_terminate(candidates, *left)
                         and _terminates_protection(text[cursor:match.start()]))):
                 final.append((cursor, match.start()))
@@ -975,7 +1114,7 @@ _LIVE_REQUEST_RE = _c(
 )
 
 
-def _narrated_from(clause: str) -> int | None:
+def _narrated_from(clause) -> int | None:
     """Where narration starts in ``clause``, or ``None`` if it does not.
 
     The frame has to open the narrated span: anything the clause asks for
@@ -983,18 +1122,19 @@ def _narrated_from(clause: str) -> int | None:
     A first-person request appearing after the frame is part of what is being
     reported, which is the whole point of reporting it.
     """
+    scan = _as_scan(clause)
     starts = [match.start() for pattern in _NARRATIVE_FRAMES
-              for match in [pattern.search(clause)] if match is not None]
+              for match in [scan.search(pattern)] if match is not None]
     if not starts:
         return None
     frame = min(starts)
-    live = _LIVE_REQUEST_RE.search(clause)
+    live = scan.search(_LIVE_REQUEST_RE)
     if live is not None and live.start() < frame:
         return None
     return frame
 
 
-def _is_narrated(clause: str) -> bool:
+def _is_narrated(clause) -> bool:
     return _narrated_from(clause) is not None
 
 
@@ -1220,13 +1360,14 @@ def _quoted_spans(text: str) -> tuple[tuple[int, int], ...]:
     return tuple(spans)
 
 
-def _flags_for(clause: str) -> ContextFlags:
+def _flags_for(clause) -> ContextFlags:
+    scan = _as_scan(clause)
     return ContextFlags(
-        warning=(_any(_WARNING_PATTERNS, clause) or _is_pronoun_warning(clause)
-                 or _is_passive_credential_warning(clause)),
-        notification=_any(_NOTIFICATION_PATTERNS, clause),
-        educational=_any(_EDUCATIONAL_PATTERNS, clause),
-        quoted=_any(_QUOTED_PATTERNS, clause),
+        warning=(scan.any(_WARNING_PATTERNS) or _is_pronoun_warning(scan)
+                 or _is_passive_credential_warning(scan)),
+        notification=scan.any(_NOTIFICATION_PATTERNS),
+        educational=scan.any(_EDUCATIONAL_PATTERNS),
+        quoted=scan.any(_QUOTED_PATTERNS),
     )
 
 
@@ -1662,7 +1803,7 @@ def _passive_request_matches(pattern: re.Pattern[str], text: str, local: "_Local
     return kept
 
 
-def _is_passive_credential_warning(clause: str) -> bool:
+def _is_passive_credential_warning(clause) -> bool:
     """A bounded negative credential warning in passive or reordered order.
 
     Every condition of the approved invariant is checked inside ``clause``,
@@ -1672,16 +1813,17 @@ def _is_passive_credential_warning(clause: str) -> bool:
     action with no inversion between the two, no request aimed at a current
     destination, and no new imperative anywhere in the same clause.
     """
-    if not any(target.search(clause) for _rid, _req, target, _diag in _CREDENTIAL_COMPILED):
+    scan = _as_scan(clause)
+    if not scan.any(tuple(target for _rid, _req, target, _diag in _CREDENTIAL_COMPILED)):
         return False
-    if _LIVE_REQUEST_RE.search(clause) or _DIRECTED_REQUEST_RE.search(clause):
+    if scan.search(_LIVE_REQUEST_RE) or scan.search(_DIRECTED_REQUEST_RE):
         return False
-    if _NEW_DIRECTIVE_RE.search(clause):
+    if scan.search(_NEW_DIRECTIVE_RE):
         return False
-    for match in _PASSIVE_WARNING_RE.finditer(clause):
+    for match in scan.finditer(_PASSIVE_WARNING_RE):
         if not _INVERSION_RE.search(match.group("gap")):
             return True
-    return bool(_SECRECY_STATE_RE.search(clause))
+    return scan.search(_SECRECY_STATE_RE) is not None
 
 
 def _evaluate_credentials(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
@@ -3278,16 +3420,95 @@ _ADVICE_DIRECTIVE = _compile_all(
 #: trailing space, so "-5 degrees" and "3.5 ml" are untouched.
 _LIST_MARKER = r"(?:[-*•–—·]+|\(?\d{1,2}[.)])"
 
+#: The two halves of the imperative prefix, named so that the compiled rule
+#: below and the incremental reader further down are generated from one
+#: source. They are not two spellings of one grammar: the rule *is* this
+#: source, and the reader consults the same constants, so a token added here
+#: reaches both or neither. A test asserts the rule still builds byte for
+#: byte from them rather than trusting the concatenation.
+#:
+#: An opening quotation mark is punctuation, not framing. Refusing to look
+#: past it means "stop taking your medications tonight" in quotes reads as a
+#: mention rather than an instruction, which hands out an exemption for the
+#: price of two characters. Whether the quote is *protected* is a separate
+#: question, decided by attribution.
+_IMPERATIVE_HEAD = r"\s*[\"'“‘(\[]?\s*(?:" + _LIST_MARKER + r"\s+)?"
+#: Ordered, and the order is load-bearing: ``ok`` stands in front of ``okay``,
+#: so a reader that commits to the first branch that matches would stop short
+#: of an end the rule can reach. Every branch is tried below for that reason.
+_IMPERATIVE_TOKENS = ("and", "then", "also", "so", "but", "just", "please",
+                      "ok", "okay", "hey", ",")
+_IMPERATIVE_TOKEN = r"(?:" + "|".join(_IMPERATIVE_TOKENS) + r")"
+_IMPERATIVE_RUN = r"(?:\s*" + _IMPERATIVE_TOKEN + r"\s*)*"
+
 #: A clause whose harmful verb sits at the front is an imperative.
-_IMPERATIVE_PREFIX_RE = _c(
-    # An opening quotation mark is punctuation, not framing. Refusing to look
-    # past it means "stop taking your medications tonight" in quotes reads as
-    # a mention rather than an instruction, which hands out an exemption for
-    # the price of two characters. Whether the quote is *protected* is a
-    # separate question, decided by attribution.
-    r"^\s*[\"'“‘(\[]?\s*(?:" + _LIST_MARKER + r"\s+)?"
-    + r"(?:\s*(?:and|then|also|so|but|just|please|ok|okay|hey|,)\s*)*$"
-)
+_IMPERATIVE_PREFIX_RE = _c(r"^" + _IMPERATIVE_HEAD + _IMPERATIVE_RUN + r"$")
+
+#: The same head, read between two offsets. ``re`` will not let ``^`` match at
+#: a ``pos`` and :meth:`re.Pattern.match` already anchors there, so the caret
+#: is the only thing that differs.
+_IMPERATIVE_HEAD_RE = _c(_IMPERATIVE_HEAD)
+#: One compiled reader per branch, built from the same tuple the rule is.
+_IMPERATIVE_TOKEN_RES = tuple(_c(re.escape(token)) for token in _IMPERATIVE_TOKENS)
+_WHITESPACE_RUN_RE = _c(r"\s*")
+
+
+def _whitespace_ends(text: str, limit: int) -> tuple[int, ...]:
+    """For each offset, where the whitespace run starting there stops."""
+    ends = [0] * (limit + 1)
+    ends[limit] = limit
+    for position in range(limit - 1, -1, -1):
+        ends[position] = ends[position + 1] if text[position].isspace() else position
+    return tuple(ends)
+
+
+def _imperative_run_state(text: str, end: int) -> tuple[bool, ...]:
+    """Which offsets begin a pure imperative token run ending at ``end``.
+
+    Read right to left, once per instruction, and then consulted by every
+    candidate in front of it. That is the whole correction: the rule's own
+    question -- "is everything between here and the verb one of the words it
+    allows" -- has an answer that does not change when a different comma is
+    considered, so it is computed once rather than re-read from each comma.
+
+    Every branch is tried, and the trailing whitespace is allowed to give
+    ground, because both are things the compiled rule can do by backtracking:
+    ``ok`` matching first must not hide the end ``okay`` would have reached.
+    """
+    whitespace = _whitespace_ends(text, end)
+    reachable = [False] * (end + 2)
+    # ``nearest[p]`` is the first offset at or after ``p`` that begins a run,
+    # which is what keeps a long run of spaces from being re-walked per offset.
+    nearest = [end + 1] * (end + 2)
+    reachable[end] = True
+    nearest[end] = end
+    for position in range(end - 1, -1, -1):
+        opening = whitespace[position]
+        for token in _IMPERATIVE_TOKEN_RES:
+            hit = token.match(text, opening, end)
+            if hit is None:
+                continue
+            if nearest[hit.end()] <= whitespace[hit.end()]:
+                reachable[position] = True
+                break
+        nearest[position] = position if reachable[position] else nearest[position + 1]
+    return tuple(reachable[:end + 1])
+
+
+def _imperative_prefix_reaches(scan: "_Scan", cut: int, stop: int) -> bool:
+    """The imperative rule, asked of ``clause[cut:stop]`` without re-reading it.
+
+    The head is short and is still matched directly; what is not re-read is
+    the run behind it, which is the part a candidate far from the instruction
+    was otherwise walking end to end. The answer is the rule's own.
+    """
+    state = scan.run_state(stop)
+    head = _IMPERATIVE_HEAD_RE.match(scan.clause, cut, stop)
+    furthest = head.end() if head is not None else cut
+    for finish in range(cut, furthest + 1):
+        if state[finish] and _IMPERATIVE_HEAD_RE.fullmatch(scan.clause, cut, finish):
+            return True
+    return False
 
 #: ``True`` when the pattern itself contains the harmful negation, so a
 #: leading negator is the *harmful* form rather than the warning form.
@@ -3415,18 +3636,20 @@ def _clauses(text: str, boundaries: tuple[int, ...] = ()) -> tuple[str, ...]:
     )
 
 
-def _advice_is_warning(clause: str, start: int, harm_is_negation: bool) -> bool:
+def _advice_is_warning(clause, start: int, harm_is_negation: bool) -> bool:
     """True when this clause argues *against* the action it names."""
+    scan = _as_scan(clause)
     if harm_is_negation:
         # The negation is inside the match, so only a double negation or an
         # explicit obligation to seek care can flip it back to a warning.
-        return _any(_ENCOURAGE_CARE, clause)
-    prefix = clause[:start]
-    return _any(_ADVICE_NEGATOR, prefix) or _any(_SEEK_GUIDANCE_FIRST, prefix)
+        return scan.any(_ENCOURAGE_CARE)
+    # What stands in front of the instruction, measured from this candidate's
+    # own start -- never from the instruction's.
+    return scan.before(_ADVICE_NEGATOR, start) or scan.before(_SEEK_GUIDANCE_FIRST, start)
 
 
-def _local_prefix(clause: str, start: int) -> str:
-    """The text since the last accepted separator: this clause's own offset 0.
+def _local_prefix(clause, start: int) -> int:
+    """Where this clause's own offset 0 sits: the last accepted separator.
 
     Actionability is a property of the clause the instruction sits in, not of
     the paragraph it arrived with. Measuring the imperative against the front
@@ -3435,20 +3658,26 @@ def _local_prefix(clause: str, start: int) -> str:
     verb away from position zero and quietly demotes a dangerous instruction.
     Cutting at the last accepted separator restores the local offset without
     re-segmenting anything or widening what counts as a boundary.
+
+    Returned as an offset, floored at the candidate's own start, so a side
+    carrying no separator of its own still measures the instruction against
+    *its* front rather than against the whole clause's.
     """
-    cut = 0
-    for match in _CLAUSE_BOUNDARY_RE.finditer(clause, 0, start):
-        cut = match.end()
-    for match in _WEAK_SEPARATOR_RE.finditer(clause, 0, start):
-        cut = max(cut, match.end())
-    return clause[cut:start]
+    scan = _as_scan(clause)
+    cut = scan.start
+    for pattern in (_CLAUSE_BOUNDARY_RE, _WEAK_SEPARATOR_RE):
+        for match in scan.finditer(pattern):
+            if match.end() <= start:
+                cut = max(cut, match.end())
+    return cut
 
 
-def _advice_is_directive(clause: str, start: int) -> bool:
+def _advice_is_directive(clause, start: int) -> bool:
     """True when the clause tells the reader to do it, not merely names it."""
-    return _any(_ADVICE_DIRECTIVE, clause) or bool(
-        _IMPERATIVE_PREFIX_RE.match(_local_prefix(clause, start))
-    )
+    scan = _as_scan(clause)
+    if scan.any(_ADVICE_DIRECTIVE):
+        return True
+    return _imperative_prefix_reaches(scan, _local_prefix(scan, start), start)
 
 
 def _evaluate_unsafe_advice(norm: NormalizedText, local: _LocalContext) -> list[RuleHit]:
