@@ -187,6 +187,30 @@ def _action_token(actions: tuple[str, ...]) -> str:
     return _TOKEN_START + _alternation(actions) + _TOKEN_END
 
 
+def _target_token(target: str) -> str:
+    """A reviewed credential target, matchable only as a whole token.
+
+    The same edge the actions already use, for the same reason. A credential
+    word that merely sits inside a longer one is not that credential:
+    "passwordless" is a rollout, "verification codebase" is a repository and
+    "cardnumbering" is a scheme. Each of them was read as the secret it
+    contains the letters of, and each produced a hard veto on an ordinary
+    release note.
+
+    This adds no morphology. Whatever plural a family supports is spelled out
+    inside ``target``; all this does is refuse to match across a token edge.
+    """
+    return _TOKEN_START + target + _TOKEN_END
+
+
+#: The same two edges asked of a *position* rather than built into a pattern,
+#: so the squeezed path below and the ordinary path above cannot disagree
+#: about where a token ends. A pattern of pure assertions matches the empty
+#: string exactly where they hold.
+_TOKEN_START_RE = _c(_TOKEN_START)
+_TOKEN_END_RE = _c(_TOKEN_END)
+
+
 # ---------------------------------------------------------------------------
 # An action word being *named* rather than performed.
 # ---------------------------------------------------------------------------
@@ -1504,20 +1528,28 @@ _PIN_TARGET = (
     r"pin(?:'s|s)?\b" + _NP_HEAD_END + r")"
 )
 
-_SECRET_TARGET = (
-    r"(?:otp|one[\s-]?time[\s-]?(?:password|code|pin)|" + _PIN_TARGET + r"|passcode|password|"
-    r"verification code|login code|security code|access code|recovery code|"
+#: Eight plural spellings are reviewed targets in their own right: OTPs,
+#: passwords, passcodes, verification codes, recovery codes, access codes,
+#: card numbers and CVVs. Each is written out beside the singular it belongs
+#: to rather than produced by a suffix rule, because a suffix rule would also
+#: invent "security answers", "secret questions", "full cards" and "expiry
+#: dates" -- forms nobody reviewed. The two targets that already carried a
+#: plural keep exactly the one they had: "personal identification numbers"
+#: and the possessive-or-plural "pin" inside :data:`_PIN_TARGET`.
+_SECRET_TARGET = _target_token(
+    r"(?:otps?|one[\s-]?time[\s-]?(?:password|code|pin)|" + _PIN_TARGET + r"|passcodes?|passwords?|"
+    r"verification codes?|login code|security code|access codes?|recovery codes?|"
     r"authentication code|auth code|2fa code|security answer|secret question)"
 )
-_CARD_TARGET = r"(?:cvv|cvc|card number|card details|security code on the back|expiry date|full card)"
-_BANK_TARGET = (
+_CARD_TARGET = _target_token(
+    r"(?:cvvs?|cvc|card numbers?|card details|security code on the back|expiry date|full card)")
+_BANK_TARGET = _target_token(
     r"(?:net ?banking|online banking|internet banking|account login|banking (?:login|password|credentials)|"
     # "Card details" was already a target; the banking equivalent was not, so
     # the one phrase a person is most likely to be asked for by name was the
     # one this layer could not see.
     r"bank(?:ing)? details|bank account details|"
-    r"account credentials|bank credentials|upi pin|atm pin)"
-)
+    r"account credentials|bank credentials|upi pin|atm pin)")
 
 _CREDENTIAL_FAMILIES = (
     ("CRED_SECRET_DISCLOSURE", _SECRET_TARGET, DiagnosticCode.CREDENTIAL_DISCLOSURE_REQUEST),
@@ -1538,11 +1570,45 @@ _CREDENTIAL_COMPILED = tuple(
 # Squeezed fallback: catches spacing/substitution evasion for long targets
 # only. Short targets such as a three-letter one are excluded because with
 # no word boundaries they match inside ordinary words.
+# Each approved plural is its own entry rather than an optional suffix on the
+# singular. In a view with no separators an optional "s" is greedy across word
+# ends: "...password" followed by "send me..." squeezes to "passwordsendme",
+# where "passwords?" claims the "s" that starts the next word and reports a
+# range that is not a token. Separate entries are each tested on their own.
 _SQUEEZED_TARGETS = _compile_all(
-    r"onetimepassword", r"verificationcode", r"logincode", r"securitycode",
-    r"passcode", r"password", r"recoverycode", r"authenticationcode",
-    r"netbanking", r"onlinebanking", r"cardnumber",
+    r"onetimepassword", r"verificationcode", r"verificationcodes",
+    r"logincode", r"securitycode", r"passcode", r"passcodes",
+    r"password", r"passwords", r"recoverycode", r"recoverycodes",
+    r"authenticationcode", r"netbanking", r"onlinebanking",
+    r"cardnumber", r"cardnumbers",
 )
+def _squeezed_target_is_whole_token(norm: NormalizedText) -> bool:
+    """True when a squeezed target maps back to a whole token in the source.
+
+    The squeezed view has no word boundaries at all, and that is exactly what
+    lets it read "c a r d n u m b e r" and "passw0rd" as one word. So the
+    boundary cannot be asked of it -- but it can be asked of the view it was
+    squeezed from. Every squeezed character records the offset it came from,
+    so a match here names an exact range in the security view, and that range
+    either is a token or is the inside of a longer one. "cardnumbering"
+    contains every letter of "card number" and is a numbering scheme.
+
+    Only the outer edges of the range are tested, which is what keeps the
+    separated and substituted spellings this path exists for: whatever the
+    message put *between* the characters is precisely what the squeeze
+    removed, so it was never a token edge to begin with.
+    """
+    offsets = norm.squeezed_offsets
+    for pattern in _SQUEEZED_TARGETS:
+        for match in pattern.finditer(norm.squeezed):
+            start = offsets[match.start()]
+            end = offsets[match.end() - 1] + 1
+            if (_TOKEN_START_RE.match(norm.security, start) is not None
+                    and _TOKEN_END_RE.match(norm.security, end) is not None):
+                return True
+    return False
+
+
 _SQUEEZED_REQUEST = _compile_all(
     r"sendme", r"shareyour", r"giveme", r"tellme", r"replywith", r"forwardthe",
     r"provideyour", r"enteryour", r"typeyour", r"sendyour", r"sendthe",
@@ -1944,9 +2010,9 @@ def _evaluate_credentials(norm: NormalizedText, local: _LocalContext) -> list[Ru
     if (not hits and not squeezed_ctx.is_advisory and not squeezed_ctx.is_discussion
             and not squeezed_ctx.notification):
         squeezed = norm.squeezed
-        if len(squeezed) >= SQUEEZE_MIN_LENGTH and _any(_SQUEEZED_TARGETS, squeezed) and _any(
-            _SQUEEZED_REQUEST, squeezed
-        ):
+        if (len(squeezed) >= SQUEEZE_MIN_LENGTH
+                and _squeezed_target_is_whole_token(norm)
+                and _any(_SQUEEZED_REQUEST, squeezed)):
             hits.append(
                 RuleHit(
                     FindingCategory.CREDENTIAL_SOLICITATION,

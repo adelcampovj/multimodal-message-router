@@ -4179,5 +4179,116 @@ class ImperativePrefixIndexTests(unittest.TestCase):
             self.assertLess(time.perf_counter() - start, 30.0)
 
 
+class CredentialTargetBoundaryTests(unittest.TestCase):
+    """P2C3QT2A. A credential target was recognised anywhere its letters
+    appeared, so "passwordless" was a password, "verification codebase" was a
+    verification code and "cardnumbering" was a card number -- each one a hard
+    veto on an ordinary release note. The targets are now whole tokens. Eight
+    plural spellings are reviewed targets in their own right so that bounding
+    the singular does not quietly stop recognising them."""
+
+    #: The eight plurals Strategy approved, with the request that must stay
+    #: severe and the longer token that must not be one.
+    APPROVED = (
+        ("passwords", "send me your passwords now", "send me the passwordsx dump now"),
+        ("passcodes", "send me your passcodes now", "send me the passcodesy archive now"),
+        ("otps", "send me the otps now", "send me the otpsx report now"),
+        ("verification codes", "forward me the verification codes now",
+         "forward me the verification codesbase now"),
+        ("recovery codes", "send me the recovery codes now",
+         "send me the recovery codesx dump now"),
+        ("card numbers", "give me your card numbers now",
+         "give me the card numbersx export now"),
+        ("access codes", "send me the access codes now", "send me the access codesx list now"),
+        ("cvvs", "share your cvvs with me now", "share your cvvsx column with me now"),
+    )
+
+    def test_each_approved_plural_is_a_live_request(self):
+        for label, request, _longer in self.APPROVED:
+            self.assertIs(analyze(request).highest_severity, Severity.SEVERE, label)
+
+    def test_each_approved_plural_reads_the_same_in_the_passive(self):
+        """A plural the active grammar accepts and the passive one cannot see
+        is the drift this phase exists to remove."""
+        for singular, plural in (("password", "passwords"), ("passcode", "passcodes"),
+                                 ("otp", "otps"), ("verification code", "verification codes"),
+                                 ("recovery code", "recovery codes"),
+                                 ("card number", "card numbers"),
+                                 ("access code", "access codes"), ("cvv", "cvvs")):
+            one = analyze(f"your {singular} must be sent to me right away")
+            many = analyze(f"your {plural} must be sent to me right away")
+            self.assertIs(many.highest_severity, one.highest_severity, plural)
+            self.assertEqual(many.hard_veto_required, one.hard_veto_required, plural)
+
+    def test_a_longer_token_is_not_the_credential_it_contains(self):
+        for label, _request, longer in self.APPROVED:
+            assessment = analyze(longer)
+            self.assertIsNot(assessment.highest_severity, Severity.SEVERE, label)
+            self.assertFalse(assessment.hard_veto_required, label)
+
+    def test_the_reported_embeddings_no_longer_escalate(self):
+        for text in ("share your passwordless login rollout notes with the team",
+                     "tell me the verification codebase owner for that repo",
+                     "send me the otpayment reconciliation file now",
+                     "give me the passcoded archive from the wiki",
+                     "send the card numbering scheme for the new stock system",
+                     "send me the password2 column from the dump now",
+                     "forward the password_hash fixture to me now",
+                     "send me your password-reset walkthrough now",
+                     "provide your netbankingx migration notes now"):
+            self.assertFalse(analyze(text).hard_veto_required, text[:40])
+
+    def test_whole_token_compounds_are_untouched(self):
+        """Whether a complete credential token is the topic rather than the
+        object is a separate question this phase does not answer."""
+        for text in ("send me the password policy document when you get a chance",
+                     "give me the passcode reset procedure from the wiki",
+                     "i will share your password manager recommendation with them",
+                     "please share your onetimepassword research summary",
+                     "share your password strategy notes before friday",
+                     "forward the password rotation schedule to operations",
+                     "confirm the password complexity rules with security"):
+            self.assertIs(analyze(text).highest_severity, Severity.SEVERE, text[:40])
+
+    def test_existing_singular_and_explicit_morphology_still_match(self):
+        for text in ("send me the otp now", "send me the one time password now",
+                     "send me the personal identification number now",
+                     "send me the personal identification numbers now",
+                     "send me the pins now", "provide your cvv now",
+                     "send me the card number now", "send me your bank details now",
+                     "send me your banking details now", "share your upi pin with me now"):
+            self.assertIs(analyze(text).highest_severity, Severity.SEVERE, text[:40])
+
+    def test_the_squeeze_records_where_each_character_came_from(self):
+        """The map is what lets a view with no boundaries answer a question
+        about boundaries, so it has to be total and in order."""
+        for text in ("send me the c a r d n u m b e r now", "send me your passw0rd now",
+                     "send the cardnumbering scheme now", "ordinary text with no secrets"):
+            normalized = normalize(text)
+            offsets = normalized.squeezed_offsets
+            self.assertEqual(len(offsets), len(normalized.squeezed), text[:30])
+            self.assertTrue(all(0 <= o < len(normalized.security) for o in offsets), text[:30])
+            self.assertTrue(all(a < b for a, b in zip(offsets, offsets[1:])), text[:30])
+
+    def test_obfuscated_spellings_still_reach_the_rule(self):
+        """Separated and substituted characters are exactly what the squeezed
+        path exists for; only the outer edges of a match are a token edge."""
+        for text in ("s e n d  m e  y o u r  p a s s w o r d  n o w",
+                     "send me the c a r d n u m b e r now",
+                     "send me your passw0rd now", "send me your p@ssword now"):
+            self.assertIs(analyze(text).highest_severity, Severity.SEVERE, text[:34])
+
+    def test_a_squeezed_target_inside_a_longer_token_is_not_one(self):
+        for text in ("send the cardnumbering scheme for the new stock system",
+                     "send me the verificationcodebase owner now",
+                     "send me the passcodedarchive now",
+                     "send me the recoverycodesx dump now",
+                     "send me your netbankingx notes now"):
+            assessment = analyze(text)
+            self.assertFalse(assessment.hard_veto_required, text[:40])
+            self.assertNotIn("CRED_OBFUSCATED_DISCLOSURE",
+                             [f.rule_id for f in assessment.findings], text[:40])
+
+
 if __name__ == "__main__":
     unittest.main()

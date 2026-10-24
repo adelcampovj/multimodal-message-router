@@ -217,6 +217,12 @@ class NormalizedText:
     truncated: bool
     segments: tuple[NormalizedSegment, ...] = ()
     boundaries: tuple[StructuralBoundary, ...] = ()
+    #: Where each character of :attr:`squeezed` came from in
+    #: :attr:`security`, one offset per squeezed character. Offsets only: it
+    #: holds no text the security view does not already hold. It exists
+    #: because the squeezed view has no word boundaries to ask about, so a
+    #: rule matching there has to be able to ask what it matched *here*.
+    squeezed_offsets: tuple[int, ...] = ()
 
     @property
     def is_empty(self) -> bool:
@@ -238,6 +244,27 @@ class NormalizedText:
             f"truncated={self.truncated}, folded_length={len(self.folded)}, "
             f"segments={len(self.segments)})"
         )
+
+
+def _squeeze(security: str) -> tuple[str, tuple[int, ...]]:
+    """The squeezed view, and where each of its characters came from.
+
+    Built in a single pass so the string and the offsets cannot disagree.
+    The substitution is one character for one character and the removal only
+    ever drops, so every squeezed character has exactly one originating
+    offset -- the correspondence is total and lossless, not an estimate.
+
+    The character class is the one the removal already used, read rather than
+    restated, so there is no second definition of "alphanumeric" to drift.
+    """
+    kept: list[str] = []
+    offsets: list[int] = []
+    for index, mark in enumerate(security):
+        squeezed_mark = mark.translate(_SUBSTITUTIONS)
+        if _NON_ALNUM_RE.fullmatch(squeezed_mark) is None:
+            kept.append(squeezed_mark)
+            offsets.append(index)
+    return "".join(kept), tuple(offsets)
 
 
 def normalize(text: str) -> NormalizedText:
@@ -272,7 +299,7 @@ def normalize(text: str) -> NormalizedText:
 
     folded = " ".join(pieces)
     security = " ".join(segment.text for segment in segments)
-    squeezed = _NON_ALNUM_RE.sub("", security.translate(_SUBSTITUTIONS))
+    squeezed, squeezed_offsets = _squeeze(security)
 
     return NormalizedText(
         folded=folded,
@@ -282,6 +309,7 @@ def normalize(text: str) -> NormalizedText:
         truncated=truncated,
         segments=tuple(segments),
         boundaries=tuple(StructuralBoundary.LINE_BREAK for _ in segments[:-1]),
+        squeezed_offsets=squeezed_offsets,
     )
 
 
