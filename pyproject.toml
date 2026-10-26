@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "multimodal-message-router"
 version = "0.0.0"
-description = "A multimodal message-routing portfolio project (scaffold)."
+description = "A deterministic, policy-based multimodal message router that decides whether a message should interrupt, defer or be suppressed (portfolio project)."
 readme = "README.md"
 # 3.10 is a deliberate floor: PEP 604 unions (X | Y) and PEP 634 structural
 # pattern matching are both native at 3.10, so annotations stay modern

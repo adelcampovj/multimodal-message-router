@@ -1,4 +1,4 @@
-"""Tests for the message_router CLI scaffold."""
+"""Tests for the message_router CLI."""
 
 from __future__ import annotations
 
@@ -59,11 +59,16 @@ class CliInvocationTests(unittest.TestCase):
         result = _run([])
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_under_construction_message_present(self):
+    def test_default_output_describes_the_project_and_its_commands(self):
         result = _run([])
         lowered = result.stdout.lower()
-        self.assertIn("under construction", lowered)
-        self.assertIn("scaffold", lowered)
+        for command in ("validate", "route"):
+            self.assertIn(command, lowered)
+        # The project is no longer a scaffold, and the default output must not
+        # say it is -- nor claim that this command line can read media.
+        self.assertNotIn("scaffold", lowered)
+        self.assertNotIn("under construction", lowered)
+        self.assertIn("does not recognise images", lowered)
 
     def test_no_forbidden_language_in_help_or_default_output(self):
         combined = _run(["--help"]).stdout + "\n" + _run([]).stdout

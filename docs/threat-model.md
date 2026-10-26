@@ -1,8 +1,16 @@
 # Threat Model
 
 Scope note: this file documents the deterministic safety-analysis layer
-(`message_router.safety`). Routing, classification, reasons, and confidence
-are not implemented yet and are out of scope here.
+(`message_router.safety`) and how its output constrains routing. The rest of
+the pipeline is described in [architecture.md](architecture.md), and the
+ordered policy that acts on these findings in
+[routing-policy.md](routing-policy.md). This layer itself produces no routing
+action, message category, reason text or confidence value.
+
+Read this as a statement of design intent and of what is tested, not as a
+security guarantee. Detection is finite and pattern-based (see *Known
+limitations*), the project has not been audited or certified, and a message
+that raises no finding has not been shown to be safe.
 
 ## Trust boundary
 
@@ -20,6 +28,12 @@ and never an instruction.
 | Payload decoded from a scannable code | `qr_derived` | No |
 | A model's interpretation | `model_interpretation` | No |
 | A deterministic check's own conclusion | `derived_signal` | Reviewable, not content |
+
+This repository ships no OCR, speech or QR engine. Text with the `ocr_text`
+and `asr_transcript` provenances appears here only through the synthetic
+fixtures in `examples/run_media_examples.py`, which return fixed fictional
+strings (see [architecture.md](architecture.md)). The provenance rules below
+are what a real engine's output would be held to.
 
 Two properties hold for *every* provenance without exception, and are
 asserted by tests that iterate the whole enum:
@@ -168,15 +182,49 @@ receive identical analysis.
   help*: requiring that verb is what separates "don't go to the emergency
   room" from "don't park near the emergency room".
 
-* **A credential named "pin" is bounded by its other meanings.** The token is
-  admitted only when it is not qualified by a closed list of unrelated
-  senses — sewing, map, location, connector, header, a pinned message, a
-  variable name. "Pinned" and "pinning" never match at all, because the
-  token boundary rejects them. The short-token exclusion in squeezed
-  matching is unchanged: it is what stops three letters matching inside
-  ordinary prose.
-* **Processing is bounded** at 20,000 characters per source; longer content
-  is analysed up to the limit and flagged as truncated.
+* **A credential named "pin" is admitted by positive structure, not by an
+  exclusion list.** "Pin" also means a sewing supply, a map marker, a
+  connector, a pinned message or a variable name, and that list of other
+  senses is open-ended, so it can never be finished. The token therefore
+  matches only as the unambiguous full form ("personal identification
+  number") or as the head of its phrase, immediately after a determiner or
+  possessive and optionally one approved credential modifier. An unapproved
+  modifier breaks that adjacency and the phrase is simply not a credential
+  target. "Pinned" and "pinning" never match at all, because the token
+  boundary rejects them. The short-token exclusion in squeezed matching is
+  unchanged: it is what stops three letters matching inside ordinary prose.
+* **Credential targets are matched as whole tokens.** "Passwordless",
+  "verification codebase" and "card numbering" do not contain a credential,
+  and neither does a credential-like fragment inside a longer identifier. The
+  squeezed view, which has no word boundaries, maps each match back to the
+  ordinary view and applies the same token test to its outer edges, so
+  separated and substituted spellings of a real target ("p a s s w o r d")
+  still match. Eight plural spellings are reviewed targets in their own right;
+  there is no general plural or stemming rule.
+* **A whole-token credential word used as a topic can still be suppressed.**
+  The rules decide whether a credential-shaped *word* is present near a
+  request, not whether the credential is the thing being asked for. A request
+  for a document *about* credentials (a "password policy", a "password
+  manager" recommendation) therefore produces the same severe finding as a
+  request for the password itself, and the message is suppressed. This fails
+  toward caution, and it is not corrected here. Telling the two apart needs a
+  bounded way to recognise the requested object's role without a blocklist of
+  words such as "policy" or "manager", which would also silence a real
+  request that happens to mention one.
+* **Some warnings that name several credentials are mistaken for requests.**
+  The warning recognition is written around singular objects. "Never share
+  your passwords with anyone" (and the same sentence with "passcodes" or
+  "OTPs") is a warning but is read as a request, and is suppressed. Other
+  plural objects are recognised as warnings. A legitimate anti-fraud message
+  can be withheld. The other plural targets checked were not affected: they
+  are either recognised as warnings or fall below the severe threshold.
+* **Processing is bounded** at 20,000 characters per source. Longer content is
+  analysed up to the limit and the assessment is marked incomplete. Anything
+  past the limit is **not analysed**. In the case tested, a benign 20,000
+  character prefix followed by a severe request produced no finding, and the
+  message was deferred with `analysis_incomplete` set. It was not recognised
+  as hostile, so padding a message past the limit hides its tail from every
+  rule.
 
 ## Explicitly out of scope for this layer
 

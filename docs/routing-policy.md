@@ -1,8 +1,14 @@
 # Routing Policy
 
 How exactly one action is selected. This document covers the ordered
-policy; classification and features are in `architecture.md`, and risk
-findings are in `threat-model.md`.
+policy; classification and features are in [architecture.md](architecture.md),
+and risk findings are in [threat-model.md](threat-model.md).
+
+This is a reference for the policy's design, not an evaluation. It reports no
+accuracy, precision or recall, because the repository contains no labelled
+real-world corpus to measure them against; what it does contain is a large
+synthetic test suite that asserts the behaviour described below (see the
+README's testing section for what that does and does not show).
 
 ## Ordered, first-match precedence
 
@@ -27,6 +33,26 @@ than inferred from behaviour.
 | 12 | `route.utility.safe_defer` | defer |
 | 13 | `route.analysis.incomplete_defer` | defer |
 | — | `route.default.defer` | defer |
+
+```mermaid
+flowchart TD
+    START(["Safety assessment, classification and features"]) --> R1{"1: hard veto required?"}
+    R1 -->|"yes: suppress, nothing later runs"| ACT_S1(["suppress"])
+    R1 -->|"no"| R27{"2-7: explicit combination of independent<br/>risk root causes, or circulated content<br/>with suspicious risk and low value?"}
+    R27 -->|"yes"| ACT_S2(["suppress"])
+    R27 -->|"no"| R8{"8: legitimate urgency high,<br/>relevance at least medium,<br/>no high pressure, not degraded?"}
+    R8 -->|"yes"| ACT_I(["interrupt"])
+    R8 -->|"no"| R911{"9-11: silenced thread, repetition<br/>or marketing, each established<br/>low-value?"}
+    R911 -->|"yes"| ACT_S3(["suppress"])
+    R911 -->|"no"| R12{"12: useful or relevant?<br/>(safety is settled by the rules above)"}
+    R12 -->|"yes"| ACT_D1(["defer"])
+    R12 -->|"no"| R13{"13: ambiguous, conflicted<br/>or degraded analysis?"}
+    R13 -->|"yes"| ACT_D2(["defer"])
+    R13 -->|"no"| ACT_D3(["default: defer"])
+```
+
+The first rule whose predicate holds wins and evaluation stops. Every
+suppression sits above the interrupt rule, and every deferral sits below it.
 
 Every one of these is reachable by a real message through the real
 pipeline, and a test asserts it. That is not a formality: an earlier
@@ -132,7 +158,10 @@ urgent message. Unknown trust does not block one either.
 
 Urgency has to be *originated* by something independent: a safety alert, a
 near-term event supplied as structured metadata, or a currently active
-service disruption. Request grammar is not one of them. Being asked
+service disruption. Request grammar is not one of them. (Through the public
+`route` command only the first and third origins can occur: the request
+document has no field for a near-term event, so that origin is available to
+callers of the library but not to the command line.) Being asked
 something is not being asked something urgently, and treating a request as
 urgency-bearing hands out priority for phrasing alone.
 
@@ -210,5 +239,6 @@ deterministic content-free view for exact comparison.
 
 ## Out of scope here
 
-Evidence selection and ranking, final rationale text, final confidence
-calibration, any CLI route command, and demonstration data.
+Evidence selection and ranking, rationale text, and confidence calibration.
+The public decision exposes none of them. How the policy is reached from the
+command line, with runnable examples, is described in [demo.md](demo.md).

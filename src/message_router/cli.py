@@ -2,7 +2,7 @@
 
 Standard library only. Three behaviours exist today:
 
-* no subcommand -- print a short status message and exit successfully;
+* no subcommand -- print a short description and exit successfully;
 * ``validate`` -- load a request document and report whether it is
   structurally valid;
 * ``route`` -- load a request document, run it through the existing
@@ -25,15 +25,13 @@ import json
 import sys
 from pathlib import Path
 
-UNDER_CONSTRUCTION_MESSAGE = (
-    "message_router is a portfolio scaffold for a multimodal message-routing "
-    "project. The domain foundation (message_router.domain), request-document "
-    "loading (message_router.io), recipient-scoped history "
-    "(message_router.repositories), replaceable media adapters "
-    "(message_router.media, message_router.ports), and deterministic safety "
-    "analysis (message_router.safety) are available to import. The routing "
-    "stages are still under construction, so this build exposes only a "
-    "placeholder command-line interface."
+STATUS_MESSAGE = (
+    "message_router is a deterministic, policy-based message-routing "
+    "portfolio project. It decides whether a message should interrupt, defer "
+    "or be suppressed. Commands: 'validate FILE' checks that a request "
+    "document loads; 'route --input FILE' routes one request document and "
+    "prints a JSON decision. Run with --help for details. This command line "
+    "does not recognise images or transcribe audio; see docs/demo.md."
 )
 
 
@@ -41,9 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="message_router",
         description=(
-            "Multimodal message-routing portfolio project. Intended to "
-            "classify incoming messages for immediate, later, or suppressed "
-            "delivery based on message content and context."
+            "Multimodal message-routing portfolio project. Classifies "
+            "incoming messages for immediate (interrupt), later (defer), or "
+            "suppressed delivery based on message content and context."
         ),
     )
     subparsers = parser.add_subparsers(dest="command")
@@ -125,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
         return _validate(args.scenario)
     if args.command == "route":
         return _route(args.input)
-    print(UNDER_CONSTRUCTION_MESSAGE)
+    print(STATUS_MESSAGE)
     return 0
 
 
