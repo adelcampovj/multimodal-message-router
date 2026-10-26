@@ -1,0 +1,22 @@
+{
+  "format": "message-router.request",
+  "version": 1,
+  "request": {
+    "recipient": {
+      "id": "rcp-demo"
+    },
+    "conversation": {
+      "id": "conv-demo",
+      "surface": "direct",
+      "participants": 2
+    },
+    "sender": {
+      "id": "snd-riverside"
+    },
+    "message": {
+      "id": "note-benign",
+      "sent_at": "2031-03-09T14:30:00+00:00",
+      "body": "Lunch on Friday? I booked the usual table at the cafe by the river for twelve thirty."
+    }
+  }
+}

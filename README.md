@@ -6,9 +6,11 @@ The intent is a system that looks at an incoming message — across text,
 image, and voice content — and decides how it should be handled: delivered
 immediately, held for later review, or suppressed entirely.
 
-**Status: this repository is currently a scaffold.** No routing logic has
-been implemented yet; the package exposes only a placeholder command-line
-interface while the rest of the project is built out.
+**Status: the routing pipeline runs end to end.** A request document can be
+routed from the command line with `route`, which prints one JSON decision.
+Image and voice handling is demonstrated with pre-extracted synthetic text
+only; no recognition engine is included. See [docs/demo.md](docs/demo.md).
+Other documents in this repository are still being brought up to date.
 
 ## Development setup
 
@@ -23,6 +25,14 @@ pip install -e .
 
 ```bash
 python -m message_router --help
+```
+
+## Trying the router
+
+Route one of the six fictional examples (see [docs/demo.md](docs/demo.md)):
+
+```bash
+PYTHONPATH=src python -m message_router route --input examples/credential_request.json
 ```
 
 ## Running tests

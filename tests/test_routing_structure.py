@@ -266,9 +266,18 @@ class NoOrganizerVocabularyTests(unittest.TestCase):
 
 
 class CliSurfaceTests(unittest.TestCase):
-    def test_cli_exposes_no_route_or_policy_command(self):
+    def test_cli_exposes_no_classify_or_policy_command(self):
+        """The CLI offers ``route`` (portfolio stage A1) but no way to run a
+        stage on its own or to inspect the policy table.
+
+        This test used to forbid ``"route"`` as well, back when no command
+        could route. That was a boundary for the stage the project was in,
+        not a safety property; the replacement guard that the CLI carries no
+        stage wiring of its own is
+        ``tests/test_route_cli.py::CliCarriesNoRoutingLogicTests``.
+        """
         source = (SRC_DIR / "message_router" / "cli.py").read_text(encoding="utf-8")
-        for term in ('"route"', "'route'", '"classify"', "'classify'", '"policy"', "'policy'"):
+        for term in ('"classify"', "'classify'", '"policy"', "'policy'"):
             self.assertNotIn(term, source)
 
     def test_cli_does_not_import_routing(self):

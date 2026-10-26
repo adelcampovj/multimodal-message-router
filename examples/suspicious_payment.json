@@ -1,0 +1,22 @@
+{
+  "format": "message-router.request",
+  "version": 1,
+  "request": {
+    "recipient": {
+      "id": "rcp-demo"
+    },
+    "conversation": {
+      "id": "conv-demo",
+      "surface": "direct",
+      "participants": 2
+    },
+    "sender": {
+      "id": "snd-unknown-courier"
+    },
+    "message": {
+      "id": "note-payment",
+      "sent_at": "2031-03-09T14:30:00+00:00",
+      "body": "Your parcel is on hold. Pay the release fee now at http://203.0.113.9/pay or it will be returned to the sender."
+    }
+  }
+}

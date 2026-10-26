@@ -1,0 +1,22 @@
+{
+  "format": "message-router.request",
+  "version": 1,
+  "request": {
+    "recipient": {
+      "id": "rcp-demo"
+    },
+    "conversation": {
+      "id": "conv-demo",
+      "surface": "direct",
+      "participants": 2
+    },
+    "sender": {
+      "id": "snd-facilities"
+    },
+    "message": {
+      "id": "note-urgent",
+      "sent_at": "2031-03-09T14:30:00+00:00",
+      "body": "Fire alarm in the main office building. Everyone please evacuate now and meet at the car park."
+    }
+  }
+}

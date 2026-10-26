@@ -1,0 +1,26 @@
+{
+  "format": "message-router.request",
+  "version": 1,
+  "request": {
+    "recipient": {
+      "id": "rcp-demo"
+    },
+    "conversation": {
+      "id": "conv-demo",
+      "surface": "direct",
+      "participants": 2
+    },
+    "sender": {
+      "id": "snd-unknown-courier"
+    },
+    "message": {
+      "id": "note-ocr",
+      "sent_at": "2031-03-09T14:30:00+00:00",
+      "attachment": {
+        "id": "att-synthetic-image",
+        "kind": "image",
+        "source": "synthetic/screenshot-not-shipped.png"
+      }
+    }
+  }
+}
