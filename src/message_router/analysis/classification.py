@@ -25,6 +25,7 @@ from enum import Enum
 from ..domain.enums import Provenance
 from ..domain.errors import UnsupportedValueError
 from ..safety.models import FindingCategory, SafetyAssessment, Severity
+from ..safety.normalization import MAX_ANALYZED_CHARS
 
 __all__ = [
     "MessageClass",
@@ -128,6 +129,12 @@ class ClassificationContributor:
     diagnostic: ClassificationDiagnostic
     ambiguous: bool = False
     from_incomplete_analysis: bool = False
+    #: True when this contributor's support exists only in the part of its
+    #: source that the safety layer did not analyse (past
+    #: :data:`~message_router.safety.normalization.MAX_ANALYZED_CHARS`).
+    #: Such support still describes the message, but nothing checked it for
+    #: risk, so a later stage must not treat it as checked.
+    outside_safety_coverage: bool = False
 
     def sort_key(self) -> tuple:
         return (
@@ -159,6 +166,17 @@ class ClassificationResult:
     @property
     def considered(self) -> frozenset[MessageClass]:
         return frozenset(c.candidate for c in self.contributors)
+
+    @property
+    def selected_within_safety_coverage(self) -> MessageClass:
+        """The class the same selection rule picks from safety-analysed support alone.
+
+        Equal to :attr:`selected` whenever every source was short enough to be
+        analysed in full. It differs only when a class owes its support to
+        content the safety layer never read.
+        """
+        covered = tuple(c for c in self.contributors if not c.outside_safety_coverage)
+        return _select(covered, True)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +350,29 @@ def _is_active_disruption(raw: str) -> bool:
     return False
 
 
+def _is_word_character(char: str) -> bool:
+    """Whether ``char`` is a word character in the sense of ``\\w`` for text."""
+    return char.isalnum() or char == "_"
+
+
+def _safety_covered_view(raw: str) -> str | None:
+    """The part of one source the safety layer analysed, or None if it read all of it.
+
+    The safety layer analyses at most :data:`MAX_ANALYZED_CHARS` characters
+    of each source, cut from the raw text. A word split by that cut is left
+    out here: a pattern that matches only its first half ("do not enter" at
+    the end of a cut "do not entertain") is created by the cut, not by the
+    message. The backward walk covers at most one word, so this stays linear.
+    """
+    if len(raw) <= MAX_ANALYZED_CHARS:
+        return None
+    end = MAX_ANALYZED_CHARS
+    if _is_word_character(raw[end]):
+        while end > 0 and _is_word_character(raw[end - 1]):
+            end -= 1
+    return raw[:end]
+
+
 def classify(
     texts: tuple[tuple[str, Provenance], ...] = (),
     assessment: SafetyAssessment | None = None,
@@ -350,6 +391,10 @@ def classify(
     incomplete = bool(assessment.analysis_incomplete) if assessment is not None else False
 
     for raw, provenance in texts:
+        # Every source is still classified in full. Only when the safety
+        # layer cut a source short is each match re-checked against the part
+        # it analysed, so a contributor can say whether that check covered it.
+        covered = _safety_covered_view(raw)
         for rule_id, candidate, strength, diagnostic, pattern in _PATTERNS:
             if pattern.search(raw):
                 contributors.append(
@@ -360,6 +405,7 @@ def classify(
                         strength=strength,
                         diagnostic=diagnostic,
                         from_incomplete_analysis=incomplete,
+                        outside_safety_coverage=covered is not None and not pattern.search(covered),
                     )
                 )
         if _is_active_disruption(raw):
@@ -371,6 +417,7 @@ def classify(
                     strength=SupportStrength.STRONG,
                     diagnostic=ClassificationDiagnostic.ACTIVE_DISRUPTION_LANGUAGE,
                     from_incomplete_analysis=incomplete,
+                    outside_safety_coverage=covered is not None and not _is_active_disruption(covered),
                 )
             )
 
@@ -378,7 +425,8 @@ def classify(
     # it never creates one. Being addressed is not the same as being asked
     # something, and treating it as such would let routing metadata alone
     # manufacture a request out of an ordinary remark.
-    if directly_addressed and any(c.candidate is MessageClass.DIRECT_REQUEST for c in contributors):
+    requests = [c for c in contributors if c.candidate is MessageClass.DIRECT_REQUEST]
+    if directly_addressed and requests:
         contributors.append(
             ClassificationContributor(
                 MessageClass.DIRECT_REQUEST,
@@ -387,6 +435,9 @@ def classify(
                 SupportStrength.WEAK,
                 ClassificationDiagnostic.DIRECT_ADDRESS,
                 from_incomplete_analysis=incomplete,
+                # It reinforces, so it is covered only if a request it
+                # reinforces was.
+                outside_safety_coverage=all(c.outside_safety_coverage for c in requests),
             )
         )
 

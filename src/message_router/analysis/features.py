@@ -363,6 +363,11 @@ class DecisionFeatures:
     modality_consistency: ModalityConsistency = ModalityConsistency.NOT_APPLICABLE
     completeness: Completeness = Completeness.COMPLETE_FOR_AVAILABLE_INPUTS
     content_availability: ContentAvailability = ContentAvailability.NO_USABLE_CONTENT
+    #: True when legitimate urgency is ``high`` only because of content past
+    #: the safety layer's analysis limit -- the same derivation from
+    #: safety-analysed support alone does not reach ``high``. Never true for
+    #: a message whose sources were all analysed in full.
+    urgency_outside_safety_coverage: bool = False
 
     def get(self, family: FeatureFamily) -> Feature | None:
         for feature in self.features:
@@ -484,54 +489,26 @@ def extract_features(
     )
 
     # -- legitimate urgency (never raised by a safety finding) ------------
-    urgency_contributors: list[FeatureContributor] = []
-    disruption = _active_disruption_contributor(classification)
-    if selected_name in _URGENT_CLASSES:
-        urgency_contributors.append(
-            FeatureContributor(f"URGENCY_{selected_name}", SupportSource.UNTRUSTED_CONTENT,
-                               Provenance.AUTHORED_TEXT)
-        )
-    if disruption is not None:
-        # A service the reader depends on is down *right now*. Narrow by
-        # construction: scheduled maintenance, a resolved incident, a
-        # retrospective, a rumour, and an ordinary status update all fail
-        # the classification rule that produces this.
-        urgency_contributors.append(disruption)
-    if near_term_event:
-        urgency_contributors.append(
-            FeatureContributor("URGENCY_NEAR_TERM_EVENT", SupportSource.STRUCTURED_METADATA,
-                               Provenance.STRUCTURED_METADATA)
-        )
-    if directly_addressed and urgency_contributors:
-        # Targeting amplifies urgency that already has an independent basis;
-        # it never originates it. Otherwise a promotion addressed to one
-        # person would become urgent purely by being addressed.
-        urgency_contributors.append(
-            FeatureContributor("URGENCY_DIRECT_TARGET", SupportSource.STRUCTURED_METADATA,
-                               Provenance.STRUCTURED_METADATA)
-        )
-    if pressure_findings:
-        # Recorded so a reader can see pressure was noticed and deliberately
-        # not counted as urgency.
-        urgency_contributors.append(
-            FeatureContributor("URGENCY_RISK_ATTRIBUTED", SupportSource.SAFETY_FINDINGS,
-                               Provenance.DERIVED_SIGNAL,
-                               FeatureNote.URGENCY_WITHHELD_RISK_ATTRIBUTED)
-        )
-    supporting = [c for c in urgency_contributors if c.note is not FeatureNote.URGENCY_WITHHELD_RISK_ATTRIBUTED]
-    if not supporting:
-        urgency_level = FeatureLevel.ABSENT
-    elif (
-        selected_name in _SELF_SUFFICIENT_URGENCY
-        or disruption is not None
-        or len(supporting) >= 2
-    ):
-        urgency_level = FeatureLevel.HIGH
-    else:
-        urgency_level = FeatureLevel.MEDIUM
+    urgency_level, urgency_contributors = _legitimate_urgency(
+        selected_name, _active_disruption_contributor(classification),
+        near_term_event, directly_addressed, bool(pressure_findings),
+    )
     features.append(
         Feature(FeatureFamily.LEGITIMATE_URGENCY, urgency_level,
                 tuple(sorted(urgency_contributors, key=lambda c: c.sort_key())))
+    )
+    # The same derivation from safety-analysed support alone. The feature
+    # above is unchanged; this only records whether its HIGH level rests on
+    # content the safety layer never read. Structured context is kept as is:
+    # it is not content, so coverage does not apply to it.
+    covered_class = getattr(classification, "selected_within_safety_coverage", selected)
+    covered_level, _ = _legitimate_urgency(
+        covered_class.name if covered_class is not None else "",
+        _active_disruption_contributor(classification, within_safety_coverage=True),
+        near_term_event, directly_addressed, bool(pressure_findings),
+    )
+    urgency_outside_safety_coverage = (
+        urgency_level is FeatureLevel.HIGH and covered_level is not FeatureLevel.HIGH
     )
 
     # -- validated trust (structured context only) ------------------------
@@ -727,7 +704,61 @@ def extract_features(
         modality_consistency=consistency,
         completeness=completeness,
         content_availability=availability,
+        urgency_outside_safety_coverage=urgency_outside_safety_coverage,
     )
+
+
+def _legitimate_urgency(
+    selected_name: str,
+    disruption: FeatureContributor | None,
+    near_term_event: bool,
+    directly_addressed: bool,
+    pressure_present: bool,
+) -> tuple[FeatureLevel, list[FeatureContributor]]:
+    """Legitimate urgency and its contributors. Never raised by a safety finding."""
+    urgency_contributors: list[FeatureContributor] = []
+    if selected_name in _URGENT_CLASSES:
+        urgency_contributors.append(
+            FeatureContributor(f"URGENCY_{selected_name}", SupportSource.UNTRUSTED_CONTENT,
+                               Provenance.AUTHORED_TEXT)
+        )
+    if disruption is not None:
+        # A service the reader depends on is down *right now*. Narrow by
+        # construction: scheduled maintenance, a resolved incident, a
+        # retrospective, a rumour, and an ordinary status update all fail
+        # the classification rule that produces this.
+        urgency_contributors.append(disruption)
+    if near_term_event:
+        urgency_contributors.append(
+            FeatureContributor("URGENCY_NEAR_TERM_EVENT", SupportSource.STRUCTURED_METADATA,
+                               Provenance.STRUCTURED_METADATA)
+        )
+    if directly_addressed and urgency_contributors:
+        # Targeting amplifies urgency that already has an independent basis;
+        # it never originates it. Otherwise a promotion addressed to one
+        # person would become urgent purely by being addressed.
+        urgency_contributors.append(
+            FeatureContributor("URGENCY_DIRECT_TARGET", SupportSource.STRUCTURED_METADATA,
+                               Provenance.STRUCTURED_METADATA)
+        )
+    if pressure_present:
+        # Recorded so a reader can see pressure was noticed and deliberately
+        # not counted as urgency.
+        urgency_contributors.append(
+            FeatureContributor("URGENCY_RISK_ATTRIBUTED", SupportSource.SAFETY_FINDINGS,
+                               Provenance.DERIVED_SIGNAL,
+                               FeatureNote.URGENCY_WITHHELD_RISK_ATTRIBUTED)
+        )
+    supporting = [c for c in urgency_contributors if c.note is not FeatureNote.URGENCY_WITHHELD_RISK_ATTRIBUTED]
+    if not supporting:
+        return FeatureLevel.ABSENT, urgency_contributors
+    if (
+        selected_name in _SELF_SUFFICIENT_URGENCY
+        or disruption is not None
+        or len(supporting) >= 2
+    ):
+        return FeatureLevel.HIGH, urgency_contributors
+    return FeatureLevel.MEDIUM, urgency_contributors
 
 
 @dataclass(frozen=True)
@@ -757,14 +788,19 @@ class InteractionSummary:
         return FeatureLevel.MEDIUM
 
 
-def _active_disruption_contributor(classification) -> FeatureContributor | None:
+def _active_disruption_contributor(
+    classification, within_safety_coverage: bool = False
+) -> FeatureContributor | None:
     """Urgency support from a currently active, recorded service disruption.
 
     Read by rule identity from the classifier's own contributors, so no
     content is inspected here and the provenance the signal came from is
-    carried through unchanged.
+    carried through unchanged. With ``within_safety_coverage``, a disruption
+    found only where the safety layer did not read is not counted.
     """
     for contributor in getattr(classification, "contributors", ()):
+        if within_safety_coverage and getattr(contributor, "outside_safety_coverage", False):
+            continue
         if getattr(contributor, "rule_id", None) == ACTIVE_DISRUPTION_RULE_ID:
             return FeatureContributor(
                 "URGENCY_ACTIVE_DISRUPTION",

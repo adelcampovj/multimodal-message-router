@@ -282,6 +282,11 @@ def _rule_safe_interrupt(inputs: _Inputs) -> RoutingResult | None:
     """Rule 3. Genuinely urgent, genuinely relevant, and not under pressure."""
     if inputs.level(FeatureFamily.LEGITIMATE_URGENCY) is not FeatureLevel.HIGH:
         return None
+    # Urgency that exists only in content the safety layer never analysed
+    # cannot earn an interrupt: nothing checked that content for risk, and
+    # a missing finding there is not evidence that it is safe.
+    if inputs.features.urgency_outside_safety_coverage:
+        return None
     if inputs.level(FeatureFamily.MALICIOUS_PRESSURE) is FeatureLevel.HIGH:
         return None
     if not _at_least(inputs.level(FeatureFamily.RECIPIENT_RELEVANCE), FeatureLevel.MEDIUM):
