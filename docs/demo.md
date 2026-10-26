@@ -132,8 +132,9 @@ PYTHONPATH=src python -m message_router route --input examples/urgent.json
 ```
 
 Interrupting requires several independent conditions at once (high legitimate
-urgency, enough relevance, no manufactured pressure, no degraded analysis),
-and urgent wording alone satisfies none of them. Here the urgency has an
+urgency, enough relevance, no manufactured pressure, no degraded analysis,
+and urgency that was safety-analysed rather than found only past the 20,000
+character limit), and urgent wording alone satisfies none of them. Here the urgency has an
 independent origin: the message is classified as a safety alert. It shows that
 interrupts are earned, not triggered by words like "now". The rule is in
 [routing-policy.md](routing-policy.md).
@@ -325,11 +326,13 @@ carry.
 
 * `history` records in a document are validated but are not consulted by
   `route`. Output is identical with or without them.
-* `preferences` in a document are used. They feed feature extraction, so a
-  silenced conversation or quiet-hours setting changes the corresponding
-  contributor levels, and a silenced thread of established low value can be
-  suppressed (policy 9). None of the six examples carries preferences, and
-  they cannot soften a safety finding.
+* `preferences` in a document are used, narrowly. A silenced conversation
+  changes the silenced-conversation level and the interruption cost, and a
+  silenced thread of established low value can be suppressed (policy 9).
+  Quiet hours are validated but do nothing through `route`: the command
+  supplies no local time, so the quiet-hours level stays `unknown` whatever
+  window is set. `accepts_broadcast` is validated and not used. None of the
+  six examples carries preferences, and they cannot soften a safety finding.
 * The urgency inputs "directly addressed" and "near-term event" exist in the
   analysis stage but have no field in the document format, so `route` cannot
   supply them. `examples/urgent.json` reaches `interrupt` because the message

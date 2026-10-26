@@ -4,7 +4,9 @@ One request travels one fixed path: it is validated into typed objects,
 optionally has attachment readings collected, is analysed for safety,
 classified, turned into qualitative features, and finally passed through an
 ordered routing policy that selects exactly one action: `interrupt`, `defer`
-or `suppress`. Nothing in that path is learned, scored or random.
+or `suppress`. Nothing in that path is learned or random, and the policy
+that picks the action computes no score (see
+[routing-policy.md](routing-policy.md)).
 
 ## The pipeline
 
@@ -35,7 +37,8 @@ flowchart TD
     MSG -->|"authored body"| SAFETY
     MEDIA -->|"MediaAnalysis: a status, and text only if a backend produced it"| SAFETY
     SAFETY --> CLASSIFY
-    MSG -->|"authored body and any extracted text, each with its provenance"| CLASSIFY
+    MSG -->|"authored body, with its provenance"| CLASSIFY
+    MEDIA -->|"extracted text, if a backend produced it, with its provenance"| CLASSIFY
     MSG -->|"sender and conversation context"| FEATURES
     SAFETY --> FEATURES
     CLASSIFY --> FEATURES
@@ -55,7 +58,15 @@ Reading the diagram:
   The policy receives all three results; the safety result alone can end the
   decision (the hard veto), because that rule is evaluated first.
 * **Preferences enter at feature extraction only.** The safety stage does not
-  accept them, so they cannot soften a finding.
+  accept them, so they cannot soften a finding. Only silenced conversations
+  have an effect through `route`; see the quiet-hours note under
+  *Determinism*.
+* **Classification reads more than safety does.** Safety analysis stops at
+  20,000 characters per source; classification reads each source whole. The
+  feature stage records when urgency rests only on text past that limit, and
+  the routing policy then withholds an interrupt (see
+  [routing-policy.md](routing-policy.md)). Reported classification and
+  urgency are not altered.
 * **The request's `history` records are validated by the loader but are not
   part of this path.** Nothing on the route path reads them.
 
@@ -146,8 +157,9 @@ Ten classes: `direct_request`, `safety_alert`, `scheduled_event`,
 addition; unknown values raise rather than falling back to a default.
 
 Each contributor records its candidate, provenance, rule ID, support
-strength, and a fixed diagnostic — never content. Selection sums support,
-and a genuine tie is reported as ambiguous and resolved by a stable rule,
+strength, and a fixed diagnostic — never content. Selection adds up
+a small support rank per candidate class (an internal tally, not a routing
+score), and a genuine tie is reported as ambiguous and resolved by a stable rule,
 never by evaluation order. When contributors disagree or nothing reaches
 threshold, the result stays ambiguous or falls to `uncategorized` rather
 than manufacturing precision.
@@ -228,7 +240,10 @@ clock, no environment-dependent behaviour, and no network or model call.
 
 Quiet hours need local time, and the domain records no recipient timezone.
 Rather than guess one, `local_minute_of_day` is supplied explicitly by the
-caller; without it, quiet-hours impact is `unknown`.
+caller; without it, quiet-hours impact is `unknown`. The `route` command and
+the pipeline behind it supply none, so through the command line quiet hours
+are validated but never change a result. Library callers of
+`extract_features` can pass the value.
 
 ## Explicitly out of scope for the analysis layer
 

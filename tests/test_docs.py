@@ -393,6 +393,106 @@ class ClaimsTests(unittest.TestCase):
             self.assertIn(fragment, lowered, fragment)
 
 
+class CoverageScoringAndQuietHoursClaimsTests(unittest.TestCase):
+    """Claims about the analysis limit, scoring and quiet hours are checked
+    against the router rather than restated."""
+
+    ALERT = "Fire alarm in the east wing. Please evacuate by the north stairs now."
+
+    @staticmethod
+    def _route(body, preferences=None):
+        from message_router.io import load_request
+        from message_router.pipeline import decision_to_dict, route_request
+
+        doc = json.loads(_text(REPO_ROOT / "examples" / "benign.json"))
+        doc["request"]["message"]["body"] = body
+        if preferences is not None:
+            doc["request"]["recipient"]["preferences"] = preferences
+        routed = route_request(load_request(json.dumps(doc).encode("utf-8")))
+        return routed, decision_to_dict(routed)
+
+    def test_no_blanket_scoring_claim_or_stale_long_message_wording_survives(self):
+        stale = ("no scores anywhere", "1,005 tests", "is not analysed. the message is deferred",
+                 "rules 12–14", "walks the ast of the whole package")
+        for doc in DOC_FILES:
+            lowered = " ".join(_text(doc).lower().split())
+            for phrase in stale:
+                self.assertNotIn(phrase, lowered, f"{doc.name}: {phrase!r}")
+
+    def test_the_structural_scoring_test_covers_what_the_docs_say_it_covers(self):
+        source = _text(REPO_ROOT / "tests" / "test_routing_structure.py")
+        self.assertIn('ROUTING_SOURCES = sorted(ROUTING_DIR.glob("*.py"))', source)
+        self.assertIn('("sum", "max", "min")', source)
+        self.assertIn("ast.Add, ast.Mult, ast.Sub, ast.Div", source)
+        policy = " ".join(_text(REPO_ROOT / "docs" / "routing-policy.md").split())
+        self.assertIn("covers the routing package only", policy)
+        # The classifier really does tally, so the docs must not deny it.
+        self.assertIn("totals.get(contributor.candidate, 0)",
+                      _text(SRC_DIR / "message_router" / "analysis" / "classification.py"))
+        self.assertIn("internal tally", " ".join(_text(REPO_ROOT / "docs" / "architecture.md").split()))
+
+    def test_extracted_text_is_shown_entering_classification_from_the_media_stage(self):
+        body = next(b for d, b in CoverageScoringAndQuietHoursClaimsTests._blocks() if d == "architecture.md"
+                    and "SAFETY" in b)
+        edges = re.findall(r"^\s*(\w+) -->\|\"([^\"]*)\"\| (\w+)$", body, re.MULTILINE)
+        into_classify = {(src, label) for src, label, dst in edges if dst == "CLASSIFY"}
+        for src, label in into_classify:
+            if "extracted" in label.lower():
+                self.assertEqual(src, "MEDIA", label)
+        self.assertTrue(any(src == "MEDIA" and "extracted" in label.lower() for src, label in into_classify))
+        self.assertTrue(any(src == "MSG" and "authored" in label.lower() for src, label in into_classify))
+
+    @staticmethod
+    def _blocks():
+        found = []
+        for doc in DOC_FILES:
+            for language, body, _ in _fences(_text(doc)):
+                if language == "mermaid":
+                    found.append((doc.name, body))
+        return found
+
+    def test_the_documented_long_message_behaviour_is_what_the_router_does(self):
+        unit = "The garden club planted tulips near the old stone wall and talked about compost. "
+        cap = 20_000
+        pad = (unit * (cap // len(unit) + 2))[: cap - 1] + " "
+        inside, _ = self._route(self.ALERT + " " + pad)
+        tail, decision = self._route(pad + self.ALERT)
+        self.assertEqual(inside.result.action.value, "interrupt")
+        self.assertNotEqual(tail.result.action.value, "interrupt")
+        self.assertTrue(decision["analysis_incomplete"])
+        self.assertEqual(decision["safety"]["findings"], [])
+        # Classification still reads the tail; only the interrupt is withheld.
+        self.assertEqual(decision["classification"]["selected"], "safety_alert")
+        urgency = next(c for c in decision["contributors"] if c["family"] == "legitimate_urgency")
+        self.assertEqual(urgency["level"], "high")
+        # ...and the documented reading of the label holds: it sits beside a high level.
+        self.assertEqual(urgency["rule_ids"], ["URGENCY_NOT_HIGH"])
+        self.assertEqual(urgency["effect"], "prevented")
+        docs = " ".join(_text(REPO_ROOT / "docs" / "routing-policy.md").split())
+        self.assertIn("`URGENCY_NOT_HIGH`", docs)
+        self.assertIn("does not assert that the level is low", docs)
+
+    def test_quiet_hours_are_validated_but_change_nothing_through_the_pipeline(self):
+        plain, plain_decision = self._route("Lunch on Friday? I booked a table.")
+        quiet, quiet_decision = self._route("Lunch on Friday? I booked a table.",
+                                            {"quiet_from_minute": 0, "quiet_to_minute": 1439})
+        from message_router.analysis.features import FeatureFamily
+
+        self.assertEqual(quiet.features.level_of(FeatureFamily.QUIET_HOURS_IMPACT).value, "unknown")
+        self.assertEqual(plain_decision["action"], quiet_decision["action"])
+        self.assertEqual(plain_decision["policy_id"], quiet_decision["policy_id"])
+        silenced, _ = self._route("Lunch on Friday? I booked a table.",
+                                  {"silenced_conversations": ["conv-demo"]})
+        self.assertEqual(silenced.features.level_of(FeatureFamily.SILENCED_CONVERSATION).value, "high")
+        readme = " ".join(_text(README).split())
+        self.assertIn("supplies no local time", readme)
+
+    def test_the_interrupt_rule_documents_its_coverage_condition(self):
+        policy = " ".join(_text(REPO_ROOT / "docs" / "routing-policy.md").split())
+        self.assertIn("Safety coverage.", policy)
+        self.assertIn("the urgency not resting only on content the safety layer did not analyse", policy)
+
+
 class PackageMetadataTests(unittest.TestCase):
     """Read with a regular expression because ``tomllib`` needs Python 3.11 and
     the project supports 3.10. Only the few simple keys checked here are read."""

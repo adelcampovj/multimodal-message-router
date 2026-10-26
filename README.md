@@ -69,9 +69,12 @@ itself is in [docs/routing-policy.md](docs/routing-policy.md).
   no later predicate runs, which a test enforces by replacing every later rule
   with one that raises. Trust, relevance or urgency are never weighed against a
   severe finding.
-* **No scores anywhere.** A structural test walks the routing package and fails
-  on arithmetic or `sum`, `max` and `min`, so a sufficiently "positive" feature
-  cannot outweigh a risk.
+* **No scoring in the routing policy.** The policy compares qualitative levels
+  by rule. A structural test scans the files of the routing package and fails
+  on addition, subtraction, multiplication, division or a `sum`, `max` or `min`
+  call, so a sufficiently "positive" feature cannot outweigh a risk. (The
+  classifier does add up small support ranks internally to pick a message
+  class; that tally is not a routing score and no action is derived from it.)
 * **Corroboration counts causes, not repetition.** Two findings that express
   the same underlying indicator count once, so the same demand read from typed
   text and from OCR text cannot corroborate itself.
@@ -81,8 +84,10 @@ itself is in [docs/routing-policy.md](docs/routing-policy.md).
 * **Honest about what it could not read.** A failed or unavailable reading
   marks the analysis incomplete. It is never treated as evidence of safety.
 * **Deterministic and bounded.** No randomness, clock, network or model call.
-  Analysis is bounded at 20,000 characters per source, and tests confirm that
-  inputs with tens of thousands of repeated separators complete promptly.
+  Safety analysis reads at most 20,000 characters of each source. Anything past
+  that is flagged as unread, never counted as safe, and cannot by itself earn
+  an interrupt. Tests confirm that inputs with tens of thousands of repeated
+  separators complete promptly.
 * **Claims are tested.** Documentation tests check that links resolve, diagrams
   show the stages in the order the code calls them, and the tables and JSON
   excerpts here match what the router prints.
@@ -174,11 +179,12 @@ The environment variable matters: some tests start subprocesses, and without it
 Python writes `__pycache__` directories that the audit rejects. (`python -B`
 alone is not enough, because it does not reach those subprocesses.)
 
-At this commit the suite has 1,005 tests: 999 pass and 6
-skip, with no failures or errors, and the audit reports no findings. The skips
-are environmental: on the Windows machine used for development, six tests are
-skipped because creating symbolic links needs a privilege that was not
-available.
+The most recent complete run, made on the Windows development machine for the
+commit that last changed this paragraph, collected 1,050 tests: 1,044 passed
+and 6 were skipped, with no failures or errors, and the audit reported no
+findings. The skips are environmental: creating symbolic
+links needs a privilege that was not available there. The count changes as
+tests are added, so run the suite to see the current figure.
 
 These are **synthetic** tests. Inputs are fictional and the expected results
 encode intended behaviour, covering domain contracts, the loader, each safety
@@ -203,10 +209,12 @@ has not been published, so that workflow has not run on a hosted runner.
   written against the existing interfaces, and the `route` command supplies none.
 * **`history` is validated but unused.** The request format accepts history
   records, but they do not influence the decision.
-* **`preferences` are used, narrowly.** They reach feature extraction, so a
-  silenced conversation or quiet-hours setting changes the matching
-  contributors, and a silenced low-value thread can be suppressed. They cannot
-  soften a safety finding.
+* **`preferences` are used, narrowly.** A silenced conversation reaches
+  feature extraction, and a silenced thread of established low value can be
+  suppressed. Quiet hours are accepted and validated, but the `route` command
+  supplies no local time, so the quiet-hours level stays `unknown` and changes
+  no decision. `accepts_broadcast` is validated and not used. Preferences
+  cannot soften a safety finding.
 * **Some benign requests are suppressed.** A request for a document about
   credentials (for example a "password policy") is treated like a request for
   the credential itself. This fails toward caution and is not yet corrected.
@@ -214,9 +222,17 @@ has not been published, so that workflow has not run on a hosted runner.
   anyone" is read as a request, and so are the same sentences with "passcodes"
   and "OTPs", because the warning recognition is written around singular
   objects.
-* **Long messages are only partly read.** Content past 20,000 characters is not
-  analysed. The message is deferred with `analysis_incomplete` set, but a
-  hostile request placed after that point is not recognised.
+* **Long messages are only partly checked for safety.** Safety analysis reads
+  at most 20,000 characters of each source (for example the typed body, or one
+  transcript) and sets `analysis_incomplete` when it cuts one short. A finding
+  inside that part still applies, and a severe one still vetoes first. A
+  hostile request placed after that point is not recognised, and its absence
+  from the findings does not mean it is safe. Classification still reads the
+  whole text. Alert or outage wording that appears only past the limit cannot
+  earn an interrupt, but an alert inside the analysed part still can, even if
+  more text follows. Long messages are not
+  all deferred or all suppressed: the outcome depends on what lies inside the
+  analysed part.
 * **No numeric confidence.** The decision exposes no calibrated confidence
   value.
 * **No natural-language reason.** The decision exposes a policy id, findings

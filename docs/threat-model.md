@@ -218,13 +218,29 @@ receive identical analysis.
   plural objects are recognised as warnings. A legitimate anti-fraud message
   can be withheld. The other plural targets checked were not affected: they
   are either recognised as warnings or fall below the severe threshold.
-* **Processing is bounded** at 20,000 characters per source. Longer content is
-  analysed up to the limit and the assessment is marked incomplete. Anything
-  past the limit is **not analysed**. In the case tested, a benign 20,000
-  character prefix followed by a severe request produced no finding, and the
-  message was deferred with `analysis_incomplete` set. It was not recognised
-  as hostile, so padding a message past the limit hides its tail from every
-  rule.
+* **Processing is bounded** at 20,000 characters per source. The limit applies
+  to each source separately (the typed body, and each image reading or
+  transcript), not to a message as a whole. A longer source is analysed up to
+  the limit, the cut is recorded, and the assessment is marked incomplete.
+  Anything past the limit is **not analysed**, and that is not a finding of
+  safety:
+  * A finding inside the analysed part still applies, and a severe one still
+    triggers the hard veto first.
+  * A hostile request placed past the limit is not recognised. In the case
+    tested, a benign 20,000 character prefix followed by a severe request
+    produced no finding, and the message was deferred with
+    `analysis_incomplete` set. Padding a message past the limit hides its
+    tail from every safety rule.
+  * Deferral is not guaranteed. Classification reads sources in full, so
+    other outcomes are possible: a source with a severe finding inside its
+    analysed part is suppressed, and a message whose analysed part holds a
+    genuine alert can still interrupt.
+  * Alert or outage wording found *only* past the limit cannot earn an
+    interrupt. The classifier still notes it, but the feature stage records
+    that the urgency rests on unanalysed text and the interrupt rule refuses
+    it (see [routing-policy.md](routing-policy.md)).
+  * This does not make long text safe. Nothing here inspects the unread part,
+    and no hidden request in it is detected.
 
 ## Explicitly out of scope for this layer
 

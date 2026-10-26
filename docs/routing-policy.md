@@ -40,7 +40,7 @@ flowchart TD
     R1 -->|"yes: suppress, nothing later runs"| ACT_S1(["suppress"])
     R1 -->|"no"| R27{"2-7: explicit combination of independent<br/>risk root causes, or circulated content<br/>with suspicious risk and low value?"}
     R27 -->|"yes"| ACT_S2(["suppress"])
-    R27 -->|"no"| R8{"8: legitimate urgency high,<br/>relevance at least medium,<br/>no high pressure, not degraded?"}
+    R27 -->|"no"| R8{"8: legitimate urgency high and analysed,<br/>relevance at least medium,<br/>no high pressure, not degraded?"}
     R8 -->|"yes"| ACT_I(["interrupt"])
     R8 -->|"no"| R911{"9-11: silenced thread, repetition<br/>or marketing, each established<br/>low-value?"}
     R911 -->|"yes"| ACT_S3(["suppress"])
@@ -61,12 +61,22 @@ pressure, which only a *severe* finding could produce — and a severe
 finding already vetoes one rule earlier. The rule read as a safeguard and
 had never fired.
 
-**There is no scoring.** No weighted sum, no point total, no probability,
-no aggregate. A structural test walks the AST of the whole package and
-fails on any arithmetic operator or `sum`/`max`/`min` call, because the
-moment features can be added together, a sufficiently "positive" message
-can outweigh a risk — which is exactly the failure this design exists to
-prevent.
+**There is no scoring in the policy.** No weighted sum, no point total, no
+probability, no aggregate: rules compare qualitative levels and the first
+match wins. A structural test parses every file in the `routing` package
+and fails on addition, subtraction, multiplication or division, on a
+`sum`, `max` or `min` call, and on identifiers such as `weight` or
+`confidence`, because the moment features can be added together, a
+sufficiently "positive" message can outweigh a risk — which is exactly the
+failure this design exists to prevent.
+
+The test covers the routing package only, and only those operations. Other
+packages are not scanned for arithmetic, and one does some: the classifier
+adds up small support ranks per candidate class to choose a class, with a
+fixed tie-break (see [architecture.md](architecture.md)). That tally is an
+internal step of classification, is not a routing score, and no action is
+derived from it. The policy reads the chosen class and the qualitative
+features, never the tally.
 
 Qualitative levels do have an explicit ordering, used only for local
 comparisons inside a single rule. `unknown`, `conflicted`, and `incomplete`
@@ -145,7 +155,8 @@ Interrupting requires *all* of:
 * recipient relevance at least `medium`;
 * malicious pressure not `high`;
 * modality consistency not `conflicting`;
-* completeness not materially degraded.
+* completeness not materially degraded;
+* the urgency not resting only on content the safety layer did not analyse.
 
 None of these alone is enough. Shouting, punctuation, the isolated word
 "urgent", direct targeting, high utility, affinity, and trust each fail to
@@ -164,6 +175,25 @@ document has no field for a near-term event, so that origin is available to
 callers of the library but not to the command line.) Being asked
 something is not being asked something urgently, and treating a request as
 urgency-bearing hands out priority for phrasing alone.
+
+**Safety coverage.** The safety layer analyses at most 20,000 characters of
+each source, but classification reads every source in full. A message can
+therefore be classified as a safety alert, or as an active outage, purely
+because of wording the safety layer never saw. The interrupt rule does not
+accept that: if the `high` urgency level holds only because of such wording,
+the rule does not fire, even though everything else would qualify. Wording
+inside the analysed part counts as before, so a genuine alert near the start
+of a very long message can still interrupt, and the unread remainder is
+neither assumed safe nor assumed hostile. Structured context (a near-term
+event, direct targeting) is not message content, so coverage does not apply
+to it.
+
+Only the interrupt is withheld. The reported classification, the `high`
+urgency level and `analysis_incomplete` are unchanged, the hard veto still
+runs first, and a severe finding inside the analysed part still suppresses.
+The fact is an internal feature flag, not a new rule, policy identifier or
+output field; the message simply falls through to the later rules and
+usually defers.
 
 Direct targeting **amplifies** urgency that already has an independent
 basis and never originates it. With nothing to amplify it contributes no
@@ -201,7 +231,7 @@ thread, quiet hours, or absent engagement. A useful promotion defers, a
 silenced thread whose usefulness was never determined defers, and urgent
 content in a silenced thread still interrupts.
 
-## Rules 12–14 — deferral
+## Rules 12–13 and the default — deferral
 
 Safe content that is useful or relevant but not urgently so defers
 (`route.utility.safe_defer`). Cases that are ambiguous, conflicted, or
@@ -217,6 +247,16 @@ reliable severe finding still reaches Rule 1 even when another source
 failed.
 
 Anything else defers by default, claiming nothing.
+
+**Reading a deferral's contributors.** Every `route.utility.safe_defer`
+decision lists a `legitimate_urgency` contributor with effect `prevented` and
+the code `URGENCY_NOT_HIGH`. The code is a fixed label meaning "urgency did
+not lead to an interrupt here"; it is attached whatever the urgency level
+was, and it does not assert that the level is low. The `level` beside it is
+the measured value and is the one to read. For example, an alert whose
+interrupt was withheld for lack of safety coverage, or because its sources
+conflicted, shows `level: high` with `URGENCY_NOT_HIGH`. The label was named
+for the common case of a message that is simply not urgent.
 
 ## Classification independence
 
