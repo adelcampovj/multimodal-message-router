@@ -7,6 +7,7 @@ deleted in tearDown. No prohibited fixture content is ever committed.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import getpass
 import importlib.util
@@ -17,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "audit_public_tree.py"
@@ -220,6 +222,151 @@ class ContentPatternTests(TempTreeTestCase):
         self.write("notes.md", "see AGENTS.md for the ground rules\n")
         findings = audit.audit_tree(self.tmp)
         self.assertIn("prohibited_challenge_filename_mention", _categories(findings))
+
+
+# ---------------------------------------------------------------------------
+# Local username: personal accounts versus CI runner accounts.
+# ---------------------------------------------------------------------------
+
+#: Fictional personal account name; never a real user.
+PERSONAL_USER = "qzpersona7"
+
+
+class UsernameScopeTests(TempTreeTestCase):
+    """A personal account name is flagged anywhere it appears. A GitHub-hosted
+    runner account ("runner" on Linux and macOS, "runneradmin" on Windows) is
+    flagged only where an account name identifies an account. The current
+    user is simulated, so none of this depends on who runs the suite."""
+
+    def scan_as(self, user):
+        with mock.patch.object(getpass, "getuser", return_value=user):
+            return audit.audit_tree(self.tmp)
+
+    def flagged(self, user):
+        return {f.relative_path for f in self.scan_as(user) if f.category == "local_username"}
+
+    def test_runner_accounts_do_not_flag_ordinary_runner_wording(self):
+        """The hosted CI failure: ordinary prose was reported as a username."""
+        self.write("docs/demo.md",
+                   "The synthetic media runner supplies fixed text.\n"
+                   "Runner output is fictional; two runners, the runner's log,\n"
+                   "a test-runner and RUNNER in capitals are ordinary words.\n"
+                   "Windows jobs run as the runneradmin account.\n")
+        self.write("tests/test_example.py", '"""Exercises the example runner."""\n')
+        for user in ("runner", "runneradmin", "Runner", "RUNNERADMIN"):
+            with self.subTest(user=user):
+                self.assertEqual(self.flagged(user), set())
+
+    def test_personal_account_is_still_flagged_anywhere(self):
+        self.write("notes.md", "Ask qzpersona7 for the shared folder.\n")
+        self.write("deploy.md", "Logged in as QZPERSONA7 on the laptop.\n")
+        self.write("clean.md", "Nothing personal here.\n")
+        self.assertEqual(self.flagged(PERSONAL_USER), {"notes.md", "deploy.md"})
+
+    def test_account_name_as_an_address_is_flagged(self):
+        """This audit has no general email-address rule. What it checks is the
+        current account name, including as the local part of an address."""
+        self.write("ci.md", "Reach the build box as runner@build-host.example.\n")
+        self.write("personal.md", "Write to qzpersona7@example.org for access.\n")
+        self.assertIn("ci.md", self.flagged("runner"))
+        self.assertIn("personal.md", self.flagged(PERSONAL_USER))
+
+    def test_runner_account_in_sensitive_content_keeps_every_finding(self):
+        self.write("linux.md", "Key copied to /home/runner/.ssh/id_rsa\n")
+        self.write("tilde.md", "Config lives in ~runner/.config/tool\n")
+        self.write("windows.md", "Token kept in C:\\Users\\runneradmin\\AppData\\token.txt\n")
+        self.write("config.py", 'API_KEY = "runner' + "Q" * 20 + '"\n')
+        self.write("key.md", "-----BEGIN RSA PRIVATE KEY-----\nrunner\n")
+        linux, windows = self.scan_as("runner"), self.scan_as("runneradmin")
+
+        def categories(findings, path):
+            return {f.category for f in findings if f.relative_path == path}
+
+        self.assertEqual(categories(linux, "linux.md"), {"posix_home_path", "local_username"})
+        self.assertEqual(categories(linux, "tilde.md"), {"local_username"})
+        self.assertIn("api_key_or_token_assignment", categories(linux, "config.py"))
+        self.assertIn("private_key_block", categories(linux, "key.md"))
+        self.assertEqual(categories(windows, "windows.md"),
+                         {"absolute_windows_drive_path", "windows_userprofile_path", "local_username"})
+
+    def test_runner_account_matching_boundaries(self):
+        cases = {
+            "home.md": ("/home/runner/work", True),
+            "mac.md": ("/Users/Runner/work", True),
+            "profile.md": ("C:\\Users\\RUNNER\\Desktop", True),
+            "tilde.md": ("~runner/.cache", True),
+            "address.md": ("runner@ci-host.example", True),
+            "other_home.md": ("/home/runner2/work", False),
+            "other_tilde.md": ("~runners/.cache", False),
+            "dotted_local_part.md": ("ci.runner@ci-host.example", False),
+            "longer_local_part.md": ("myrunner@ci-host.example", False),
+            "dangling_at.md": ("ask the runner@ the end", False),
+            "prose.md": ("the runner, a runner's job (runner).", False),
+        }
+        for name, (text, _) in cases.items():
+            self.write(name, text + "\n")
+        flagged = self.flagged("runner")
+        for name, (_, expected) in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(name in flagged, expected)
+
+    def test_only_the_exact_runner_account_names_are_scoped(self):
+        self.assertEqual(audit._GENERIC_CI_ACCOUNTS, frozenset({"runner", "runneradmin"}))
+        self.write("notes.md", "runner2 deployed it; the runner-ci job; myrunner said so.\n")
+        for user in ("runner2", "runner-ci", "myrunner"):
+            with self.subTest(user=user):
+                self.assertEqual(self.flagged(user), {"notes.md"})
+
+    def test_personal_account_matching_boundaries_are_unchanged(self):
+        cases = {
+            "exact.md": ("qzpersona7", True),
+            "upper.md": ("QZPERSONA7", True),
+            "punctuated.md": ("(qzpersona7).", True),
+            "underscore.md": ("qzpersona7_backup", True),
+            "linux_home.md": ("/home/qzpersona7/x", True),
+            "windows_profile.md": ("C:\\Users\\QzPersona7\\Documents", True),
+            "address.md": ("qzpersona7@example.org", True),
+            "longer.md": ("qzpersona77", False),
+            "prefixed.md": ("xqzpersona7", False),
+        }
+        for name, (text, _) in cases.items():
+            self.write(name, text + "\n")
+        flagged = self.flagged(PERSONAL_USER)
+        for name, (_, expected) in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(name in flagged, expected)
+
+    def test_ci_environment_variables_do_not_change_detection(self):
+        """The scope follows the account name itself, never a CI flag."""
+        self.write("notes.md", "Ask qzpersona7 for access; the media runner is fine.\n")
+        ci_env = {"CI": "true", "GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux"}
+        with mock.patch.dict(os.environ, ci_env):
+            self.assertEqual(self.flagged(PERSONAL_USER), {"notes.md"})
+            self.assertEqual(self.flagged("runner"), set())
+
+
+class RepositoryUnderRunnerAccountTests(unittest.TestCase):
+    def test_repository_content_findings_are_empty_under_runner_accounts(self):
+        """The exact hosted CI condition, on Linux and on Windows runners."""
+        for user in ("runner", "runneradmin"):
+            with self.subTest(user=user), mock.patch.object(getpass, "getuser", return_value=user):
+                content_categories = {category for category, _ in audit._content_checks()}
+                self.assertIn("local_username", content_categories)
+                findings = audit.audit_tree(REPO_ROOT)
+                content_findings = [f for f in findings if f.category in content_categories]
+                self.assertEqual(content_findings, [], content_findings)
+
+
+class AuditIndependenceTests(unittest.TestCase):
+    def test_audit_uses_only_the_standard_library_and_no_router_code(self):
+        imported = set()
+        for node in ast.walk(ast.parse(SCRIPT_PATH.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                imported |= {alias.name.split(".")[0] for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+        self.assertNotIn("message_router", imported)
+        self.assertLessEqual(imported, set(sys.stdlib_module_names) | {"__future__"})
 
 
 # ---------------------------------------------------------------------------

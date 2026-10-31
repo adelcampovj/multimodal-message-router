@@ -149,13 +149,30 @@ _STRATEGY_BUILDER_RE = re.compile(
 
 _PUBLICATION_FILENAME_MENTION_RE = re.compile(r"\b(?:AGENTS\.md|problem_statement\.md)\b")
 
+# The accounts GitHub-hosted runners execute as: "runner" on Linux and macOS,
+# "runneradmin" on Windows. They name a machine role, not a person, and
+# "runner" is also an ordinary word -- this repository's docs describe a
+# "media runner" -- so matching them anywhere in prose reports ordinary text
+# as a leaked username. For these exact names only, the username check is
+# limited to places where an account name identifies an account: a home or
+# profile directory, ``~name`` and ``name@host``. Every other username is still
+# matched anywhere, and no other check is affected.
+_GENERIC_CI_ACCOUNTS = frozenset({"runner", "runneradmin"})
+
 
 def _username_pattern() -> re.Pattern[str] | None:
     """Built at call time from the *current* OS user -- never a literal."""
     user = getpass.getuser()
     if not user or len(user) < 2:
         return None
-    return re.compile(r"(?<![A-Za-z0-9])" + re.escape(user) + r"(?![A-Za-z0-9])", re.IGNORECASE)
+    name = re.escape(user)
+    if user.casefold() in _GENERIC_CI_ACCOUNTS:
+        return re.compile(
+            r"(?:(?<=/home/)|(?<=/users/)|(?<=\\users\\)|(?<=~))" + name + r"(?![A-Za-z0-9])"
+            r"|(?<![A-Za-z0-9._%+-])" + name + r"@(?=[A-Za-z0-9])",
+            re.IGNORECASE,
+        )
+    return re.compile(r"(?<![A-Za-z0-9])" + name + r"(?![A-Za-z0-9])", re.IGNORECASE)
 
 
 def _content_checks() -> tuple[tuple[str, re.Pattern[str]], ...]:
