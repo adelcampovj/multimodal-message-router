@@ -284,7 +284,7 @@ The environment variable matters: some tests start subprocesses, and without it
 Python writes `__pycache__` directories that the audit rejects. (`python -B`
 alone is not enough, because it does not reach those subprocesses.)
 
-The last complete run on the Windows development machine, at commit `467ba3e`,
+The last complete run on the Windows development machine, at commit `882bf05`,
 collected 1,060 tests: 1,054 passed and 6 were skipped, with no failures or
 errors, and the audit reported no findings. The skips are environmental:
 creating symbolic links needs a privilege that was not available there. The
@@ -300,8 +300,8 @@ this project reports no accuracy, precision or recall.
 
 A GitHub Actions workflow in `.github/workflows/ci.yml` runs the tests, the
 audit and a CLI check on Ubuntu and Windows with Python 3.12. For commit
-`467ba3e` it ran on GitHub-hosted runners
-([run 41275230396](https://github.com/adelcampovj/multimodal-message-router/actions/runs/41275230396)).
+`822c30e` it ran on GitHub-hosted runners
+([run 41354571865](https://github.com/adelcampovj/multimodal-message-router/actions/runs/41354571865)).
 On both Ubuntu and Windows all 1,060 tests passed, none failed or were skipped,
 and the audit reported no findings. Those results describe that commit only;
 they are not a claim about any later one.
