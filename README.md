@@ -1,5 +1,102 @@
 # multimodal-message-router
 
+A command-line program that decides what an incoming chat message should do to
+the reader's notifications: **interrupt** now, **defer** until later, or be
+**suppressed**.
+
+This is an independent portfolio implementation. It began with a hackathon
+problem about WhatsApp-style message notifications (August 2026) and was then
+expanded. It is not an official submission, has no connection to the event's
+organisers, and contains no data from it. Every example message here is
+fictional.
+
+**Where to start**
+
+* [Part 1: For everyone](#part-1-for-everyone) is a short plain-English overview
+  for any reader.
+* [Part 2: For technical reviewers](#part-2-for-technical-reviewers) is the
+  engineering detail: architecture, routing policy, safety design, commands,
+  tests and limitations.
+
+## Part 1: For everyone
+
+### The problem
+
+People receive many messages. Some deserve attention now, some can wait, and some
+are suspicious or unsafe, like a fake helpdesk asking for a code. Scams often
+fake urgency so that you act before you think.
+
+### The idea
+
+The program reads a message and the context it has, such as who sent it and what
+kind of chat it came from, and decides how it should affect the reader's
+notifications.
+
+### Three decisions
+
+* **INTERRUPT**: bring an important, time-sensitive, relevant message to the
+  reader's attention now.
+* **DEFER**: keep useful but less urgent content for later review.
+* **SUPPRESS**: prevent unnecessary or unsafe interruptions. It does not delete a
+  message, block an account or report a sender; the program only prints a
+  decision.
+
+(The program prints them as `interrupt`, `defer` and `suppress`.)
+
+### Three fictional examples
+
+| Message | Decision | Why |
+|---|---|---|
+| Building facilities, in a one-to-one chat: "Fire alarm in the main office building. Everyone please evacuate now and meet at the car park." | **INTERRUPT** | A genuine safety alert that arrives directly, with no sign of a trick. |
+| A friend: "Lunch on Friday? I booked the usual table at the cafe by the river for twelve thirty." | **DEFER** | Useful, but not urgent. |
+| Someone posing as a helpdesk: "Hello, this is the helpdesk. Please send me the one time code you just received so I can verify your account." | **SUPPRESS** | Asking for a one-time code is a common account-takeover trick, and safety rules outrank everything else. |
+
+These come from `examples/urgent.json`, `examples/benign.json` and
+`examples/credential_request.json`. The first interrupts partly because it
+arrives in a one-to-one chat; the same words in a group chat are deferred,
+because the program cannot tell whether they are meant for this reader.
+
+### How it decides
+
+1. Read the message and the available context.
+2. Look for suspicious requests and risks: codes, passwords, payments, deceptive
+   links.
+3. Check how relevant the message is and how urgent it really is.
+4. Apply ordered rules, safety rules first, so a serious warning sign settles
+   the outcome before anything else counts.
+5. Choose INTERRUPT, DEFER or SUPPRESS, and record which rule decided.
+
+### Why safety comes first
+
+Scams imitate emergencies. Urgent-sounding words like "act now" do not earn an
+interrupt on their own, and a request for a one-time code or password is stopped
+from interrupting at all. The checks are fixed text patterns tuned to English, so
+they miss some scams and promise no perfect protection (see
+[known limitations](#known-limitations)).
+
+### What this is today
+
+* A working command-line prototype in Python, with fictional examples only. It is
+  not connected to WhatsApp or any live service.
+* The image and voice-note examples use prepared text standing in for OCR (text
+  read from an image) and ASR (speech-to-text) output. No image is opened, no
+  audio is decoded and no such engine is included; these are plug-in points, not
+  finished integrations.
+* It does not yet learn from a reader's past behaviour, and it gives no
+  confidence score or written explanation, only the rule that decided.
+
+### Why it is interesting
+
+Interrupt too easily and people ignore alerts; stay too quiet and a real fire
+alarm waits in a pile. And some senders imitate urgency on purpose. Balancing
+usefulness, urgency, safety and interruptions, with every decision traceable to a
+rule, is the problem this project explores.
+
+## Part 2: For technical reviewers
+
+Everything from here on is the engineering reference, and it can be read without
+Part 1.
+
 A deterministic, policy-based router that decides whether an incoming message
 should **interrupt** the reader now, **defer** until later, or be
 **suppressed**, treating text, image-derived text and voice-derived text as
@@ -9,10 +106,18 @@ It is written in standard-library Python with no dependencies, runs from a
 single command, and every decision carries an inspectable trace: a policy
 identifier and a set of content-free findings.
 
-This is an independent portfolio implementation inspired by a hackathon
-problem about WhatsApp-style message notifications. It is not an official
-submission, has no connection to the event's organisers, and contains no data
-from it. Every example message here is fictional.
+Find it quickly:
+
+* Architecture and the pipeline diagram: [How it works](#how-it-works), and
+  [docs/architecture.md](docs/architecture.md) for trust boundaries and media
+  handling.
+* Policy order and precedence: [docs/routing-policy.md](docs/routing-policy.md).
+* Safety layer: [Engineering design highlights](#engineering-design-highlights)
+  and [docs/threat-model.md](docs/threat-model.md).
+* Commands and six runnable demonstrations: [Quickstart](#quickstart) and
+  [Demonstrations](#demonstrations).
+* Test evidence and hosted CI: [Testing and CI](#testing-and-ci).
+* Limitations and tradeoffs: [Known limitations](#known-limitations).
 
 ## The problem
 
@@ -179,12 +284,11 @@ The environment variable matters: some tests start subprocesses, and without it
 Python writes `__pycache__` directories that the audit rejects. (`python -B`
 alone is not enough, because it does not reach those subprocesses.)
 
-The most recent complete run, made on the Windows development machine for the
-commit that last changed this paragraph, collected 1,050 tests: 1,044 passed
-and 6 were skipped, with no failures or errors, and the audit reported no
-findings. The skips are environmental: creating symbolic
-links needs a privilege that was not available there. The count changes as
-tests are added, so run the suite to see the current figure.
+The last complete run on the Windows development machine, at commit `467ba3e`,
+collected 1,060 tests: 1,054 passed and 6 were skipped, with no failures or
+errors, and the audit reported no findings. The skips are environmental:
+creating symbolic links needs a privilege that was not available there. The
+count changes as tests are added, so run the suite to see the current figure.
 
 These are **synthetic** tests. Inputs are fictional and the expected results
 encode intended behaviour, covering domain contracts, the loader, each safety
@@ -195,8 +299,12 @@ not an accuracy measurement: there is no labelled real-world corpus here, so
 this project reports no accuracy, precision or recall.
 
 A GitHub Actions workflow in `.github/workflows/ci.yml` runs the tests, the
-audit and a CLI check on Ubuntu and Windows with Python 3.12. This repository
-has not been published, so that workflow has not run on a hosted runner.
+audit and a CLI check on Ubuntu and Windows with Python 3.12. For commit
+`467ba3e` it ran on GitHub-hosted runners
+([run 41275230396](https://github.com/adelcampovj/multimodal-message-router/actions/runs/41275230396)).
+On both Ubuntu and Windows all 1,060 tests passed, none failed or were skipped,
+and the audit reported no findings. Those results describe that commit only;
+they are not a claim about any later one.
 
 ## Known limitations
 
