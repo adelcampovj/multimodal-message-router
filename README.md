@@ -12,13 +12,10 @@ fictional.
 
 **Where to start**
 
-* [Part 1: For everyone](#part-1-for-everyone) is a short plain-English overview
-  for any reader.
-* [Part 2: For technical reviewers](#part-2-for-technical-reviewers) is the
+* A short plain-English overview for any reader follows directly below.
+* [For Technical Reviewers](#for-technical-reviewers) is the
   engineering detail: architecture, routing policy, safety design, commands,
   tests and limitations.
-
-## Part 1: For everyone
 
 ### The problem
 
@@ -92,10 +89,10 @@ alarm waits in a pile. And some senders imitate urgency on purpose. Balancing
 usefulness, urgency, safety and interruptions, with every decision traceable to a
 rule, is the problem this project explores.
 
-## Part 2: For technical reviewers
+## For Technical Reviewers
 
 Everything from here on is the engineering reference, and it can be read without
-Part 1.
+the overview above.
 
 A deterministic, policy-based router that decides whether an incoming message
 should **interrupt** the reader now, **defer** until later, or be
